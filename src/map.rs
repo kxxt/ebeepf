@@ -11,7 +11,7 @@ use bitflags::bitflags;
 
 use crate::program::exclusive_map_hash;
 use crate::sys;
-use crate::{BpfToken, Error, Link, ProgramSpec, Result, TypeId};
+use crate::{BpfToken, Error, Link, ProgramSpec, Result, TypeId, VerifierLog};
 
 bitflags! {
     /// Flags controlling map creation and access.
@@ -300,6 +300,7 @@ pub struct MapSpec {
     pub(crate) value_size: u32,
     pub(crate) max_entries: u32,
     pub(crate) flags: MapFlags,
+    pub(crate) interface_index: u32,
     pub(crate) pinning: Pinning,
     pub(crate) numa_node: Option<u32>,
     pub(crate) map_extra: u64,
@@ -307,6 +308,7 @@ pub struct MapSpec {
     pub(crate) btf_value_type: TypeId,
     pub(crate) inner_map: Option<String>,
     pub(crate) exclusive_program: Option<String>,
+    pub(crate) creation_log: Option<VerifierLog>,
     pub(crate) autocreate: bool,
     pub(crate) auto_attach: bool,
     pub(crate) initial_value: Option<Vec<u8>>,
@@ -332,6 +334,7 @@ impl MapSpec {
             value_size,
             max_entries,
             flags: MapFlags::empty(),
+            interface_index: 0,
             pinning: Pinning::None,
             numa_node: None,
             map_extra: 0,
@@ -339,6 +342,7 @@ impl MapSpec {
             btf_value_type: TypeId::VOID,
             inner_map: None,
             exclusive_program: None,
+            creation_log: None,
             autocreate: true,
             auto_attach: false,
             initial_value: None,
@@ -400,6 +404,11 @@ impl MapSpec {
         self.flags
     }
 
+    /// Network interface selected for device-bound map creation, or zero.
+    pub const fn interface_index(&self) -> u32 {
+        self.interface_index
+    }
+
     /// BTF key type ID, or zero when absent.
     pub const fn btf_key_type(&self) -> TypeId {
         self.btf_key_type
@@ -445,6 +454,11 @@ impl MapSpec {
     /// Program whose instruction identity has exclusive access to this map.
     pub fn exclusive_program(&self) -> Option<&str> {
         self.exclusive_program.as_deref()
+    }
+
+    /// Kernel logging requested for map creation.
+    pub const fn creation_log(&self) -> Option<VerifierLog> {
+        self.creation_log
     }
 
     /// Whether object loading creates or reuses this map.
@@ -513,6 +527,14 @@ impl MapSpec {
         self
     }
 
+    /// Selects a network interface for hardware-offloaded or device-bound maps.
+    ///
+    /// Zero restores normal host-kernel map creation.
+    pub fn set_interface_index(&mut self, interface_index: u32) -> &mut Self {
+        self.interface_index = interface_index;
+        self
+    }
+
     /// Changes the NUMA placement. This also enables [`MapFlags::NUMA_NODE`].
     pub fn set_numa_node(&mut self, node: Option<u32>) -> &mut Self {
         self.numa_node = node;
@@ -535,6 +557,12 @@ impl MapSpec {
     /// Restricts this map to one program from the same object.
     pub fn set_exclusive_program(&mut self, name: impl Into<String>) -> &mut Self {
         self.exclusive_program = Some(name.into());
+        self
+    }
+
+    /// Configures map-creation verifier logging on supporting kernels.
+    pub fn set_creation_log(&mut self, log: Option<VerifierLog>) -> &mut Self {
+        self.creation_log = log;
         self
     }
 
@@ -793,6 +821,75 @@ impl<'a> MapCreateOptions<'a> {
     }
 }
 
+/// Userspace access requested for a pinned kernel object descriptor.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ObjectAccess {
+    /// Permit both reads and writes.
+    #[default]
+    ReadWrite,
+    /// Permit reads but reject userspace writes.
+    ReadOnly,
+    /// Permit writes but reject userspace reads.
+    WriteOnly,
+}
+
+impl ObjectAccess {
+    const fn as_raw(self) -> u32 {
+        match self {
+            Self::ReadWrite => 0,
+            Self::ReadOnly => 1 << 3,
+            Self::WriteOnly => 1 << 4,
+        }
+    }
+}
+
+/// Options for pinning or opening a pinned kernel object.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ObjectPathOptions<'fd> {
+    access: ObjectAccess,
+    directory: Option<BorrowedFd<'fd>>,
+}
+
+impl<'fd> ObjectPathOptions<'fd> {
+    /// Creates options using the process working directory and no access flags.
+    pub const fn new() -> Self {
+        Self {
+            access: ObjectAccess::ReadWrite,
+            directory: None,
+        }
+    }
+
+    /// Sets userspace access restrictions when opening a pinned object.
+    ///
+    /// Pin creation itself does not accept access restrictions.
+    pub const fn access(mut self, access: ObjectAccess) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Resolves a relative pathname beneath an open directory.
+    pub const fn relative_to(mut self, directory: BorrowedFd<'fd>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    pub(crate) fn raw_for_open(self) -> (u32, Option<i32>) {
+        (
+            self.access.as_raw(),
+            self.directory.map(|directory| directory.as_raw_fd()),
+        )
+    }
+
+    pub(crate) fn raw_for_pin(self) -> Result<Option<i32>> {
+        if self.access != ObjectAccess::ReadWrite {
+            return Err(Error::InvalidObject(
+                "access restrictions apply when opening, not pinning, a kernel object".into(),
+            ));
+        }
+        Ok(self.directory.map(|directory| directory.as_raw_fd()))
+    }
+}
+
 impl MapBatch {
     /// Key/value pairs returned by the kernel.
     pub fn entries(&self) -> &[(Vec<u8>, Vec<u8>)] {
@@ -932,6 +1029,7 @@ impl Map {
             value_size: spec.value_size,
             max_entries: spec.max_entries,
             flags: spec.flags.bits(),
+            interface_index: spec.interface_index,
             inner_map_fd: inner.map(|map| map.fd.as_raw_fd()),
             numa_node: spec.numa_node,
             btf_fd: None,
@@ -942,10 +1040,13 @@ impl Map {
             map_extra: spec.map_extra,
             token_fd: options.token.map(|token| token.as_fd().as_raw_fd()),
             exclusive_program_hash: exclusive_program_hash.as_ref(),
+            log_level: spec.creation_log.map_or(0, |log| log.level),
+            log_size: spec.creation_log.map_or(0, |log| log.capacity),
         })
-        .map_err(|source| Error::MapCreate {
+        .map_err(|(source, log)| Error::MapCreate {
             map: spec.name.clone(),
             source,
+            log,
         })?;
         let map = Self::from_fd(fd, spec);
         if let Some(initial) = &map.spec.initial_value {
@@ -960,8 +1061,17 @@ impl Map {
 
     /// Opens a map pinned in bpffs.
     pub fn open_pinned(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_pinned_with(path, ObjectPathOptions::new())
+    }
+
+    /// Opens a pinned map with access flags or directory-relative resolution.
+    pub fn open_pinned_with(
+        path: impl AsRef<Path>,
+        options: ObjectPathOptions<'_>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fd = sys::object_get(path).map_err(|source| Error::File {
+        let (flags, directory) = options.raw_for_open();
+        let fd = sys::object_get_with(path, flags, directory).map_err(|source| Error::File {
             operation: "open pinned map",
             path: path.into(),
             source,
@@ -988,6 +1098,7 @@ impl Map {
             raw.max_entries,
         );
         spec.flags = MapFlags::from_bits_retain(raw.map_flags);
+        spec.interface_index = raw.ifindex;
         spec.btf_key_type = TypeId(raw.btf_key_type_id);
         spec.btf_value_type = TypeId(raw.btf_value_type_id);
         spec.map_extra = raw.map_extra;
@@ -1232,6 +1343,15 @@ impl Map {
         sys::map_freeze(self.fd.as_raw_fd()).map_err(|source| Error::system("freeze map", source))
     }
 
+    /// Computes the SHA-256 hash of a frozen map's contents.
+    ///
+    /// Linux supports content hashing for selected map types, such as arrays,
+    /// and rejects this operation until the map is frozen.
+    pub fn content_hash(&self) -> Result<[u8; 32]> {
+        sys::map_content_hash(self.fd.as_raw_fd())
+            .map_err(|source| Error::system("hash frozen map contents", source))
+    }
+
     /// Registers a loaded `struct_ops` map and returns its kernel link.
     pub fn attach_struct_ops(&self) -> Result<Link> {
         if self.spec.map_type != MapType::StructOps {
@@ -1266,11 +1386,19 @@ impl Map {
 
     /// Pins the map at a bpffs path.
     pub fn pin(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.pin_with(path, ObjectPathOptions::new())
+    }
+
+    /// Pins this map with optional directory-relative resolution.
+    pub fn pin_with(&self, path: impl AsRef<Path>, options: ObjectPathOptions<'_>) -> Result<()> {
         let path = path.as_ref();
-        sys::object_pin(self.fd.as_raw_fd(), path).map_err(|source| Error::File {
-            operation: "pin map",
-            path: path.into(),
-            source,
+        let directory = options.raw_for_pin()?;
+        sys::object_pin_with(self.fd.as_raw_fd(), path, 0, directory).map_err(|source| {
+            Error::File {
+                operation: "pin map",
+                path: path.into(),
+                source,
+            }
         })
     }
 
@@ -1907,6 +2035,11 @@ mod tests {
     fn setters_preserve_invariants() {
         let mut spec = MapSpec::new("counts", MapType::Hash, 4, 8, 1);
         spec.set_numa_node(Some(2))
+            .set_interface_index(7)
+            .set_creation_log(Some(VerifierLog {
+                level: 1,
+                capacity: 4096,
+            }))
             .set_max_entries(1024)
             .set_pinning(Pinning::ByName)
             .set_autocreate(false)
@@ -1914,11 +2047,23 @@ mod tests {
         spec.set_initial_value(7_u64.to_ne_bytes()).unwrap();
         assert_eq!(spec.max_entries(), 1024);
         assert!(spec.flags().contains(MapFlags::NUMA_NODE));
+        assert_eq!(spec.interface_index(), 7);
+        assert_eq!(spec.creation_log().unwrap().capacity, 4096);
         assert_eq!(spec.pinning(), Pinning::ByName);
         assert!(!spec.autocreate());
         assert!(spec.auto_attach());
         assert_eq!(spec.initial_value(), Some(7_u64.to_ne_bytes().as_slice()));
         assert!(spec.set_initial_value([0; 4]).is_err());
+        assert_eq!(
+            ObjectPathOptions::new()
+                .access(ObjectAccess::ReadOnly)
+                .raw_for_open(),
+            (1 << 3, None)
+        );
+        assert!(ObjectPathOptions::new()
+            .access(ObjectAccess::WriteOnly)
+            .raw_for_pin()
+            .is_err());
     }
 
     #[test]

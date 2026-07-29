@@ -2,9 +2,9 @@
 
 use std::env;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File};
 use std::io::{self, IoSlice, IoSliceMut, Read as _};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
@@ -15,10 +15,11 @@ use std::time::Duration;
 use ebeepf::query::attached_programs_on_interface;
 use ebeepf::{
     AttachAnchor, AttachOrder, AttachType, BpfToken, Btf, BtfObject, BtfType, Error, HelperId,
-    Instruction, LinkType, Map, MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut,
-    Object, ObjectLinker, OrderedLinkOptions, ProgramType, RingBuffer, SkeletonBuilder,
-    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, TypeId, UpdateMode, UsdtOptions, Xdp,
-    XdpAttachOptions, XdpFlags,
+    Instruction, LinkDetails, LinkType, Map, MapCreateOptions, MapFlags, MapSpec, MapType,
+    MappedDataSectionMut, Object, ObjectLinker, ObjectPathOptions, OrderedLinkOptions,
+    PerfEventLinkDetails, ProgramInfoOptions, ProgramStatistics, ProgramType, RingBuffer,
+    SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, TypeId, UpdateMode,
+    UsdtOptions, VerifierLog, Xdp, XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -588,6 +589,11 @@ fn relocates_typed_and_typeless_kernel_symbols() {
             .iter()
             .any(|instruction| instruction.code == 0x18 && instruction.source() == 3));
     }
+    let _schedule_link = loaded
+        .program("compare_typed_kernel_function")
+        .unwrap()
+        .attach()
+        .unwrap();
     let module = loaded.program("compare_typed_module_function").unwrap();
     assert_eq!(
         module
@@ -897,6 +903,7 @@ fn receive_fd(socket: &UnixDatagram) -> nix::Result<OwnedFd> {
 #[test]
 #[ignore = "requires root or CAP_BPF and a kernel with eBPF enabled"]
 fn loads_program_and_exercises_map_crud() {
+    let _statistics = ProgramStatistics::enable().unwrap();
     for map_type in [
         MapType::Array,
         MapType::LpmTrie,
@@ -942,7 +949,12 @@ fn loads_program_and_exercises_map_crud() {
     }
 
     let mut mmap_spec = MapSpec::new("mapped_values", MapType::Array, 4, 8, 2);
-    mmap_spec.set_flags(MapFlags::MMAPABLE);
+    mmap_spec
+        .set_flags(MapFlags::MMAPABLE)
+        .set_creation_log(Some(VerifierLog {
+            level: 1,
+            capacity: 4096,
+        }));
     let mmap_map = Map::create(mmap_spec).unwrap();
     let mut memory = mmap_map.mmap_mut().unwrap();
     assert!(mmap_map.mmap().is_err());
@@ -973,15 +985,50 @@ fn loads_program_and_exercises_map_crud() {
     let value = 0x1234_5678_9abc_def0_u64.to_ne_bytes();
     map.update(&key, &value, UpdateMode::Any).unwrap();
     assert_eq!(map.lookup(&key).unwrap().as_deref(), Some(value.as_slice()));
-    assert_eq!(map.info().unwrap().value_size, 8);
+    let map_info = map.info().unwrap();
+    assert_eq!(map_info.value_size, 8);
     let drop_packet = loaded.program("drop_packet").unwrap();
     assert_eq!(drop_packet.info().unwrap().name, "drop_packet");
+    let detailed_program = drop_packet.info_with(ProgramInfoOptions::all()).unwrap();
+    assert_eq!(
+        detailed_program.translated_instructions.len(),
+        detailed_program.translated_size as usize
+    );
+    assert!(!detailed_program.translated_instructions.is_empty());
+    drop_packet
+        .test_run(TestRunOptions::new(&[0_u8; 64]))
+        .unwrap();
+    assert!(drop_packet.info().unwrap().run_count >= 1);
     drop_packet.bind_map(map, 0).unwrap();
+    map.freeze().unwrap();
+    assert_ne!(map.content_hash().unwrap(), [0; 32]);
     let link = loaded
         .program("track_switch")
         .unwrap()
         .attach_tracepoint_with_cookie("sched", "sched_switch", 0xfeed)
         .unwrap();
+    assert!(matches!(
+        link.info().unwrap().details,
+        LinkDetails::PerfEvent(PerfEventLinkDetails::Tracepoint {
+            name: Some(_),
+            cookie: 0xfeed
+        })
+    ));
+    let pins = tempfile::Builder::new()
+        .prefix("ebeepf-object-")
+        .tempdir_in("/sys/fs/bpf")
+        .unwrap();
+    loaded.pin(pins.path()).unwrap();
+    for name in ["values", "drop_packet", "track_switch"] {
+        assert!(pins.path().join(name).exists());
+    }
+    loaded.unpin(pins.path()).unwrap();
+    let pin_directory = File::open(pins.path()).unwrap();
+    let relative = ObjectPathOptions::new().relative_to(pin_directory.as_fd());
+    map.pin_with("relative-map", relative).unwrap();
+    let reopened = Map::open_pinned_with("relative-map", relative).unwrap();
+    assert_eq!(reopened.info().unwrap().id, map.info().unwrap().id);
+    map.unpin(pins.path().join("relative-map")).unwrap();
     drop(link);
 }
 
@@ -1083,6 +1130,13 @@ fn manages_legacy_xdp_and_tc_attachments() {
         .unwrap();
     let attachments =
         attached_programs_on_interface(xdp.interface_index(), AttachType::TcxIngress).unwrap();
+    assert_eq!(
+        second.info().unwrap().details,
+        LinkDetails::Tcx {
+            interface_index: xdp.interface_index(),
+            attach_type: AttachType::TcxIngress,
+        }
+    );
     assert_eq!(
         attachments
             .programs

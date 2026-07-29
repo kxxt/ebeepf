@@ -38,6 +38,7 @@ const BPF_PROG_QUERY: u32 = 16;
 const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
 const BPF_BTF_LOAD: u32 = 18;
 const BPF_BTF_GET_FD_BY_ID: u32 = 19;
+const BPF_TASK_FD_QUERY: u32 = 20;
 const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
 const BPF_MAP_FREEZE: u32 = 22;
 const BPF_BTF_GET_NEXT_ID: u32 = 23;
@@ -49,13 +50,16 @@ const BPF_LINK_CREATE: u32 = 28;
 const BPF_LINK_UPDATE: u32 = 29;
 const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 const BPF_LINK_GET_NEXT_ID: u32 = 31;
+const BPF_ENABLE_STATS: u32 = 32;
 const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_DETACH: u32 = 34;
 const BPF_PROG_BIND_MAP: u32 = 35;
 const BPF_TOKEN_CREATE: u32 = 36;
 const BPF_PROG_STREAM_READ_BY_FD: u32 = 37;
 const BPF_PROG_ASSOC_STRUCT_OPS: u32 = 38;
+const BPF_COMMON_ATTRS: u32 = 1 << 16;
 const BPF_F_TOKEN_FD: u32 = 1 << 16;
+const BPF_F_PATH_FD: u32 = 1 << 14;
 
 const PERF_TYPE_TRACEPOINT: u32 = 2;
 const PERF_TYPE_SOFTWARE: u32 = 1;
@@ -74,6 +78,7 @@ pub(crate) struct MapCreate<'a> {
     pub value_size: u32,
     pub max_entries: u32,
     pub flags: u32,
+    pub interface_index: u32,
     pub inner_map_fd: Option<RawFd>,
     pub numa_node: Option<u32>,
     pub btf_fd: Option<RawFd>,
@@ -84,6 +89,8 @@ pub(crate) struct MapCreate<'a> {
     pub map_extra: u64,
     pub token_fd: Option<RawFd>,
     pub exclusive_program_hash: Option<&'a [u8; 32]>,
+    pub log_level: u32,
+    pub log_size: usize,
 }
 
 #[derive(Debug)]
@@ -108,6 +115,8 @@ pub(crate) struct ProgramLoad<'a> {
     pub log_level: u32,
     pub log_size: usize,
     pub token_fd: Option<RawFd>,
+    pub signature: Option<&'a [u8]>,
+    pub keyring_id: i32,
 }
 
 #[repr(C)]
@@ -131,6 +140,15 @@ struct MapCreateAttr {
     map_token_fd: i32,
     excl_prog_hash: u64,
     excl_prog_hash_size: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct CommonAttr {
+    log_buf: u64,
+    log_size: u32,
+    log_level: u32,
+    log_true_size: u32,
 }
 
 const MAP_CREATE_ATTR_SIZE: usize =
@@ -195,6 +213,9 @@ struct ProgramLoadAttr {
     keyring_id: i32,
 }
 
+const PROGRAM_LOAD_COMMON_PROBE_SIZE: usize =
+    mem::offset_of!(ProgramLoadAttr, program_token_fd) + mem::size_of::<i32>();
+
 #[repr(C)]
 #[derive(Default)]
 struct ProgramAttachAttr {
@@ -243,6 +264,20 @@ struct ProgramQueryAttr {
 
 #[repr(C)]
 #[derive(Default)]
+pub(crate) struct TaskFdQueryRaw {
+    pub process_id: u32,
+    pub fd: u32,
+    pub flags: u32,
+    pub buffer_length: u32,
+    pub buffer: u64,
+    pub program_id: u32,
+    pub fd_type: u32,
+    pub probe_offset: u64,
+    pub probe_address: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
 struct GetIdAttr {
     start_id: u32,
     next_id: u32,
@@ -276,6 +311,12 @@ struct BtfLoadAttr {
 struct TokenCreateAttr {
     flags: u32,
     bpffs_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct EnableStatsAttr {
+    stats_type: u32,
 }
 
 #[repr(C)]
@@ -572,7 +613,7 @@ pub(crate) struct BtfInfoRaw {
     pub kernel_btf: u32,
 }
 
-pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
+pub(crate) fn map_create(options: &MapCreate<'_>) -> Result<OwnedFd, (io::Error, String)> {
     let token_flag = u32::from(options.token_fd.is_some()) * BPF_F_TOKEN_FD;
     let value_type_flag = u32::from(options.value_type_btf_obj_fd.is_some()) * (1_u32 << 15);
     let mut attr = MapCreateAttr {
@@ -583,9 +624,10 @@ pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
         map_flags: (options.flags & !(BPF_F_TOKEN_FD | (1_u32 << 15)))
             | token_flag
             | value_type_flag,
-        inner_map_fd: fd_u32(options.inner_map_fd)?,
+        map_ifindex: options.interface_index,
+        inner_map_fd: fd_u32(options.inner_map_fd).map_err(|error| (error, String::new()))?,
         numa_node: options.numa_node.unwrap_or_default(),
-        btf_fd: fd_u32(options.btf_fd)?,
+        btf_fd: fd_u32(options.btf_fd).map_err(|error| (error, String::new()))?,
         btf_key_type_id: options.btf_key_type_id,
         btf_value_type_id: options.btf_value_type_id,
         btf_vmlinux_value_type_id: options.btf_vmlinux_value_type_id,
@@ -603,10 +645,52 @@ pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
         ..Default::default()
     };
     set_object_name(&mut attr.map_name, options.name);
+    let mut log = vec![0_u8; options.log_size];
     // The UAPI's map-create payload ends at `excl_prog_hash_size` (byte 92).
     // `repr(C)` rounds this Rust structure up to 96 bytes for its u64
     // alignment, but the four tail-padding bytes are not part of the ABI.
-    command_fd_sized(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE)
+    let result = if log.is_empty() || !supports_common_attributes() {
+        command_fd_sized(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE)
+    } else {
+        let mut common = CommonAttr {
+            log_buf: mut_slice_pointer(&mut log),
+            log_size: u32::try_from(log.len()).unwrap_or(u32::MAX),
+            log_level: options.log_level,
+            ..Default::default()
+        };
+        command_fd_sized_with_common(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE, &mut common)
+    };
+    result.map_err(|error| (error, log_string(&log)))
+}
+
+fn supports_common_attributes() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(probe_common_attributes)
+}
+
+fn probe_common_attributes() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let attr = ProgramLoadAttr::default();
+        // A supporting kernel reads the nonzero common-attribute size and
+        // rejects this deliberately null pointer with EFAULT before attempting
+        // to validate the otherwise empty program-load request.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                libc::c_long::from(BPF_PROG_LOAD | BPF_COMMON_ATTRS),
+                ptr::from_ref(&attr),
+                PROGRAM_LOAD_COMMON_PROBE_SIZE,
+                ptr::null::<CommonAttr>(),
+                mem::size_of::<CommonAttr>(),
+            )
+        };
+        result < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
 }
 
 pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
@@ -682,6 +766,7 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             value_size: 4,
             max_entries: 1,
             flags: 0,
+            interface_index: 0,
             inner_map_fd: None,
             numa_node: None,
             btf_fd: None,
@@ -692,6 +777,8 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             map_extra: 0,
             token_fd: None,
             exclusive_program_hash: None,
+            log_level: 0,
+            log_size: 0,
         }) {
             Ok(inner) => Some(inner),
             Err(_) => return Ok(false),
@@ -732,6 +819,7 @@ pub(crate) fn supports_full_range_map_value_offset(token_fd: Option<RawFd>) -> i
         value_size: 1,
         max_entries: 1,
         flags: 0,
+        interface_index: 0,
         inner_map_fd: None,
         numa_node: None,
         btf_fd: None,
@@ -742,7 +830,10 @@ pub(crate) fn supports_full_range_map_value_offset(token_fd: Option<RawFd>) -> i
         map_extra: 0,
         token_fd,
         exclusive_program_hash: None,
-    })?;
+        log_level: 0,
+        log_size: 0,
+    })
+    .map_err(|(error, _)| error)?;
     let instructions = [
         Instruction::new(
             0x18, // BPF_LD | BPF_DW | BPF_IMM
@@ -775,6 +866,8 @@ pub(crate) fn supports_full_range_map_value_offset(token_fd: Option<RawFd>) -> i
         log_level: 1,
         log_size: 4096,
         token_fd,
+        signature: None,
+        keyring_id: 0,
     }) {
         Err((_, log)) if log.contains("direct value offset of") => Ok(false),
         Err((_, log)) if log.contains("invalid access to map value pointer") => Ok(true),
@@ -1087,6 +1180,13 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         // not a descriptor. A nonzero count asks the kernel to bind every
         // element and would therefore reject that reserved zero slot.
         fd_array_count: 0,
+        signature: options
+            .signature
+            .map_or(0, |signature| pointer(signature.as_ptr())),
+        signature_size: options.signature.map_or(0, |signature| {
+            u32::try_from(signature.len()).unwrap_or(u32::MAX)
+        }),
+        keyring_id: options.keyring_id,
         ..Default::default()
     };
     set_object_name(&mut attr.prog_name, options.name);
@@ -1215,6 +1315,8 @@ fn probe_program_load(
         log_level: u32::from(log),
         log_size: if log { 4096 } else { 0 },
         token_fd: None,
+        signature: None,
+        keyring_id: 0,
     })
 }
 
@@ -1281,24 +1383,39 @@ fn probe_bpf_cookie() -> bool {
         log_level: 0,
         log_size: 0,
         token_fd: None,
+        signature: None,
+        keyring_id: 0,
     })
     .is_ok()
 }
 
-pub(crate) fn object_pin(fd: RawFd, path: &Path) -> io::Result<()> {
+pub(crate) fn object_pin_with(
+    fd: RawFd,
+    path: &Path,
+    file_flags: u32,
+    path_fd: Option<RawFd>,
+) -> io::Result<()> {
     let path = path_cstring(path.as_os_str())?;
     let attr = ObjectPathAttr {
         pathname: pointer(path.as_ptr()),
         bpf_fd: raw_fd_u32(fd)?,
+        file_flags: (file_flags & !BPF_F_PATH_FD) | (u32::from(path_fd.is_some()) * BPF_F_PATH_FD),
+        path_fd: path_fd.unwrap_or_default(),
         ..Default::default()
     };
     command(BPF_OBJ_PIN, &attr).map(drop)
 }
 
-pub(crate) fn object_get(path: &Path) -> io::Result<OwnedFd> {
+pub(crate) fn object_get_with(
+    path: &Path,
+    file_flags: u32,
+    path_fd: Option<RawFd>,
+) -> io::Result<OwnedFd> {
     let path = path_cstring(path.as_os_str())?;
     let attr = ObjectPathAttr {
         pathname: pointer(path.as_ptr()),
+        file_flags: (file_flags & !BPF_F_PATH_FD) | (u32::from(path_fd.is_some()) * BPF_F_PATH_FD),
+        path_fd: path_fd.unwrap_or_default(),
         ..Default::default()
     };
     command_fd(BPF_OBJ_GET, &attr)
@@ -1306,6 +1423,17 @@ pub(crate) fn object_get(path: &Path) -> io::Result<OwnedFd> {
 
 pub(crate) fn map_info(fd: RawFd) -> io::Result<MapInfoRaw> {
     object_info(fd)
+}
+
+pub(crate) fn map_content_hash(fd: RawFd) -> io::Result<[u8; 32]> {
+    let mut hash = [0_u8; 32];
+    let mut info = MapInfoRaw {
+        hash: mut_slice_pointer(&mut hash),
+        hash_size: hash.len() as u32,
+        ..Default::default()
+    };
+    object_info_into(fd, &mut info)?;
+    Ok(hash)
 }
 
 pub(crate) fn token_info(fd: RawFd) -> io::Result<TokenInfoRaw> {
@@ -1316,26 +1444,16 @@ pub(crate) fn program_info(fd: RawFd) -> io::Result<ProgramInfoRaw> {
     object_info(fd)
 }
 
-pub(crate) fn program_info_with_map_ids(fd: RawFd) -> io::Result<(ProgramInfoRaw, Vec<u32>)> {
-    let initial = program_info(fd)?;
-    let capacity = initial.nr_map_ids as usize;
-    if capacity == 0 {
-        return Ok((initial, Vec::new()));
-    }
-    let mut map_ids = vec![0_u32; capacity];
-    let mut info = ProgramInfoRaw {
-        map_ids: mut_slice_pointer(&mut map_ids),
-        nr_map_ids: u32::try_from(map_ids.len()).unwrap_or(u32::MAX),
-        ..Default::default()
-    };
-    object_info_into(fd, &mut info)?;
-    map_ids.truncate((info.nr_map_ids as usize).min(capacity));
-    info.map_ids = 0;
-    Ok((info, map_ids))
+pub(crate) fn program_info_into(fd: RawFd, info: &mut ProgramInfoRaw) -> io::Result<()> {
+    object_info_into(fd, info)
 }
 
 pub(crate) fn link_info(fd: RawFd) -> io::Result<LinkInfoRaw> {
     object_info(fd)
+}
+
+pub(crate) fn link_info_into(fd: RawFd, info: &mut LinkInfoRaw) -> io::Result<()> {
+    object_info_into(fd, info)
 }
 
 pub(crate) fn btf_info(fd: RawFd) -> io::Result<(BtfInfoRaw, Vec<u8>, Vec<u8>)> {
@@ -1431,6 +1549,28 @@ pub(crate) fn program_query(
         link_ids,
         link_attach_flags,
     })
+}
+
+pub(crate) fn task_fd_query(
+    process_id: u32,
+    fd: RawFd,
+    flags: u32,
+    buffer_size: usize,
+) -> io::Result<(TaskFdQueryRaw, Vec<u8>)> {
+    let fd = raw_fd_u32(fd)?;
+    let mut buffer = vec![0_u8; buffer_size];
+    let mut query = TaskFdQueryRaw {
+        process_id,
+        fd,
+        flags,
+        buffer_length: u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+        buffer: mut_slice_pointer(&mut buffer),
+        ..Default::default()
+    };
+    command_mut(BPF_TASK_FD_QUERY, &mut query)?;
+    buffer.truncate((query.buffer_length as usize).min(buffer.len()));
+    query.buffer = 0;
+    Ok((query, buffer))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1879,6 +2019,15 @@ pub(crate) fn program_stream_read(
         .map_err(|_| io::Error::other("BPF program stream returned an invalid byte count"))
 }
 
+pub(crate) fn enable_run_time_statistics() -> io::Result<OwnedFd> {
+    command_fd(
+        BPF_ENABLE_STATS,
+        &EnableStatsAttr {
+            stats_type: 0, // BPF_STATS_RUN_TIME
+        },
+    )
+}
+
 pub(crate) fn token_create(bpffs_fd: RawFd, flags: u32) -> io::Result<OwnedFd> {
     let attr = TokenCreateAttr {
         flags,
@@ -2197,6 +2346,51 @@ fn command_fd_sized<T>(command_number: u32, attr: &T, attr_size: usize) -> io::R
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn command_fd_sized_with_common<T>(
+    command_number: u32,
+    attr: &T,
+    attr_size: usize,
+    common: &mut CommonAttr,
+) -> io::Result<OwnedFd> {
+    if attr_size > mem::size_of::<T>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bpf attribute size exceeds its backing value",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: Both values are initialized repr(C) UAPI structures and
+        // remain live and writable as required for the duration of the call.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_bpf,
+                libc::c_long::from(command_number | BPF_COMMON_ATTRS),
+                ptr::from_ref(attr),
+                attr_size,
+                ptr::from_mut(common),
+                mem::size_of::<CommonAttr>(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = RawFd::try_from(result)
+            .map_err(|_| io::Error::other("bpf syscall returned an invalid descriptor"))?;
+        // SAFETY: The successful fd-producing BPF command returned a new
+        // descriptor owned by the caller.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command_number, attr, attr_size, common);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "eBPF is only supported on Linux",
+        ))
+    }
+}
+
 fn command<T>(command_number: u32, attr: &T) -> io::Result<RawFd> {
     command_sized(command_number, attr, mem::size_of::<T>())
 }
@@ -2268,10 +2462,12 @@ mod tests {
     #[test]
     fn kernel_abi_layouts_match_linux_uapi() {
         assert_eq!(mem::size_of::<MapCreateAttr>(), 96);
+        assert_eq!(mem::size_of::<CommonAttr>(), 24);
         assert_eq!(MAP_CREATE_ATTR_SIZE, 92);
         assert_eq!(mem::size_of::<MapElementAttr>(), 32);
         assert_eq!(mem::size_of::<MapBatchAttr>(), 56);
         assert_eq!(mem::size_of::<ProgramLoadAttr>(), 168);
+        assert_eq!(PROGRAM_LOAD_COMMON_PROBE_SIZE, 148);
         assert_eq!(mem::size_of::<BtfLoadAttr>(), 40);
         assert_eq!(mem::size_of::<TokenCreateAttr>(), 8);
         assert_eq!(mem::size_of::<TokenInfoRaw>(), 32);
@@ -2280,6 +2476,7 @@ mod tests {
         assert_eq!(mem::size_of::<GetIdWithTokenAttr>(), 16);
         assert_eq!(mem::size_of::<ProgramAttachAttr>(), 32);
         assert_eq!(mem::size_of::<ProgramQueryAttr>(), 64);
+        assert_eq!(mem::size_of::<TaskFdQueryRaw>(), 48);
         assert_eq!(mem::size_of::<LinkCreateAttr>(), 32);
         assert_eq!(mem::offset_of!(LinkCreateAttr, cookie), 24);
         assert_eq!(mem::size_of::<PerfEventLinkCreateAttr>(), 24);

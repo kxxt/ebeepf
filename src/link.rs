@@ -1,12 +1,14 @@
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::path::Path;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::sys;
-use crate::{Error, Map, MapType, Program, Result, UpdateMode};
+use crate::{Error, Map, MapType, ObjectPathOptions, Program, Result, UpdateMode};
 
 /// A Linux eBPF attachment type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -368,6 +370,251 @@ impl LinkType {
     }
 }
 
+/// Target-specific metadata for a BPF iterator link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum IteratorLinkTarget {
+    /// Iterator over entries of one map.
+    Map {
+        /// Kernel ID of the selected map.
+        map_id: u32,
+    },
+    /// Iterator over a cgroup hierarchy.
+    Cgroup {
+        /// Kernel ID of the starting cgroup.
+        cgroup_id: u64,
+        /// Hierarchy traversal order.
+        order: CgroupLinkOrder,
+    },
+    /// Iterator over a task, task files, or task VMAs.
+    Task {
+        /// Selected thread ID, or zero for all threads.
+        thread_id: u32,
+        /// Selected process ID, or zero for all processes.
+        process_id: u32,
+    },
+    /// Target not decoded by this crate version.
+    Other,
+}
+
+/// Traversal order used by a cgroup iterator.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum CgroupLinkOrder {
+    /// Kernel-selected default traversal.
+    Unspecified,
+    /// Visit only the selected cgroup.
+    SelfOnly,
+    /// Visit descendants in pre-order.
+    DescendantsPre,
+    /// Visit descendants in post-order.
+    DescendantsPost,
+    /// Walk from the selected cgroup toward its ancestors.
+    AncestorsUp,
+    /// Visit direct children.
+    Children,
+    /// Value introduced after this crate version.
+    Other(u32),
+}
+
+impl CgroupLinkOrder {
+    const fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Unspecified,
+            1 => Self::SelfOnly,
+            2 => Self::DescendantsPre,
+            3 => Self::DescendantsPost,
+            4 => Self::AncestorsUp,
+            5 => Self::Children,
+            value => Self::Other(value),
+        }
+    }
+}
+
+/// Decoded metadata for a perf-event BPF link.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum PerfEventLinkDetails {
+    /// Userspace probe or return probe.
+    Uprobe {
+        /// Probed executable path, when disclosed by the kernel.
+        path: Option<PathBuf>,
+        /// Whether this is a return probe.
+        return_probe: bool,
+        /// File offset of the probe.
+        offset: u32,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+        /// File offset of the USDT reference counter.
+        reference_counter_offset: u64,
+    },
+    /// Kernel probe or return probe.
+    Kprobe {
+        /// Probed kernel function, when disclosed by the kernel.
+        function: Option<String>,
+        /// Whether this is a return probe.
+        return_probe: bool,
+        /// Offset from the function entry.
+        offset: u32,
+        /// Resolved kernel address.
+        address: u64,
+        /// Number of missed probe hits.
+        missed: u64,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+    },
+    /// Tracepoint event.
+    Tracepoint {
+        /// Tracepoint name, when disclosed by the kernel.
+        name: Option<String>,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+    },
+    /// Generic perf event.
+    Event {
+        /// Perf-event configuration value.
+        config: u64,
+        /// Perf-event type.
+        event_type: u32,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+    },
+    /// Perf-event subtype not decoded by this crate version.
+    Other(u32),
+}
+
+/// Type-specific metadata from the `bpf_link_info` union.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum LinkDetails {
+    /// No type-specific metadata.
+    Unspecified,
+    /// Raw tracepoint target.
+    RawTracepoint {
+        /// Tracepoint name.
+        name: String,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+    },
+    /// BTF tracing, LSM, or extension target.
+    Tracing {
+        /// Hook attachment type.
+        attach_type: AttachType,
+        /// Kernel ID of the target program or BTF object.
+        target_btf_object_id: u32,
+        /// Type ID within the target BTF object.
+        target_btf_id: u32,
+        /// Caller-supplied attachment cookie.
+        cookie: u64,
+    },
+    /// Cgroup target.
+    Cgroup {
+        /// Kernel ID of the target cgroup.
+        cgroup_id: u64,
+        /// Hook attachment type.
+        attach_type: AttachType,
+    },
+    /// Iterator target and decoded iterator-specific selector.
+    Iterator {
+        /// Kernel iterator target name.
+        target_name: String,
+        /// Target-specific selector.
+        target: IteratorLinkTarget,
+    },
+    /// Network-namespace target.
+    NetworkNamespace {
+        /// Network namespace inode.
+        inode: u32,
+        /// Hook attachment type.
+        attach_type: AttachType,
+    },
+    /// XDP network-device target.
+    Xdp {
+        /// Target network interface index.
+        interface_index: u32,
+    },
+    /// Perf-event target.
+    PerfEvent(PerfEventLinkDetails),
+    /// Multiple kernel-probe targets.
+    KprobeMulti {
+        /// Kernel attachment flags.
+        flags: u32,
+        /// Number of missed probe hits.
+        missed: u64,
+        /// Resolved target addresses.
+        addresses: Vec<u64>,
+        /// Attachment cookies corresponding to the addresses.
+        cookies: Vec<u64>,
+    },
+    /// Map backing a `struct_ops` link.
+    StructOps {
+        /// Kernel ID of the backing map.
+        map_id: u32,
+    },
+    /// Netfilter hook target.
+    Netfilter {
+        /// Network protocol family.
+        protocol_family: u32,
+        /// Netfilter hook number.
+        hook_number: u32,
+        /// Hook priority.
+        priority: i32,
+        /// Kernel attachment flags.
+        flags: u32,
+    },
+    /// TCX network-device target.
+    Tcx {
+        /// Target network interface index.
+        interface_index: u32,
+        /// Hook attachment type.
+        attach_type: AttachType,
+    },
+    /// Multiple userspace-probe targets.
+    UprobeMulti {
+        /// Probed executable path, when disclosed by the kernel.
+        path: Option<PathBuf>,
+        /// Kernel attachment flags.
+        flags: u32,
+        /// Target process ID, or zero for all processes.
+        process_id: u32,
+        /// File offsets of the probes.
+        offsets: Vec<u64>,
+        /// USDT reference-counter offsets corresponding to the probes.
+        reference_counter_offsets: Vec<u64>,
+        /// Attachment cookies corresponding to the probes.
+        cookies: Vec<u64>,
+    },
+    /// Netkit network-device target.
+    Netkit {
+        /// Target network interface index.
+        interface_index: u32,
+        /// Hook attachment type.
+        attach_type: AttachType,
+    },
+    /// Socket-map target.
+    SocketMap {
+        /// Kernel ID of the target socket map.
+        map_id: u32,
+        /// Hook attachment type.
+        attach_type: AttachType,
+    },
+    /// Multiple BTF tracing targets.
+    TracingMulti {
+        /// Hook attachment type.
+        attach_type: AttachType,
+        /// Kernel ID of the target BTF object.
+        btf_object_id: u32,
+        /// Target type IDs.
+        type_ids: Vec<u32>,
+        /// Resolved target addresses.
+        addresses: Vec<u64>,
+        /// Attachment cookies corresponding to the targets.
+        cookies: Vec<u64>,
+    },
+    /// Type introduced after this crate version.
+    Other([u8; 48]),
+}
+
 /// Metadata common to a kernel `bpf_link`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkInfo {
@@ -389,6 +636,8 @@ pub struct LinkInfo {
     pub target_btf_id: Option<u32>,
     /// Cgroup kernel ID for cgroup links.
     pub cgroup_id: Option<u64>,
+    /// Fully decoded type-specific metadata.
+    pub details: LinkDetails,
 }
 
 enum LinkFd {
@@ -513,8 +762,17 @@ impl Link {
 
     /// Opens a link pinned in bpffs.
     pub fn open_pinned(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_pinned_with(path, ObjectPathOptions::new())
+    }
+
+    /// Opens a pinned link with access flags or directory-relative resolution.
+    pub fn open_pinned_with(
+        path: impl AsRef<Path>,
+        options: ObjectPathOptions<'_>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fd = sys::object_get(path).map_err(|source| Error::File {
+        let (flags, directory) = options.raw_for_open();
+        let fd = sys::object_get_with(path, flags, directory).map_err(|source| Error::File {
             operation: "open pinned link",
             path: path.into(),
             source,
@@ -547,6 +805,11 @@ impl Link {
 
     /// Pins a kernel link in bpffs so it outlives this process.
     pub fn pin(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.pin_with(path, ObjectPathOptions::new())
+    }
+
+    /// Pins this link with optional directory-relative resolution.
+    pub fn pin_with(&self, path: impl AsRef<Path>, options: ObjectPathOptions<'_>) -> Result<()> {
         let path = path.as_ref();
         let fd = match &self.fd {
             LinkFd::Bpf(fd) => fd,
@@ -557,7 +820,8 @@ impl Link {
                 ));
             }
         };
-        sys::object_pin(fd.as_raw_fd(), path).map_err(|source| Error::File {
+        let directory = options.raw_for_pin()?;
+        sys::object_pin_with(fd.as_raw_fd(), path, 0, directory).map_err(|source| Error::File {
             operation: "pin link",
             path: path.into(),
             source,
@@ -643,28 +907,15 @@ impl Link {
                 ));
             }
         };
-        let raw = sys::link_info(fd.as_raw_fd())
+        let mut raw = sys::link_info(fd.as_raw_fd())
             .map_err(|source| Error::system("read eBPF link metadata", source))?;
         let link_type = LinkType::from_raw(raw.link_type);
-        let detail_u32 = |offset: usize| {
-            u32::from_ne_bytes(
-                raw.details[offset..offset + 4]
-                    .try_into()
-                    .expect("fixed link-info range"),
-            )
-        };
-        let detail_u64 = |offset: usize| {
-            u64::from_ne_bytes(
-                raw.details[offset..offset + 8]
-                    .try_into()
-                    .expect("fixed link-info range"),
-            )
-        };
+        let details = decode_link_details(fd.as_raw_fd(), &mut raw, link_type)?;
         let attach_type = match link_type {
-            LinkType::Tracing => Some(AttachType::from_raw(detail_u32(0))),
-            LinkType::Cgroup => Some(AttachType::from_raw(detail_u32(8))),
+            LinkType::Tracing => Some(AttachType::from_raw(detail_u32(&raw.details, 0))),
+            LinkType::Cgroup => Some(AttachType::from_raw(detail_u32(&raw.details, 8))),
             LinkType::Tcx | LinkType::Netkit | LinkType::SocketMap => {
-                Some(AttachType::from_raw(detail_u32(4)))
+                Some(AttachType::from_raw(detail_u32(&raw.details, 4)))
             }
             _ => None,
         };
@@ -674,12 +925,14 @@ impl Link {
             program_id: raw.program_id,
             attach_type,
             interface_index: matches!(link_type, LinkType::Xdp | LinkType::Tcx | LinkType::Netkit)
-                .then(|| detail_u32(0)),
+                .then(|| detail_u32(&raw.details, 0)),
             map_id: matches!(link_type, LinkType::StructOps | LinkType::SocketMap)
-                .then(|| detail_u32(0)),
-            target_btf_object_id: (link_type == LinkType::Tracing).then(|| detail_u32(4)),
-            target_btf_id: (link_type == LinkType::Tracing).then(|| detail_u32(8)),
-            cgroup_id: (link_type == LinkType::Cgroup).then(|| detail_u64(0)),
+                .then(|| detail_u32(&raw.details, 0)),
+            target_btf_object_id: (link_type == LinkType::Tracing)
+                .then(|| detail_u32(&raw.details, 4)),
+            target_btf_id: (link_type == LinkType::Tracing).then(|| detail_u32(&raw.details, 8)),
+            cgroup_id: (link_type == LinkType::Cgroup).then(|| detail_u64(&raw.details, 0)),
+            details,
         })
     }
 
@@ -718,6 +971,325 @@ impl Link {
             LinkFd::PerfEvents(_) | LinkFd::Detached => Ok(()),
         }
     }
+}
+
+const MAX_LINK_INFO_ITEMS: usize = 1 << 20;
+const MAX_LINK_INFO_STRING: usize = 1 << 20;
+const DEFAULT_LINK_INFO_STRING: usize = 4096;
+
+fn detail_u32(details: &[u8; 48], offset: usize) -> u32 {
+    u32::from_ne_bytes(
+        details[offset..offset + 4]
+            .try_into()
+            .expect("fixed link-info u32 range"),
+    )
+}
+
+fn detail_i32(details: &[u8; 48], offset: usize) -> i32 {
+    i32::from_ne_bytes(
+        details[offset..offset + 4]
+            .try_into()
+            .expect("fixed link-info i32 range"),
+    )
+}
+
+fn detail_u64(details: &[u8; 48], offset: usize) -> u64 {
+    u64::from_ne_bytes(
+        details[offset..offset + 8]
+            .try_into()
+            .expect("fixed link-info u64 range"),
+    )
+}
+
+fn set_detail_u32(details: &mut [u8; 48], offset: usize, value: u32) {
+    details[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn set_detail_u64(details: &mut [u8; 48], offset: usize, value: u64) {
+    details[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn link_info_string_buffer(reported: u32) -> Result<Vec<u8>> {
+    let capacity = (reported as usize).max(DEFAULT_LINK_INFO_STRING);
+    if capacity > MAX_LINK_INFO_STRING {
+        return Err(Error::InvalidObject(format!(
+            "kernel link-info string length {capacity} is unreasonable"
+        )));
+    }
+    Ok(vec![0; capacity])
+}
+
+fn link_info_u64_buffer(count: u32) -> Result<Vec<u64>> {
+    let count = count as usize;
+    if count > MAX_LINK_INFO_ITEMS {
+        return Err(Error::InvalidObject(format!(
+            "kernel link-info item count {count} is unreasonable"
+        )));
+    }
+    Ok(vec![0; count])
+}
+
+fn link_info_u32_buffer(count: u32) -> Result<Vec<u32>> {
+    let count = count as usize;
+    if count > MAX_LINK_INFO_ITEMS {
+        return Err(Error::InvalidObject(format!(
+            "kernel link-info item count {count} is unreasonable"
+        )));
+    }
+    Ok(vec![0; count])
+}
+
+fn buffer_bytes(buffer: &[u8], reported: u32) -> &[u8] {
+    let end = (reported as usize).min(buffer.len());
+    let bytes = &buffer[..end];
+    let nul = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    &bytes[..nul]
+}
+
+fn buffer_string(buffer: &[u8], reported: u32) -> String {
+    String::from_utf8_lossy(buffer_bytes(buffer, reported)).into_owned()
+}
+
+fn buffer_path(buffer: &[u8], reported: u32) -> Option<PathBuf> {
+    (reported != 0)
+        .then(|| PathBuf::from(OsString::from_vec(buffer_bytes(buffer, reported).into())))
+}
+
+fn refresh_link_info(fd: i32, raw: &mut sys::LinkInfoRaw) -> Result<()> {
+    sys::link_info_into(fd, raw)
+        .map_err(|source| Error::system("read detailed eBPF link metadata", source))
+}
+
+fn decode_link_details(
+    fd: i32,
+    raw: &mut sys::LinkInfoRaw,
+    link_type: LinkType,
+) -> Result<LinkDetails> {
+    match link_type {
+        LinkType::Unspecified => Ok(LinkDetails::Unspecified),
+        LinkType::RawTracepoint => {
+            let mut name = link_info_string_buffer(detail_u32(&raw.details, 8))?;
+            set_detail_u64(&mut raw.details, 0, name.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                8,
+                u32::try_from(name.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            Ok(LinkDetails::RawTracepoint {
+                name: buffer_string(&name, detail_u32(&raw.details, 8)),
+                cookie: detail_u64(&raw.details, 16),
+            })
+        }
+        LinkType::Tracing => Ok(LinkDetails::Tracing {
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 0)),
+            target_btf_object_id: detail_u32(&raw.details, 4),
+            target_btf_id: detail_u32(&raw.details, 8),
+            cookie: detail_u64(&raw.details, 16),
+        }),
+        LinkType::Cgroup => Ok(LinkDetails::Cgroup {
+            cgroup_id: detail_u64(&raw.details, 0),
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 8)),
+        }),
+        LinkType::Iterator => {
+            let mut name = link_info_string_buffer(detail_u32(&raw.details, 8))?;
+            set_detail_u64(&mut raw.details, 0, name.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                8,
+                u32::try_from(name.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            let target_name = buffer_string(&name, detail_u32(&raw.details, 8));
+            let target = match target_name.as_str() {
+                "bpf_map_elem" | "bpf_sk_storage_map" => IteratorLinkTarget::Map {
+                    map_id: detail_u32(&raw.details, 12),
+                },
+                "cgroup" => IteratorLinkTarget::Cgroup {
+                    cgroup_id: detail_u64(&raw.details, 16),
+                    order: CgroupLinkOrder::from_raw(detail_u32(&raw.details, 24)),
+                },
+                "task" | "task_file" | "task_vma" => IteratorLinkTarget::Task {
+                    thread_id: detail_u32(&raw.details, 16),
+                    process_id: detail_u32(&raw.details, 20),
+                },
+                _ => IteratorLinkTarget::Other,
+            };
+            Ok(LinkDetails::Iterator {
+                target_name,
+                target,
+            })
+        }
+        LinkType::NetworkNamespace => Ok(LinkDetails::NetworkNamespace {
+            inode: detail_u32(&raw.details, 0),
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 4)),
+        }),
+        LinkType::Xdp => Ok(LinkDetails::Xdp {
+            interface_index: detail_u32(&raw.details, 0),
+        }),
+        LinkType::PerfEvent => decode_perf_event_details(fd, raw),
+        LinkType::KprobeMulti => {
+            let capacity = detail_u32(&raw.details, 8);
+            let mut addresses = link_info_u64_buffer(capacity)?;
+            let mut cookies = link_info_u64_buffer(capacity)?;
+            set_detail_u64(&mut raw.details, 0, addresses.as_mut_ptr() as usize as u64);
+            set_detail_u64(&mut raw.details, 24, cookies.as_mut_ptr() as usize as u64);
+            refresh_link_info(fd, raw)?;
+            let count = (detail_u32(&raw.details, 8) as usize).min(addresses.len());
+            addresses.truncate(count);
+            cookies.truncate(count);
+            Ok(LinkDetails::KprobeMulti {
+                flags: detail_u32(&raw.details, 12),
+                missed: detail_u64(&raw.details, 16),
+                addresses,
+                cookies,
+            })
+        }
+        LinkType::StructOps => Ok(LinkDetails::StructOps {
+            map_id: detail_u32(&raw.details, 0),
+        }),
+        LinkType::Netfilter => Ok(LinkDetails::Netfilter {
+            protocol_family: detail_u32(&raw.details, 0),
+            hook_number: detail_u32(&raw.details, 4),
+            priority: detail_i32(&raw.details, 8),
+            flags: detail_u32(&raw.details, 12),
+        }),
+        LinkType::Tcx => Ok(LinkDetails::Tcx {
+            interface_index: detail_u32(&raw.details, 0),
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 4)),
+        }),
+        LinkType::UprobeMulti => {
+            let path_capacity = detail_u32(&raw.details, 32);
+            let item_capacity = detail_u32(&raw.details, 36);
+            let mut path = link_info_string_buffer(path_capacity)?;
+            let mut offsets = link_info_u64_buffer(item_capacity)?;
+            let mut reference_counter_offsets = link_info_u64_buffer(item_capacity)?;
+            let mut cookies = link_info_u64_buffer(item_capacity)?;
+            set_detail_u64(&mut raw.details, 0, path.as_mut_ptr() as usize as u64);
+            set_detail_u64(&mut raw.details, 8, offsets.as_mut_ptr() as usize as u64);
+            set_detail_u64(
+                &mut raw.details,
+                16,
+                reference_counter_offsets.as_mut_ptr() as usize as u64,
+            );
+            set_detail_u64(&mut raw.details, 24, cookies.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                32,
+                u32::try_from(path.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            let count = (detail_u32(&raw.details, 36) as usize).min(offsets.len());
+            offsets.truncate(count);
+            reference_counter_offsets.truncate(count);
+            cookies.truncate(count);
+            Ok(LinkDetails::UprobeMulti {
+                path: buffer_path(&path, detail_u32(&raw.details, 32)),
+                flags: detail_u32(&raw.details, 40),
+                process_id: detail_u32(&raw.details, 44),
+                offsets,
+                reference_counter_offsets,
+                cookies,
+            })
+        }
+        LinkType::Netkit => Ok(LinkDetails::Netkit {
+            interface_index: detail_u32(&raw.details, 0),
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 4)),
+        }),
+        LinkType::SocketMap => Ok(LinkDetails::SocketMap {
+            map_id: detail_u32(&raw.details, 0),
+            attach_type: AttachType::from_raw(detail_u32(&raw.details, 4)),
+        }),
+        LinkType::TracingMulti => {
+            let capacity = detail_u32(&raw.details, 4);
+            let mut type_ids = link_info_u32_buffer(capacity)?;
+            let mut addresses = link_info_u64_buffer(capacity)?;
+            let mut cookies = link_info_u64_buffer(capacity)?;
+            set_detail_u64(&mut raw.details, 16, type_ids.as_mut_ptr() as usize as u64);
+            set_detail_u64(&mut raw.details, 24, addresses.as_mut_ptr() as usize as u64);
+            set_detail_u64(&mut raw.details, 32, cookies.as_mut_ptr() as usize as u64);
+            refresh_link_info(fd, raw)?;
+            let count = (detail_u32(&raw.details, 4) as usize).min(type_ids.len());
+            type_ids.truncate(count);
+            addresses.truncate(count);
+            cookies.truncate(count);
+            Ok(LinkDetails::TracingMulti {
+                attach_type: AttachType::from_raw(detail_u32(&raw.details, 0)),
+                btf_object_id: detail_u32(&raw.details, 8),
+                type_ids,
+                addresses,
+                cookies,
+            })
+        }
+        LinkType::Other(_) => Ok(LinkDetails::Other(raw.details)),
+    }
+}
+
+fn decode_perf_event_details(fd: i32, raw: &mut sys::LinkInfoRaw) -> Result<LinkDetails> {
+    let event_kind = detail_u32(&raw.details, 0);
+    let details = match event_kind {
+        1 | 2 => {
+            let mut name = link_info_string_buffer(detail_u32(&raw.details, 16))?;
+            set_detail_u64(&mut raw.details, 8, name.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                16,
+                u32::try_from(name.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            PerfEventLinkDetails::Uprobe {
+                path: buffer_path(&name, detail_u32(&raw.details, 16)),
+                return_probe: event_kind == 2,
+                offset: detail_u32(&raw.details, 20),
+                cookie: detail_u64(&raw.details, 24),
+                reference_counter_offset: detail_u64(&raw.details, 32),
+            }
+        }
+        3 | 4 => {
+            let mut name = link_info_string_buffer(detail_u32(&raw.details, 16))?;
+            set_detail_u64(&mut raw.details, 8, name.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                16,
+                u32::try_from(name.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            let reported = detail_u32(&raw.details, 16);
+            PerfEventLinkDetails::Kprobe {
+                function: (reported != 0).then(|| buffer_string(&name, reported)),
+                return_probe: event_kind == 4,
+                offset: detail_u32(&raw.details, 20),
+                address: detail_u64(&raw.details, 24),
+                missed: detail_u64(&raw.details, 32),
+                cookie: detail_u64(&raw.details, 40),
+            }
+        }
+        5 => {
+            let mut name = link_info_string_buffer(detail_u32(&raw.details, 16))?;
+            set_detail_u64(&mut raw.details, 8, name.as_mut_ptr() as usize as u64);
+            set_detail_u32(
+                &mut raw.details,
+                16,
+                u32::try_from(name.len()).unwrap_or(u32::MAX),
+            );
+            refresh_link_info(fd, raw)?;
+            let reported = detail_u32(&raw.details, 16);
+            PerfEventLinkDetails::Tracepoint {
+                name: (reported != 0).then(|| buffer_string(&name, reported)),
+                cookie: detail_u64(&raw.details, 24),
+            }
+        }
+        6 => PerfEventLinkDetails::Event {
+            config: detail_u64(&raw.details, 8),
+            event_type: detail_u32(&raw.details, 16),
+            cookie: detail_u64(&raw.details, 24),
+        },
+        value => PerfEventLinkDetails::Other(value),
+    };
+    Ok(LinkDetails::PerfEvent(details))
 }
 
 impl Drop for Link {
@@ -760,5 +1332,48 @@ mod tests {
         for raw in 0..60 {
             assert_eq!(AttachType::from_raw(raw).as_raw(), raw);
         }
+    }
+
+    #[test]
+    fn decodes_static_link_union_variants() {
+        let mut tracing = sys::LinkInfoRaw::default();
+        set_detail_u32(
+            &mut tracing.details,
+            0,
+            AttachType::TraceFunctionEntry.as_raw(),
+        );
+        set_detail_u32(&mut tracing.details, 4, 17);
+        set_detail_u32(&mut tracing.details, 8, 23);
+        set_detail_u64(&mut tracing.details, 16, 0xfeed);
+        assert_eq!(
+            decode_link_details(-1, &mut tracing, LinkType::Tracing).unwrap(),
+            LinkDetails::Tracing {
+                attach_type: AttachType::TraceFunctionEntry,
+                target_btf_object_id: 17,
+                target_btf_id: 23,
+                cookie: 0xfeed,
+            }
+        );
+
+        let mut perf = sys::LinkInfoRaw::default();
+        set_detail_u32(&mut perf.details, 0, 6);
+        set_detail_u64(&mut perf.details, 8, 91);
+        set_detail_u32(&mut perf.details, 16, 7);
+        set_detail_u64(&mut perf.details, 24, 42);
+        assert_eq!(
+            decode_link_details(-1, &mut perf, LinkType::PerfEvent).unwrap(),
+            LinkDetails::PerfEvent(PerfEventLinkDetails::Event {
+                config: 91,
+                event_type: 7,
+                cookie: 42,
+            })
+        );
+    }
+
+    #[test]
+    fn link_info_allocations_are_bounded() {
+        assert!(link_info_u64_buffer((MAX_LINK_INFO_ITEMS + 1) as u32).is_err());
+        assert!(link_info_string_buffer((MAX_LINK_INFO_STRING + 1) as u32).is_err());
+        assert_eq!(mem::size_of::<sys::LinkInfoRaw>(), 64);
     }
 }

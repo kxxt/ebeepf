@@ -4,7 +4,7 @@ use std::fs;
 use std::fs::File;
 use std::io::{self, ErrorKind, Read};
 use std::mem::size_of;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::str;
 
@@ -319,7 +319,7 @@ impl Object {
                 program_type: ProgramType::Unspecified,
                 attach_type: None,
             });
-            let auto_attach = kind_supports_auto_attach(&kind);
+            let auto_attach = kind_supports_auto_attach(&kind, entry_name);
             let mut spec = ProgramSpec {
                 name: program_name.clone(),
                 section: entry_name.into(),
@@ -338,6 +338,8 @@ impl Object {
                 func_info_record_size: 0,
                 line_info: Vec::new(),
                 line_info_record_size: 0,
+                signature: None,
+                keyring_id: 0,
                 verifier_log: VerifierLog::default(),
                 section_index: entry_index,
                 section_offset: entry.byte_offset as u64,
@@ -436,6 +438,23 @@ impl Object {
             .position(|byte| *byte == 0)
             .unwrap_or(self.license.len());
         str::from_utf8(&self.license[..end]).unwrap_or("")
+    }
+
+    /// Kernel version shared by all program definitions, when consistent.
+    pub fn kernel_version(&self) -> Option<u32> {
+        let mut programs = self.programs.values();
+        let version = programs.next()?.kernel_version();
+        programs
+            .all(|program| program.kernel_version() == version)
+            .then_some(version)
+    }
+
+    /// Sets the legacy kernel version on every program definition.
+    pub fn set_kernel_version(&mut self, kernel_version: u32) -> &mut Self {
+        for program in self.programs.values_mut() {
+            program.set_kernel_version(kernel_version);
+        }
+        self
     }
 
     /// Parsed BTF, when the object contains it.
@@ -756,6 +775,11 @@ impl LoadedObject {
         self.btf_fd.is_some()
     }
 
+    /// Borrows the loaded object BTF descriptor, when one was created.
+    pub fn btf_fd(&self) -> Option<BorrowedFd<'_>> {
+        self.btf_fd.as_ref().map(AsFd::as_fd)
+    }
+
     /// Token retained from this object's delegated load, when present.
     pub fn token(&self) -> Option<&BpfToken> {
         self.token.as_ref()
@@ -797,6 +821,116 @@ impl LoadedObject {
         self.programs
             .remove(name)
             .ok_or_else(|| Error::ProgramNotFound(name.into()))
+    }
+
+    /// Pins every loaded map below `directory`.
+    ///
+    /// Periods in object names are replaced with underscores because bpffs
+    /// does not accept them. If any pin fails, pins created by this call are
+    /// removed before the error is returned.
+    pub fn pin_maps(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        create_pin_directory(directory)?;
+        let mut pinned = Vec::new();
+        for map in self.maps.values() {
+            let path = match object_pin_path(directory, map.name()) {
+                Ok(path) => path,
+                Err(error) => {
+                    rollback_pins(&pinned);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = map.pin(&path) {
+                rollback_pins(&pinned);
+                return Err(error);
+            }
+            pinned.push(path);
+        }
+        Ok(())
+    }
+
+    /// Removes every map pin below `directory` without closing map handles.
+    pub fn unpin_maps(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        for map in self.maps.values() {
+            map.unpin(object_pin_path(directory, map.name())?)?;
+        }
+        Ok(())
+    }
+
+    /// Pins every loaded program below `directory`.
+    ///
+    /// If any pin fails, pins created by this call are removed before the
+    /// error is returned.
+    pub fn pin_programs(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        create_pin_directory(directory)?;
+        let mut pinned = Vec::new();
+        for program in self.programs.values() {
+            let path = match object_pin_path(directory, program.name()) {
+                Ok(path) => path,
+                Err(error) => {
+                    rollback_pins(&pinned);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = program.pin(&path) {
+                rollback_pins(&pinned);
+                return Err(error);
+            }
+            pinned.push(path);
+        }
+        Ok(())
+    }
+
+    /// Removes every program pin below `directory` without closing handles.
+    pub fn unpin_programs(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        for program in self.programs.values() {
+            program.unpin(object_pin_path(directory, program.name())?)?;
+        }
+        Ok(())
+    }
+
+    /// Pins all loaded maps and programs below one directory transactionally.
+    pub fn pin(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        self.pin_maps(directory)?;
+        if let Err(error) = self.pin_programs(directory) {
+            drop(self.unpin_maps(directory));
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Removes all program pins followed by all map pins below one directory.
+    pub fn unpin(&self, directory: impl AsRef<Path>) -> Result<()> {
+        let directory = directory.as_ref();
+        self.unpin_programs(directory)?;
+        self.unpin_maps(directory)
+    }
+}
+
+fn create_pin_directory(directory: &Path) -> Result<()> {
+    fs::create_dir_all(directory).map_err(|source| Error::File {
+        operation: "create pin directory",
+        path: directory.into(),
+        source,
+    })
+}
+
+fn object_pin_path(directory: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.bytes().any(|byte| byte == b'/' || byte == 0) {
+        return Err(Error::InvalidObject(format!(
+            "`{name}` cannot be used as a bpffs pin name"
+        )));
+    }
+    Ok(directory.join(name.replace('.', "_")))
+}
+
+fn rollback_pins(paths: &[PathBuf]) {
+    for path in paths.iter().rev() {
+        drop(fs::remove_file(path));
     }
 }
 
@@ -3550,6 +3684,7 @@ fn load_maps(
                         value_size: spec.value_size,
                         max_entries: spec.max_entries,
                         flags: spec.flags.bits(),
+                        interface_index: spec.interface_index,
                         inner_map_fd: inner_fd,
                         numa_node: spec.numa_node,
                         btf_fd: with_btf.then_some(btf_fd).flatten().map(AsRawFd::as_raw_fd),
@@ -3569,6 +3704,8 @@ fn load_maps(
                         map_extra: spec.map_extra,
                         token_fd,
                         exclusive_program_hash: exclusive_program_hash.as_ref(),
+                        log_level: spec.creation_log.map_or(0, |log| log.level),
+                        log_size: spec.creation_log.map_or(0, |log| log.capacity),
                     })
                 };
                 let with_btf = accepts_btf
@@ -3576,14 +3713,18 @@ fn load_maps(
                     && (spec.btf_key_type != TypeId::VOID || spec.btf_value_type != TypeId::VOID);
                 let fd = match create(with_btf) {
                     Ok(fd) => fd,
-                    Err(_) if with_btf => create(false).map_err(|source| Error::MapCreate {
-                        map: name.clone(),
-                        source,
-                    })?,
-                    Err(source) => {
+                    Err(_) if with_btf => {
+                        create(false).map_err(|(source, log)| Error::MapCreate {
+                            map: name.clone(),
+                            source,
+                            log,
+                        })?
+                    }
+                    Err((source, log)) => {
                         return Err(Error::MapCreate {
                             map: name.clone(),
                             source,
+                            log,
                         });
                     }
                 };
@@ -3626,6 +3767,7 @@ fn ensure_map_compatible(spec: &MapSpec, map: &Map) -> Result<()> {
         || info.value_size != spec.value_size
         || info.max_entries != spec.max_entries
         || info.flags != spec.flags
+        || info.interface_index != spec.interface_index
     {
         return Err(Error::InvalidObject(format!(
             "pinned map `{}` is incompatible with the object definition",
@@ -6094,5 +6236,16 @@ mod tests {
         assert_eq!(parse_kconfig_integer("0x2a").unwrap(), 42);
         assert_eq!(parse_kconfig_integer("-1").unwrap(), u64::MAX);
         assert!(parse_kconfig_integer("12oops").is_err());
+    }
+
+    #[test]
+    fn aggregate_pin_paths_are_safe_bpffs_components() {
+        let root = Path::new("/sys/fs/bpf/sample");
+        assert_eq!(
+            object_pin_path(root, "object.rodata").unwrap(),
+            root.join("object_rodata")
+        );
+        assert!(object_pin_path(root, "nested/program").is_err());
+        assert!(object_pin_path(root, "").is_err());
     }
 }

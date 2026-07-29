@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -6,12 +8,12 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
-use goblin::elf::sym::STT_FUNC;
+use goblin::elf::sym::{Sym, STT_FUNC};
 use goblin::elf::Elf;
 use sha2::{Digest, Sha256};
 
 use crate::link::{AttachType, Link};
-use crate::map::{kernel_name, Map};
+use crate::map::{kernel_name, Map, ObjectPathOptions};
 use crate::sys::{self, ProgramLoad};
 use crate::usdt::{UsdtManager, UsdtOptions};
 use crate::{BpfToken, BtfKind, BtfObject, Error, Instruction, Result, TypeId};
@@ -405,6 +407,10 @@ impl ProgramKind {
             },
             "cgroup_skb" if target == "egress" => Self::Cgroup {
                 attach_type: AttachType::CgroupInetEgress,
+            },
+            "cgroup" if target == "skb" => Self::Other {
+                program_type: ProgramType::CgroupSocketBuffer,
+                attach_type: None,
             },
             "cgroup" if target == "dev" => Self::Cgroup {
                 attach_type: AttachType::CgroupDevice,
@@ -821,12 +827,43 @@ impl<'target> OrderedLinkOptions<'target> {
     }
 }
 
-pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind) -> bool {
+pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind, section: &str) -> bool {
+    let prefix = section
+        .split_once('/')
+        .map_or(section, |(prefix, _)| prefix);
     match kind {
-        ProgramKind::Kprobe { .. }
-        | ProgramKind::Tracepoint { .. }
-        | ProgramKind::RawTracepoint { .. } => true,
+        ProgramKind::Kprobe {
+            function,
+            return_probe,
+        } => {
+            !function.is_empty()
+                && if matches!(prefix, "ksyscall" | "kretsyscall") {
+                    valid_probe_name(function)
+                } else {
+                    parse_kprobe_target(function, *return_probe).is_ok()
+                }
+        }
+        ProgramKind::Uprobe {
+            target,
+            return_probe,
+        } => parse_uprobe_target(target, *return_probe).is_ok(),
+        ProgramKind::Tracepoint { .. } | ProgramKind::RawTracepoint { .. } => true,
         ProgramKind::Tracing { target, .. } => !target.is_empty(),
+        ProgramKind::Other { attach_type, .. } => {
+            if matches!(prefix, "usdt" | "usdt.s") {
+                parse_usdt_target(section).is_ok()
+            } else {
+                match attach_type {
+                    Some(AttachType::TraceKprobeMulti | AttachType::TraceKprobeSession) => section
+                        .split_once('/')
+                        .is_some_and(|(_, target)| valid_probe_pattern(target)),
+                    Some(AttachType::TraceUprobeMulti | AttachType::TraceUprobeSession) => {
+                        parse_uprobe_multi_target(section).is_ok()
+                    }
+                    _ => false,
+                }
+            }
+        }
         _ => false,
     }
 }
@@ -873,6 +910,8 @@ pub struct ProgramSpec {
     pub(crate) func_info_record_size: u32,
     pub(crate) line_info: Vec<u8>,
     pub(crate) line_info_record_size: u32,
+    pub(crate) signature: Option<Vec<u8>>,
+    pub(crate) keyring_id: i32,
     pub(crate) verifier_log: VerifierLog,
     pub(crate) section_index: usize,
     pub(crate) section_offset: u64,
@@ -887,7 +926,7 @@ impl ProgramSpec {
     ) -> Result<Self> {
         let section = section.into();
         let kind = ProgramKind::from_section(&section)?;
-        let auto_attach = kind_supports_auto_attach(&kind);
+        let auto_attach = kind_supports_auto_attach(&kind, &section);
         let flags = program_flags_from_section(&section);
         Ok(Self {
             name: name.into(),
@@ -907,6 +946,8 @@ impl ProgramSpec {
             func_info_record_size: 0,
             line_info: Vec::new(),
             line_info_record_size: 0,
+            signature: None,
+            keyring_id: 0,
             verifier_log: VerifierLog::default(),
             section_index: 0,
             section_offset: 0,
@@ -936,6 +977,47 @@ impl ProgramSpec {
     /// Program instructions, after ELF relocation.
     pub fn instructions(&self) -> &[Instruction] {
         &self.instructions
+    }
+
+    /// Program load flags.
+    pub const fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    /// Kernel version encoded for legacy program types.
+    ///
+    /// Zero asks object loading to use the running kernel version when the
+    /// selected program type requires one.
+    pub const fn kernel_version(&self) -> u32 {
+        self.kernel_version
+    }
+
+    /// Cryptographic program signature and kernel keyring ID, when configured.
+    pub fn signature(&self) -> Option<(&[u8], i32)> {
+        self.signature
+            .as_deref()
+            .map(|signature| (signature, self.keyring_id))
+    }
+
+    /// BTF function-info records associated with the instruction stream.
+    pub fn function_info(&self) -> ProgramInfoRecordsRef<'_> {
+        ProgramInfoRecordsRef {
+            record_size: self.func_info_record_size,
+            bytes: &self.func_info,
+        }
+    }
+
+    /// BTF line-info records associated with the instruction stream.
+    pub fn line_info(&self) -> ProgramInfoRecordsRef<'_> {
+        ProgramInfoRecordsRef {
+            record_size: self.line_info_record_size,
+            bytes: &self.line_info,
+        }
+    }
+
+    /// Current verifier logging configuration.
+    pub const fn verifier_log(&self) -> VerifierLog {
+        self.verifier_log
     }
 
     /// Whether [`crate::Object::load`] loads this program.
@@ -991,7 +1073,7 @@ impl ProgramSpec {
     /// Whether [`Program::attach`] can attach this program without additional
     /// runtime arguments.
     pub fn auto_attachable(&self) -> bool {
-        self.auto_attach && kind_supports_auto_attach(&self.kind)
+        self.auto_attach && kind_supports_auto_attach(&self.kind, &self.section)
     }
 
     /// Enables or disables automatic loading.
@@ -1009,6 +1091,61 @@ impl ProgramSpec {
     /// Overrides the inferred program and attachment kind.
     pub fn set_kind(&mut self, kind: ProgramKind) -> &mut Self {
         self.kind = kind;
+        self
+    }
+
+    /// Replaces the complete instruction stream before loading.
+    ///
+    /// Parsed BTF function and line records and any cryptographic signature
+    /// describe the original stream and are therefore cleared. Callers
+    /// replacing instructions are responsible for supplying an already
+    /// relocated, verifier-ready stream.
+    pub fn set_instructions(&mut self, instructions: Vec<Instruction>) -> &mut Self {
+        self.instructions = instructions;
+        self.func_info.clear();
+        self.func_info_record_size = 0;
+        self.line_info.clear();
+        self.line_info_record_size = 0;
+        self.signature = None;
+        self.keyring_id = 0;
+        self
+    }
+
+    /// Sets the encoded kernel version used by legacy program types.
+    pub fn set_kernel_version(&mut self, kernel_version: u32) -> &mut Self {
+        self.kernel_version = kernel_version;
+        self
+    }
+
+    /// Supplies a cryptographic signature for kernel verification at load.
+    ///
+    /// `keyring_id` accepts ordinary key serial numbers and the negative
+    /// special keyring IDs defined by Linux.
+    pub fn set_signature(
+        &mut self,
+        signature: impl Into<Vec<u8>>,
+        keyring_id: i32,
+    ) -> Result<&mut Self> {
+        let signature = signature.into();
+        if signature.is_empty() {
+            return Err(Error::InvalidObject(
+                "program signature cannot be empty".into(),
+            ));
+        }
+        if signature.len() > u32::MAX as usize {
+            return Err(Error::InvalidObject(
+                "program signature does not fit the kernel ABI".into(),
+            ));
+        }
+        self.signature = Some(signature);
+        self.keyring_id = keyring_id;
+        Ok(self)
+    }
+
+    /// Clears a previously configured program signature.
+    pub fn clear_signature(&mut self) -> &mut Self {
+        self.signature = None;
+        self.keyring_id = 0;
         self
     }
 
@@ -1168,6 +1305,139 @@ pub(crate) fn exclusive_map_hash(program: &ProgramSpec) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// Optional variable-length arrays requested with [`Program::info_with`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgramInfoOptions {
+    translated_instructions: bool,
+    jited_instructions: bool,
+    map_ids: bool,
+    jited_symbols: bool,
+    jited_function_lengths: bool,
+    function_info: bool,
+    line_info: bool,
+    jited_line_info: bool,
+    program_tags: bool,
+}
+
+impl ProgramInfoOptions {
+    /// Requests translated eBPF instruction bytes.
+    pub const fn translated_instructions(mut self, include: bool) -> Self {
+        self.translated_instructions = include;
+        self
+    }
+
+    /// Requests native JIT instruction bytes.
+    pub const fn jited_instructions(mut self, include: bool) -> Self {
+        self.jited_instructions = include;
+        self
+    }
+
+    /// Requests IDs of referenced maps.
+    pub const fn map_ids(mut self, include: bool) -> Self {
+        self.map_ids = include;
+        self
+    }
+
+    /// Requests native JIT symbol addresses.
+    pub const fn jited_symbols(mut self, include: bool) -> Self {
+        self.jited_symbols = include;
+        self
+    }
+
+    /// Requests native JIT function lengths.
+    pub const fn jited_function_lengths(mut self, include: bool) -> Self {
+        self.jited_function_lengths = include;
+        self
+    }
+
+    /// Requests BTF function-info records for translated instructions.
+    pub const fn function_info(mut self, include: bool) -> Self {
+        self.function_info = include;
+        self
+    }
+
+    /// Requests BTF line-info records for translated instructions.
+    pub const fn line_info(mut self, include: bool) -> Self {
+        self.line_info = include;
+        self
+    }
+
+    /// Requests line-info records for native JIT instructions.
+    pub const fn jited_line_info(mut self, include: bool) -> Self {
+        self.jited_line_info = include;
+        self
+    }
+
+    /// Requests tags for every program function.
+    pub const fn program_tags(mut self, include: bool) -> Self {
+        self.program_tags = include;
+        self
+    }
+
+    /// Requests every variable-length array exposed by the kernel.
+    pub const fn all() -> Self {
+        Self {
+            translated_instructions: true,
+            jited_instructions: true,
+            map_ids: true,
+            jited_symbols: true,
+            jited_function_lengths: true,
+            function_info: true,
+            line_info: true,
+            jited_line_info: true,
+            program_tags: true,
+        }
+    }
+}
+
+/// Opaque fixed-size records returned as part of program metadata.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProgramInfoRecords {
+    /// Size of each record in bytes.
+    pub record_size: u32,
+    /// Contiguous record bytes in native kernel layout.
+    pub bytes: Vec<u8>,
+}
+
+impl ProgramInfoRecords {
+    /// Number of complete records.
+    pub fn len(&self) -> usize {
+        usize::try_from(self.record_size)
+            .ok()
+            .filter(|size| *size != 0)
+            .map_or(0, |size| self.bytes.len() / size)
+    }
+
+    /// Whether the array contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Borrowed fixed-size records from a parsed program definition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProgramInfoRecordsRef<'program> {
+    /// Size of each record in bytes.
+    pub record_size: u32,
+    /// Contiguous record bytes in native BTF.ext layout.
+    pub bytes: &'program [u8],
+}
+
+impl ProgramInfoRecordsRef<'_> {
+    /// Number of complete records.
+    pub fn len(&self) -> usize {
+        usize::try_from(self.record_size)
+            .ok()
+            .filter(|size| *size != 0)
+            .map_or(0, |size| self.bytes.len() / size)
+    }
+
+    /// Whether the array contains no records.
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
 /// Kernel metadata for a loaded program.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramInfo {
@@ -1191,6 +1461,22 @@ pub struct ProgramInfo {
     pub gpl_compatible: bool,
     /// IDs of maps referenced by the program.
     pub map_ids: Vec<u32>,
+    /// Translated eBPF instructions, when requested.
+    pub translated_instructions: Vec<u8>,
+    /// Native JIT instructions, when requested and available.
+    pub jited_instructions: Vec<u8>,
+    /// Native JIT symbol addresses, when requested and available.
+    pub jited_symbols: Vec<u64>,
+    /// Native JIT function lengths, when requested and available.
+    pub jited_function_lengths: Vec<u32>,
+    /// BTF function-info records for translated instructions.
+    pub function_info: ProgramInfoRecords,
+    /// BTF line-info records for translated instructions.
+    pub line_info: ProgramInfoRecords,
+    /// Line-info records for native JIT instructions.
+    pub jited_line_info: ProgramInfoRecords,
+    /// Tags for each function in the program.
+    pub program_tags: Vec<[u8; 8]>,
     /// Network interface index for device-bound programs.
     pub interface_index: u32,
     /// Network namespace device containing the program.
@@ -1213,6 +1499,206 @@ pub struct ProgramInfo {
     pub attach_btf_id: u32,
 }
 
+const MAX_PROGRAM_INFO_BYTES: usize = 64 * 1024 * 1024;
+const MAX_PROGRAM_INFO_ITEMS: usize = 1 << 20;
+
+struct DetailedProgramInfo {
+    raw: sys::ProgramInfoRaw,
+    translated_instructions: Vec<u8>,
+    jited_instructions: Vec<u8>,
+    map_ids: Vec<u32>,
+    jited_symbols: Vec<u64>,
+    jited_function_lengths: Vec<u32>,
+    function_info: Vec<u8>,
+    line_info: Vec<u8>,
+    jited_line_info: Vec<u8>,
+    program_tags: Vec<[u8; 8]>,
+}
+
+fn program_info_bytes(size: u32, description: &str) -> Result<Vec<u8>> {
+    let size = size as usize;
+    if size > MAX_PROGRAM_INFO_BYTES {
+        return Err(Error::InvalidObject(format!(
+            "kernel reports an unreasonable {description} size of {size} bytes"
+        )));
+    }
+    Ok(vec![0; size])
+}
+
+fn program_info_items<T: Default + Clone>(count: u32, description: &str) -> Result<Vec<T>> {
+    let count = count as usize;
+    if count > MAX_PROGRAM_INFO_ITEMS {
+        return Err(Error::InvalidObject(format!(
+            "kernel reports an unreasonable {description} count of {count}"
+        )));
+    }
+    Ok(vec![T::default(); count])
+}
+
+fn program_info_records(count: u32, size: u32, description: &str) -> Result<Vec<u8>> {
+    let bytes = (count as usize)
+        .checked_mul(size as usize)
+        .ok_or_else(|| Error::InvalidObject(format!("{description} size overflows usize")))?;
+    if bytes > MAX_PROGRAM_INFO_BYTES {
+        return Err(Error::InvalidObject(format!(
+            "kernel reports an unreasonable {description} size of {bytes} bytes"
+        )));
+    }
+    Ok(vec![0; bytes])
+}
+
+fn truncate_program_records(records: &mut Vec<u8>, count: u32, size: u32) {
+    let returned = (count as usize).saturating_mul(size as usize);
+    records.truncate(returned.min(records.len()));
+}
+
+fn query_program_info(fd: i32, options: ProgramInfoOptions) -> Result<DetailedProgramInfo> {
+    let initial =
+        sys::program_info(fd).map_err(|source| Error::system("read program metadata", source))?;
+    let mut translated_instructions = if options.translated_instructions {
+        program_info_bytes(initial.xlated_program_len, "translated program")?
+    } else {
+        Vec::new()
+    };
+    let mut jited_instructions = if options.jited_instructions {
+        program_info_bytes(initial.jited_program_len, "JIT program")?
+    } else {
+        Vec::new()
+    };
+    let mut map_ids = if options.map_ids {
+        program_info_items(initial.nr_map_ids, "map ID")?
+    } else {
+        Vec::new()
+    };
+    let mut jited_symbols = if options.jited_symbols {
+        program_info_items(initial.nr_jited_symbols, "JIT symbol")?
+    } else {
+        Vec::new()
+    };
+    let mut jited_function_lengths = if options.jited_function_lengths {
+        program_info_items(initial.nr_jited_function_lengths, "JIT function length")?
+    } else {
+        Vec::new()
+    };
+    let mut function_info = if options.function_info {
+        program_info_records(
+            initial.function_info_count,
+            initial.function_info_record_size,
+            "function info",
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut line_info = if options.line_info {
+        program_info_records(
+            initial.line_info_count,
+            initial.line_info_record_size,
+            "line info",
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut jited_line_info = if options.jited_line_info {
+        program_info_records(
+            initial.jited_line_info_count,
+            initial.jited_line_info_record_size,
+            "JIT line info",
+        )?
+    } else {
+        Vec::new()
+    };
+    let mut program_tags = if options.program_tags {
+        program_info_items(initial.program_tag_count, "program tag")?
+    } else {
+        Vec::new()
+    };
+
+    let mut raw = sys::ProgramInfoRaw {
+        jited_program_len: u32::try_from(jited_instructions.len()).unwrap_or(u32::MAX),
+        xlated_program_len: u32::try_from(translated_instructions.len()).unwrap_or(u32::MAX),
+        jited_program_insns: jited_instructions.as_mut_ptr() as usize as u64,
+        xlated_program_insns: translated_instructions.as_mut_ptr() as usize as u64,
+        nr_map_ids: u32::try_from(map_ids.len()).unwrap_or(u32::MAX),
+        map_ids: map_ids.as_mut_ptr() as usize as u64,
+        nr_jited_symbols: u32::try_from(jited_symbols.len()).unwrap_or(u32::MAX),
+        nr_jited_function_lengths: u32::try_from(jited_function_lengths.len()).unwrap_or(u32::MAX),
+        jited_symbols: jited_symbols.as_mut_ptr() as usize as u64,
+        jited_function_lengths: jited_function_lengths.as_mut_ptr() as usize as u64,
+        function_info_record_size: initial.function_info_record_size,
+        function_info: function_info.as_mut_ptr() as usize as u64,
+        function_info_count: if options.function_info {
+            initial.function_info_count
+        } else {
+            0
+        },
+        line_info_count: if options.line_info {
+            initial.line_info_count
+        } else {
+            0
+        },
+        line_info: line_info.as_mut_ptr() as usize as u64,
+        jited_line_info: jited_line_info.as_mut_ptr() as usize as u64,
+        jited_line_info_count: if options.jited_line_info {
+            initial.jited_line_info_count
+        } else {
+            0
+        },
+        line_info_record_size: initial.line_info_record_size,
+        jited_line_info_record_size: initial.jited_line_info_record_size,
+        program_tag_count: u32::try_from(program_tags.len()).unwrap_or(u32::MAX),
+        program_tags: program_tags.as_mut_ptr() as usize as u64,
+        ..Default::default()
+    };
+    sys::program_info_into(fd, &mut raw)
+        .map_err(|source| Error::system("read detailed program metadata", source))?;
+
+    translated_instructions
+        .truncate((raw.xlated_program_len as usize).min(translated_instructions.len()));
+    jited_instructions.truncate((raw.jited_program_len as usize).min(jited_instructions.len()));
+    map_ids.truncate((raw.nr_map_ids as usize).min(map_ids.len()));
+    jited_symbols.truncate((raw.nr_jited_symbols as usize).min(jited_symbols.len()));
+    jited_function_lengths
+        .truncate((raw.nr_jited_function_lengths as usize).min(jited_function_lengths.len()));
+    truncate_program_records(
+        &mut function_info,
+        raw.function_info_count,
+        raw.function_info_record_size,
+    );
+    truncate_program_records(
+        &mut line_info,
+        raw.line_info_count,
+        raw.line_info_record_size,
+    );
+    truncate_program_records(
+        &mut jited_line_info,
+        raw.jited_line_info_count,
+        raw.jited_line_info_record_size,
+    );
+    program_tags.truncate((raw.program_tag_count as usize).min(program_tags.len()));
+    raw.jited_program_insns = 0;
+    raw.xlated_program_insns = 0;
+    raw.map_ids = 0;
+    raw.jited_symbols = 0;
+    raw.jited_function_lengths = 0;
+    raw.function_info = 0;
+    raw.line_info = 0;
+    raw.jited_line_info = 0;
+    raw.program_tags = 0;
+
+    Ok(DetailedProgramInfo {
+        raw,
+        translated_instructions,
+        jited_instructions,
+        map_ids,
+        jited_symbols,
+        jited_function_lengths,
+        function_info,
+        line_info,
+        jited_line_info,
+        program_tags,
+    })
+}
+
 /// Kernel targets used by a multi-kprobe attachment.
 #[derive(Clone, Copy, Debug)]
 pub enum KprobeMultiTargets<'target> {
@@ -1220,6 +1706,8 @@ pub enum KprobeMultiTargets<'target> {
     Symbols(&'target [&'target str]),
     /// Kernel function addresses.
     Addresses(&'target [u64]),
+    /// Glob pattern matched against available kernel functions.
+    Pattern(&'target str),
 }
 
 /// Options for attaching one program to multiple kernel probes.
@@ -1229,6 +1717,7 @@ pub struct KprobeMultiOptions<'target> {
     cookies: Option<&'target [u64]>,
     return_probe: bool,
     session: bool,
+    unique_match: bool,
 }
 
 impl<'target> KprobeMultiOptions<'target> {
@@ -1239,6 +1728,7 @@ impl<'target> KprobeMultiOptions<'target> {
             cookies: None,
             return_probe: false,
             session: false,
+            unique_match: false,
         }
     }
 
@@ -1249,6 +1739,18 @@ impl<'target> KprobeMultiOptions<'target> {
             cookies: None,
             return_probe: false,
             session: false,
+            unique_match: false,
+        }
+    }
+
+    /// Creates options targeting a kernel-function glob pattern.
+    pub const fn pattern(pattern: &'target str) -> Self {
+        Self {
+            targets: KprobeMultiTargets::Pattern(pattern),
+            cookies: None,
+            return_probe: false,
+            session: false,
+            unique_match: false,
         }
     }
 
@@ -1267,6 +1769,12 @@ impl<'target> KprobeMultiOptions<'target> {
     /// Selects a kprobe session link.
     pub const fn session(mut self, enabled: bool) -> Self {
         self.session = enabled;
+        self
+    }
+
+    /// Requires a pattern to resolve to exactly one kernel function.
+    pub const fn unique_match(mut self, enabled: bool) -> Self {
+        self.unique_match = enabled;
         self
     }
 }
@@ -1318,6 +1826,8 @@ pub enum UprobeMultiTargets<'target> {
     Offsets(&'target [u64]),
     /// Exact ELF function symbols resolved by this crate.
     Symbols(&'target [&'target str]),
+    /// Glob pattern matched against ELF function symbols.
+    Pattern(&'target str),
 }
 
 /// Options for attaching one program to multiple userspace probes.
@@ -1413,6 +1923,19 @@ impl<'target> UprobeMultiOptions<'target> {
         Self {
             path: path.into(),
             targets: UprobeMultiTargets::Symbols(symbols),
+            reference_counter_offsets: None,
+            cookies: None,
+            pid: None,
+            return_probe: false,
+            session: false,
+        }
+    }
+
+    /// Creates options targeting all ELF function symbols matching a glob.
+    pub fn pattern(path: impl Into<PathBuf>, pattern: &'target str) -> Self {
+        Self {
+            path: path.into(),
+            targets: UprobeMultiTargets::Pattern(pattern),
             reference_counter_offsets: None,
             cookies: None,
             pid: None,
@@ -1537,6 +2060,30 @@ impl io::Read for ProgramStream<'_> {
     }
 }
 
+/// RAII guard enabling kernel runtime and execution-count statistics.
+///
+/// Statistics remain enabled system-wide while at least one guard descriptor
+/// is open. The counters are exposed through [`ProgramInfo`].
+#[derive(Debug)]
+pub struct ProgramStatistics {
+    fd: OwnedFd,
+}
+
+impl ProgramStatistics {
+    /// Enables BPF program runtime statistics.
+    pub fn enable() -> Result<Self> {
+        let fd = sys::enable_run_time_statistics()
+            .map_err(|source| Error::system("enable BPF runtime statistics", source))?;
+        Ok(Self { fd })
+    }
+}
+
+impl AsFd for ProgramStatistics {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 /// An owned reference to a program loaded in the kernel.
 #[derive(Clone)]
 pub struct Program {
@@ -1626,6 +2173,8 @@ impl Program {
             log_level: spec.verifier_log.level,
             log_size: spec.verifier_log.capacity,
             token_fd,
+            signature: spec.signature.as_deref(),
+            keyring_id: spec.keyring_id,
         };
         let fd = sys::program_load(&options).map_err(|(source, log)| Error::Verifier {
             program: spec.name.clone(),
@@ -1642,8 +2191,17 @@ impl Program {
 
     /// Opens a program pinned in bpffs.
     pub fn open_pinned(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_pinned_with(path, ObjectPathOptions::new())
+    }
+
+    /// Opens a pinned program with access flags or directory-relative resolution.
+    pub fn open_pinned_with(
+        path: impl AsRef<Path>,
+        options: ObjectPathOptions<'_>,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fd = sys::object_get(path).map_err(|source| Error::File {
+        let (flags, directory) = options.raw_for_open();
+        let fd = sys::object_get_with(path, flags, directory).map_err(|source| Error::File {
             operation: "open pinned program",
             path: path.into(),
             source,
@@ -1683,6 +2241,8 @@ impl Program {
             func_info_record_size: 0,
             line_info: Vec::new(),
             line_info_record_size: 0,
+            signature: None,
+            keyring_id: 0,
             verifier_log: VerifierLog::default(),
             section_index: 0,
             section_offset: 0,
@@ -1739,8 +2299,16 @@ impl Program {
 
     /// Reads current metadata from the kernel.
     pub fn info(&self) -> Result<ProgramInfo> {
-        let (raw, map_ids) = sys::program_info_with_map_ids(self.fd.as_raw_fd())
-            .map_err(|source| Error::system("read program metadata", source))?;
+        self.info_with(ProgramInfoOptions::default().map_ids(true))
+    }
+
+    /// Reads metadata and selected variable-length arrays from the kernel.
+    ///
+    /// JIT data can require additional privileges and may be unavailable even
+    /// when the program itself is visible.
+    pub fn info_with(&self, options: ProgramInfoOptions) -> Result<ProgramInfo> {
+        let detailed = query_program_info(self.fd.as_raw_fd(), options)?;
+        let raw = detailed.raw;
         Ok(ProgramInfo {
             id: raw.id,
             program_type: ProgramType::from_raw(raw.program_type),
@@ -1751,7 +2319,24 @@ impl Program {
             load_time: raw.load_time,
             created_by_uid: raw.created_by_uid,
             gpl_compatible: raw.gpl_compatible != 0,
-            map_ids,
+            map_ids: detailed.map_ids,
+            translated_instructions: detailed.translated_instructions,
+            jited_instructions: detailed.jited_instructions,
+            jited_symbols: detailed.jited_symbols,
+            jited_function_lengths: detailed.jited_function_lengths,
+            function_info: ProgramInfoRecords {
+                record_size: raw.function_info_record_size,
+                bytes: detailed.function_info,
+            },
+            line_info: ProgramInfoRecords {
+                record_size: raw.line_info_record_size,
+                bytes: detailed.line_info,
+            },
+            jited_line_info: ProgramInfoRecords {
+                record_size: raw.jited_line_info_record_size,
+                bytes: detailed.jited_line_info,
+            },
+            program_tags: detailed.program_tags,
             interface_index: raw.ifindex,
             network_namespace_device: raw.netns_dev,
             network_namespace_inode: raw.netns_ino,
@@ -1767,11 +2352,19 @@ impl Program {
 
     /// Pins the program in bpffs.
     pub fn pin(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.pin_with(path, ObjectPathOptions::new())
+    }
+
+    /// Pins this program with optional directory-relative resolution.
+    pub fn pin_with(&self, path: impl AsRef<Path>, options: ObjectPathOptions<'_>) -> Result<()> {
         let path = path.as_ref();
-        sys::object_pin(self.fd.as_raw_fd(), path).map_err(|source| Error::File {
-            operation: "pin program",
-            path: path.into(),
-            source,
+        let directory = options.raw_for_pin()?;
+        sys::object_pin_with(self.fd.as_raw_fd(), path, 0, directory).map_err(|source| {
+            Error::File {
+                operation: "pin program",
+                path: path.into(),
+                source,
+            }
         })
     }
 
@@ -1898,6 +2491,19 @@ impl Program {
         Ok(Link::perf_events(fds))
     }
 
+    /// Attaches to an architecture-specific kernel syscall wrapper.
+    ///
+    /// `syscall` is the unprefixed syscall name, such as `openat`.
+    pub fn attach_ksyscall(&self, syscall: &str, return_probe: bool) -> Result<Link> {
+        if !valid_probe_name(syscall) {
+            return Err(Error::InvalidObject(format!(
+                "`{syscall}` is not a valid syscall name"
+            )));
+        }
+        let function = syscall_wrapper(syscall);
+        self.attach_kprobe(&function, 0, return_probe)
+    }
+
     /// Attaches to many kernel functions with one kernel link.
     pub fn attach_kprobe_multi(&self, options: KprobeMultiOptions<'_>) -> Result<Link> {
         if options.return_probe && options.session {
@@ -1905,9 +2511,21 @@ impl Program {
                 "kprobe sessions cannot be return probes".into(),
             ));
         }
+        if options.unique_match && !matches!(options.targets, KprobeMultiTargets::Pattern(_)) {
+            return Err(Error::InvalidObject(
+                "unique matching is only meaningful for a kprobe pattern".into(),
+            ));
+        }
+        let resolved;
+        let resolved_references;
         let (symbols, addresses) = match options.targets {
             KprobeMultiTargets::Symbols(symbols) => (Some(symbols), None),
             KprobeMultiTargets::Addresses(addresses) => (None, Some(addresses)),
+            KprobeMultiTargets::Pattern(pattern) => {
+                resolved = resolve_kernel_symbols(pattern, options.unique_match)?;
+                resolved_references = resolved.iter().map(String::as_str).collect::<Vec<_>>();
+                (Some(resolved_references.as_slice()), None)
+            }
         };
         let attach_type = if options.session {
             AttachType::TraceKprobeSession
@@ -2053,6 +2671,30 @@ impl Program {
         Ok(Link::perf_events(fds))
     }
 
+    /// Resolves an ELF function and attaches at an optional offset within it.
+    pub fn attach_uprobe_symbol(
+        &self,
+        path: impl AsRef<Path>,
+        symbol: &str,
+        symbol_offset: u64,
+        pid: Option<u32>,
+        return_probe: bool,
+    ) -> Result<Link> {
+        if return_probe && symbol_offset != 0 {
+            return Err(Error::InvalidObject(
+                "userspace return probes cannot use a function offset".into(),
+            ));
+        }
+        let path = resolve_binary_path(path.as_ref())?;
+        let [base] = resolve_elf_symbols(&path, &[symbol])?
+            .try_into()
+            .map_err(|_| Error::InvalidObject("ELF symbol resolution returned no target".into()))?;
+        let offset = base.checked_add(symbol_offset).ok_or_else(|| {
+            Error::InvalidObject(format!("offset for ELF symbol `{symbol}` overflows"))
+        })?;
+        self.attach_uprobe(path, offset, pid, return_probe)
+    }
+
     /// Attaches to many locations in one executable with one kernel link.
     pub fn attach_uprobe_multi(&self, options: UprobeMultiOptions<'_>) -> Result<Link> {
         if options.return_probe && options.session {
@@ -2060,11 +2702,16 @@ impl Program {
                 "uprobe sessions cannot be return probes".into(),
             ));
         }
+        let path = resolve_binary_path(&options.path)?;
         let resolved;
         let offsets = match options.targets {
             UprobeMultiTargets::Offsets(offsets) => offsets,
             UprobeMultiTargets::Symbols(symbols) => {
-                resolved = resolve_elf_symbols(&options.path, symbols)?;
+                resolved = resolve_elf_symbols(&path, symbols)?;
+                &resolved
+            }
+            UprobeMultiTargets::Pattern(pattern) => {
+                resolved = resolve_elf_symbol_pattern(&path, pattern)?;
                 &resolved
             }
         };
@@ -2076,7 +2723,7 @@ impl Program {
         let fd = sys::uprobe_multi_link_create(&sys::UprobeMultiTarget {
             program_fd: self.fd.as_raw_fd(),
             attach_type: attach_type.as_raw(),
-            path: &options.path,
+            path: &path,
             offsets,
             reference_counter_offsets: options.reference_counter_offsets,
             cookies: options.cookies,
@@ -2479,11 +3126,66 @@ impl Program {
     /// Attaches using the target encoded in the program section when no extra
     /// runtime argument is required.
     pub fn attach(&self) -> Result<Link> {
+        let prefix = self
+            .spec
+            .section
+            .split_once('/')
+            .map_or(self.spec.section.as_str(), |(prefix, _)| prefix);
+        match prefix {
+            "ksyscall" | "kretsyscall" => {
+                let ProgramKind::Kprobe {
+                    function,
+                    return_probe,
+                } = self.spec.kind()
+                else {
+                    return Err(Error::InvalidObject(format!(
+                        "program section `{}` has inconsistent syscall metadata",
+                        self.spec.section
+                    )));
+                };
+                return self.attach_ksyscall(function, *return_probe);
+            }
+            "kprobe.multi" | "kretprobe.multi" | "kprobe.session" => {
+                let (_, pattern) = self.spec.section.split_once('/').ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "program section `{}` has no kernel function pattern",
+                        self.spec.section
+                    ))
+                })?;
+                let options = KprobeMultiOptions::pattern(pattern)
+                    .return_probe(prefix == "kretprobe.multi")
+                    .session(prefix == "kprobe.session");
+                return self.attach_kprobe_multi(options);
+            }
+            "uprobe.multi" | "uprobe.multi.s" | "uretprobe.multi" | "uretprobe.multi.s"
+            | "uprobe.session" | "uprobe.session.s" => {
+                let (path, pattern) = parse_uprobe_multi_target(&self.spec.section)?;
+                let options = UprobeMultiOptions::pattern(path, &pattern)
+                    .return_probe(matches!(prefix, "uretprobe.multi" | "uretprobe.multi.s"))
+                    .session(matches!(prefix, "uprobe.session" | "uprobe.session.s"));
+                return self.attach_uprobe_multi(options);
+            }
+            "usdt" | "usdt.s" => {
+                let (path, provider, name) = parse_usdt_target(&self.spec.section)?;
+                return self.attach_usdt(UsdtOptions::new(path, provider, name));
+            }
+            _ => {}
+        }
         match self.spec.kind() {
             ProgramKind::Kprobe {
                 function,
                 return_probe,
-            } => self.attach_kprobe(function, 0, *return_probe),
+            } => {
+                let (function, offset) = parse_kprobe_target(function, *return_probe)?;
+                self.attach_kprobe(&function, offset, *return_probe)
+            }
+            ProgramKind::Uprobe {
+                target,
+                return_probe,
+            } => {
+                let (path, symbol, offset) = parse_uprobe_target(target, *return_probe)?;
+                self.attach_uprobe_symbol(path, &symbol, offset, None, *return_probe)
+            }
             ProgramKind::Tracepoint { category, event } => self.attach_tracepoint(category, event),
             ProgramKind::RawTracepoint { name, .. } => self.attach_raw_tracepoint(name),
             ProgramKind::Tracing {
@@ -2518,6 +3220,249 @@ impl Program {
             ))),
         }
     }
+}
+
+fn valid_probe_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.'))
+}
+
+fn valid_probe_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'*' | b'?'))
+}
+
+fn parse_u64_c(value: &str) -> Option<u64> {
+    let (digits, radix) = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if value.len() > 1 && value.starts_with('0') {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    (!digits.is_empty())
+        .then(|| u64::from_str_radix(digits, radix).ok())
+        .flatten()
+}
+
+fn parse_kprobe_target(target: &str, return_probe: bool) -> Result<(String, u64)> {
+    if target.is_empty() {
+        return Err(Error::InvalidObject(
+            "kernel probe section has no function target".into(),
+        ));
+    }
+    let (function, offset) = match target.rsplit_once('+') {
+        Some((function, offset)) => {
+            let offset = parse_u64_c(offset).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "kernel probe target `{target}` has an invalid offset"
+                ))
+            })?;
+            (function, offset)
+        }
+        None => (target, 0),
+    };
+    if !valid_probe_name(function) {
+        return Err(Error::InvalidObject(format!(
+            "`{function}` is not a valid kernel probe function"
+        )));
+    }
+    if return_probe && offset != 0 {
+        return Err(Error::InvalidObject(
+            "kernel return probes cannot use a function offset".into(),
+        ));
+    }
+    Ok((function.into(), offset))
+}
+
+fn parse_uprobe_target(target: &str, return_probe: bool) -> Result<(PathBuf, String, u64)> {
+    let (path, function) = target.split_once(':').ok_or_else(|| {
+        Error::InvalidObject(format!(
+            "userspace probe target `{target}` must use `path:function[+offset]`"
+        ))
+    })?;
+    if path.is_empty() || function.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "userspace probe target `{target}` has an empty path or function"
+        )));
+    }
+    let (function, offset) = match function.rsplit_once('+') {
+        Some((function, offset)) => {
+            let offset = parse_u64_c(offset).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "userspace probe target `{target}` has an invalid offset"
+                ))
+            })?;
+            (function, offset)
+        }
+        None => (function, 0),
+    };
+    if function.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "userspace probe target `{target}` has an empty function"
+        )));
+    }
+    if return_probe && offset != 0 {
+        return Err(Error::InvalidObject(
+            "userspace return probes cannot use a function offset".into(),
+        ));
+    }
+    Ok((path.into(), function.into(), offset))
+}
+
+fn parse_uprobe_multi_target(section: &str) -> Result<(PathBuf, String)> {
+    let (_, target) = section.split_once('/').ok_or_else(|| {
+        Error::InvalidObject(format!(
+            "userspace multi-probe section `{section}` has no target"
+        ))
+    })?;
+    let (path, pattern) = target.split_once(':').ok_or_else(|| {
+        Error::InvalidObject(format!(
+            "userspace multi-probe target `{target}` must use `path:function-pattern`"
+        ))
+    })?;
+    if path.is_empty() || pattern.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "userspace multi-probe target `{target}` has an empty path or pattern"
+        )));
+    }
+    Ok((path.into(), pattern.into()))
+}
+
+fn parse_usdt_target(section: &str) -> Result<(PathBuf, String, String)> {
+    let (_, target) = section
+        .split_once('/')
+        .ok_or_else(|| Error::InvalidObject(format!("USDT section `{section}` has no target")))?;
+    let mut parts = target.splitn(3, ':');
+    let path = parts.next().unwrap_or_default();
+    let provider = parts.next().unwrap_or_default();
+    let name = parts.next().unwrap_or_default();
+    if path.is_empty() || provider.is_empty() || name.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "USDT target `{target}` must use `path:provider:name`"
+        )));
+    }
+    Ok((path.into(), provider.into(), name.into()))
+}
+
+fn arch_syscall_prefix() -> Option<&'static str> {
+    match env::consts::ARCH {
+        "x86_64" => Some("x64"),
+        "x86" => Some("ia32"),
+        "s390x" => Some("s390x"),
+        "arm" => Some("arm"),
+        "aarch64" => Some("arm64"),
+        "mips" | "mips32r6" | "mips64" | "mips64r6" => Some("mips"),
+        "riscv32" | "riscv64" => Some("riscv"),
+        "powerpc" => Some("powerpc"),
+        "powerpc64" => Some("powerpc64"),
+        _ => None,
+    }
+}
+
+fn kernel_symbol_exists(name: &str) -> Option<bool> {
+    let symbols = fs::read_to_string("/proc/kallsyms").ok()?;
+    Some(symbols.lines().any(|line| {
+        line.split_whitespace()
+            .nth(2)
+            .is_some_and(|symbol| symbol == name)
+    }))
+}
+
+fn syscall_wrapper(syscall: &str) -> String {
+    let Some(prefix) = arch_syscall_prefix() else {
+        return format!("__se_sys_{syscall}");
+    };
+    let wrapper = format!("__{prefix}_sys_{syscall}");
+    if kernel_symbol_exists(&wrapper).unwrap_or(true) {
+        wrapper
+    } else {
+        format!("__se_sys_{syscall}")
+    }
+}
+
+fn resolve_binary_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() || path.components().count() > 1 || path.exists() {
+        return Ok(path.into());
+    }
+    if let Some(search) = env::var_os("PATH") {
+        for directory in env::split_paths(&search) {
+            let candidate = directory.join(path);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(Error::InvalidObject(format!(
+        "userspace probe binary `{}` was not found directly or on PATH",
+        path.display()
+    )))
+}
+
+fn resolve_kernel_symbols(pattern: &str, unique_match: bool) -> Result<Vec<String>> {
+    if !valid_probe_pattern(pattern) {
+        return Err(Error::InvalidObject(format!(
+            "`{pattern}` is not a valid kernel function pattern"
+        )));
+    }
+    if !unique_match && !pattern.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
+        return Ok(vec![pattern.into()]);
+    }
+
+    let mut symbols = BTreeSet::new();
+    let mut match_count = 0_usize;
+    let mut read_filter = false;
+    for path in [
+        "/sys/kernel/tracing/available_filter_functions",
+        "/sys/kernel/debug/tracing/available_filter_functions",
+    ] {
+        match fs::read_to_string(path) {
+            Ok(contents) => {
+                read_filter = true;
+                for line in contents.lines() {
+                    if let Some(name) = line.split_whitespace().next() {
+                        if glob_matches(pattern, name) {
+                            match_count += 1;
+                            symbols.insert(name.into());
+                        }
+                    }
+                }
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    if !read_filter {
+        let contents = fs::read_to_string("/proc/kallsyms")
+            .map_err(|source| Error::system("read kernel symbols for kprobe pattern", source))?;
+        for line in contents.lines() {
+            if let Some(name) = line.split_whitespace().nth(2) {
+                if glob_matches(pattern, name) {
+                    match_count += 1;
+                    symbols.insert(name.into());
+                }
+            }
+        }
+    }
+    if unique_match && match_count != 1 {
+        return Err(Error::InvalidObject(format!(
+            "kernel function pattern `{pattern}` matched {match_count} functions, expected one"
+        )));
+    }
+    if symbols.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "kernel function pattern `{pattern}` matched no functions"
+        )));
+    }
+    Ok(symbols.into_iter().collect())
 }
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
@@ -2579,25 +3524,68 @@ fn resolve_elf_symbols(path: &Path, symbols: &[&str]) -> Result<Vec<u64>> {
                         path.display()
                     ))
                 })
-                .and_then(|symbol| {
-                    let section = elf.section_headers.get(symbol.st_shndx).ok_or_else(|| {
-                        Error::InvalidObject(format!(
-                            "ELF symbol `{requested}` has invalid section {}",
-                            symbol.st_shndx
-                        ))
-                    })?;
-                    symbol
-                        .st_value
-                        .checked_sub(section.sh_addr)
-                        .and_then(|offset| offset.checked_add(section.sh_offset))
-                        .ok_or_else(|| {
-                            Error::InvalidObject(format!(
-                                "ELF symbol `{requested}` file offset overflows"
-                            ))
-                        })
-                })
+                .and_then(|symbol| elf_symbol_file_offset(&elf, &symbol, requested))
         })
         .collect()
+}
+
+fn resolve_elf_symbol_pattern(path: &Path, pattern: &str) -> Result<Vec<u64>> {
+    if pattern.is_empty() {
+        return Err(Error::InvalidObject(
+            "userspace function pattern cannot be empty".into(),
+        ));
+    }
+    let bytes = fs::read(path).map_err(|source| Error::File {
+        operation: "read userspace probe ELF",
+        path: path.into(),
+        source,
+    })?;
+    let elf = Elf::parse(&bytes)
+        .map_err(|error| Error::InvalidObject(format!("invalid userspace probe ELF: {error}")))?;
+    let mut offsets = BTreeSet::new();
+    for symbol in elf
+        .syms
+        .iter()
+        .filter(|symbol| symbol.st_type() == STT_FUNC && symbol.st_shndx != 0)
+    {
+        if let Some(name) = elf.strtab.get_at(symbol.st_name) {
+            if glob_matches(pattern, name) {
+                offsets.insert(elf_symbol_file_offset(&elf, &symbol, name)?);
+            }
+        }
+    }
+    for symbol in elf
+        .dynsyms
+        .iter()
+        .filter(|symbol| symbol.st_type() == STT_FUNC && symbol.st_shndx != 0)
+    {
+        if let Some(name) = elf.dynstrtab.get_at(symbol.st_name) {
+            if glob_matches(pattern, name) {
+                offsets.insert(elf_symbol_file_offset(&elf, &symbol, name)?);
+            }
+        }
+    }
+    if offsets.is_empty() {
+        return Err(Error::InvalidObject(format!(
+            "ELF function pattern `{pattern}` matched no symbols in `{}`",
+            path.display()
+        )));
+    }
+    Ok(offsets.into_iter().collect())
+}
+
+fn elf_symbol_file_offset(elf: &Elf<'_>, symbol: &Sym, name: &str) -> Result<u64> {
+    let section = elf.section_headers.get(symbol.st_shndx).ok_or_else(|| {
+        Error::InvalidObject(format!(
+            "ELF symbol `{name}` has invalid section {}",
+            symbol.st_shndx
+        ))
+    })?;
+    symbol
+        .st_value
+        .checked_sub(section.sh_addr)
+        .and_then(|offset| offset.checked_add(section.sh_offset))
+        .ok_or_else(|| Error::InvalidObject(format!("ELF symbol `{name}` file offset overflows")))
 }
 
 fn tracepoint_id(category: &str, event: &str) -> Result<u64> {
@@ -2736,28 +3724,171 @@ mod tests {
     }
 
     #[test]
+    fn current_libbpf_section_families_are_recognized() {
+        for section in [
+            "socket",
+            "sk_reuseport/migrate",
+            "sk_reuseport",
+            "kprobe/do_sys_open",
+            "kretprobe/do_sys_open",
+            "ksyscall/openat",
+            "kretsyscall/openat",
+            "kprobe.multi/schedule*",
+            "kretprobe.multi/schedule",
+            "kprobe.session/schedule",
+            "uprobe//bin/sh:main",
+            "uprobe.s//bin/sh:main",
+            "uretprobe//bin/sh:main",
+            "uretprobe.s//bin/sh:main",
+            "uprobe.multi//bin/sh:main",
+            "uretprobe.multi//bin/sh:main",
+            "uprobe.session//bin/sh:main",
+            "uprobe.multi.s//bin/sh:main",
+            "uretprobe.multi.s//bin/sh:main",
+            "uprobe.session.s//bin/sh:main",
+            "usdt//bin/sh:provider:name",
+            "usdt.s//bin/sh:provider:name",
+            "tc/ingress",
+            "tc/egress",
+            "tcx/ingress",
+            "tcx/egress",
+            "tc",
+            "classifier",
+            "action",
+            "netkit/primary",
+            "netkit/peer",
+            "tracepoint/sched/sched_switch",
+            "tp/sched/sched_switch",
+            "tracepoint.s/sched/sched_switch",
+            "tp.s/sched/sched_switch",
+            "raw_tracepoint/sched_switch",
+            "raw_tp/sched_switch",
+            "raw_tracepoint.s/sched_switch",
+            "raw_tp.s/sched_switch",
+            "raw_tracepoint.w/sched_switch",
+            "raw_tp.w/sched_switch",
+            "tp_btf/sched_switch",
+            "tp_btf.s/sched_switch",
+            "fentry/do_unlinkat",
+            "fmod_ret/do_unlinkat",
+            "fexit/do_unlinkat",
+            "fentry.s/do_unlinkat",
+            "fmod_ret.s/do_unlinkat",
+            "fexit.s/do_unlinkat",
+            "fsession/do_unlinkat",
+            "fsession.s/do_unlinkat",
+            "fentry.multi/do_*",
+            "fexit.multi/do_*",
+            "fsession.multi/do_*",
+            "fentry.multi.s/do_*",
+            "fexit.multi.s/do_*",
+            "fsession.multi.s/do_*",
+            "freplace/target",
+            "lsm/file_open",
+            "lsm.s/file_open",
+            "lsm_cgroup/socket_bind",
+            "iter/task",
+            "iter.s/task",
+            "syscall",
+            "xdp",
+            "xdp.frags",
+            "xdp/devmap",
+            "xdp.frags/devmap",
+            "xdp/cpumap",
+            "xdp.frags/cpumap",
+            "perf_event",
+            "lwt_in",
+            "lwt_out",
+            "lwt_xmit",
+            "lwt_seg6local",
+            "sockops",
+            "sk_skb/stream_parser",
+            "sk_skb/stream_verdict",
+            "sk_skb/verdict",
+            "sk_skb",
+            "sk_msg",
+            "lirc_mode2",
+            "flow_dissector",
+            "cgroup_skb/ingress",
+            "cgroup_skb/egress",
+            "cgroup/skb",
+            "cgroup/sock_create",
+            "cgroup/sock_release",
+            "cgroup/sock",
+            "cgroup/post_bind4",
+            "cgroup/post_bind6",
+            "cgroup/bind4",
+            "cgroup/bind6",
+            "cgroup/connect4",
+            "cgroup/connect6",
+            "cgroup/connect_unix",
+            "cgroup/sendmsg4",
+            "cgroup/sendmsg6",
+            "cgroup/sendmsg_unix",
+            "cgroup/recvmsg4",
+            "cgroup/recvmsg6",
+            "cgroup/recvmsg_unix",
+            "cgroup/getpeername4",
+            "cgroup/getpeername6",
+            "cgroup/getpeername_unix",
+            "cgroup/getsockname4",
+            "cgroup/getsockname6",
+            "cgroup/getsockname_unix",
+            "cgroup/sysctl",
+            "cgroup/getsockopt",
+            "cgroup/setsockopt",
+            "cgroup/dev",
+            "struct_ops/congestion",
+            "struct_ops.s/congestion",
+            "sk_lookup",
+            "netfilter",
+        ] {
+            assert!(ProgramKind::from_section(section).is_ok(), "{section}");
+        }
+    }
+
+    #[test]
     fn auto_attachment_requires_no_runtime_target() {
         let instructions = vec![Instruction::new(0x95, 0, 0, 0, 0)];
-        assert!(
-            ProgramSpec::new("entry", "fentry/do_unlinkat", instructions.clone())
-                .unwrap()
-                .auto_attachable()
-        );
-        assert!(ProgramSpec::new(
-            "entry",
+        for section in [
+            "fentry/do_unlinkat",
+            "fentry.multi/do_*",
             "tracepoint/sched/sched_switch",
-            instructions.clone()
-        )
-        .unwrap()
-        .auto_attachable());
-        assert!(
-            ProgramSpec::new("entry", "fentry.multi/do_*", instructions.clone())
-                .unwrap()
-                .auto_attachable()
-        );
-        assert!(!ProgramSpec::new("entry", "xdp", instructions)
+            "kprobe/do_sys_open+0x4",
+            "ksyscall/openat",
+            "uprobe//bin/sh:main",
+            "kprobe.multi/schedule*",
+            "kprobe.session/schedule",
+            "uprobe.multi//bin/sh:main",
+            "uprobe.session//bin/sh:main",
+            "usdt//bin/sh:provider:name",
+        ] {
+            assert!(
+                ProgramSpec::new("entry", section, instructions.clone())
+                    .unwrap()
+                    .auto_attachable(),
+                "{section}"
+            );
+        }
+        assert!(!ProgramSpec::new("entry", "xdp", instructions.clone())
             .unwrap()
             .auto_attachable());
+        assert!(!ProgramSpec::new("entry", "kprobe", instructions.clone())
+            .unwrap()
+            .auto_attachable());
+        assert!(!ProgramSpec::new("entry", "uprobe//bin/sh", instructions)
+            .unwrap()
+            .auto_attachable());
+
+        assert_eq!(
+            parse_kprobe_target("do_sys_open+010", false).unwrap(),
+            ("do_sys_open".into(), 8)
+        );
+        assert!(parse_kprobe_target("do_sys_open+1", true).is_err());
+        assert_eq!(
+            parse_uprobe_target("/bin/sh:main+0x10", false).unwrap(),
+            (PathBuf::from("/bin/sh"), "main".into(), 16)
+        );
     }
 
     #[test]
@@ -2784,11 +3915,54 @@ mod tests {
             vec![Instruction::new(0x95, 0, 0, 0, 0)],
         )
         .unwrap();
-        spec.set_autoload(false).set_auto_attach(false).set_flags(4);
+        spec.func_info = vec![1; 8];
+        spec.func_info_record_size = 8;
+        spec.line_info = vec![2; 16];
+        spec.line_info_record_size = 16;
+        assert_eq!(spec.function_info().len(), 1);
+        assert_eq!(spec.line_info().len(), 1);
+        spec.set_signature(vec![3; 64], -3).unwrap();
+        assert_eq!(
+            spec.signature().map(|(bytes, id)| (bytes.len(), id)),
+            Some((64, -3))
+        );
+        assert!(spec.set_signature(Vec::new(), 0).is_err());
+        let replacement = vec![Instruction::new(0xb7, 0, 0, 0, 1)];
+        spec.set_autoload(false)
+            .set_auto_attach(false)
+            .set_flags(4)
+            .set_kernel_version(0x0006_0800)
+            .set_instructions(replacement.clone());
         assert!(!spec.autoload());
         assert!(!spec.auto_attach());
         assert!(!spec.auto_attachable());
         assert_eq!(spec.program_type(), ProgramType::RawTracepoint);
+        assert_eq!(spec.flags(), 4);
+        assert_eq!(spec.kernel_version(), 0x0006_0800);
+        assert_eq!(spec.instructions(), replacement);
+        assert!(spec.func_info.is_empty());
+        assert!(spec.line_info.is_empty());
+        assert!(spec.signature().is_none());
+        assert_eq!(spec.verifier_log(), VerifierLog::default());
+    }
+
+    #[test]
+    fn program_info_options_and_records_are_explicit() {
+        let options = ProgramInfoOptions::all();
+        assert!(options.translated_instructions);
+        assert!(options.jited_instructions);
+        assert!(options.map_ids);
+        assert!(options.function_info);
+        assert!(options.program_tags);
+
+        let records = ProgramInfoRecords {
+            record_size: 4,
+            bytes: vec![0; 12],
+        };
+        assert_eq!(records.len(), 3);
+        assert!(!records.is_empty());
+        assert_eq!(ProgramInfoRecords::default().len(), 0);
+        assert!(program_info_records(u32::MAX, u32::MAX, "test").is_err());
     }
 
     #[test]

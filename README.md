@@ -93,6 +93,9 @@ Standalone maps use `MapCreateOptions::token`, while
 
 ## Status
 
+The audited workflow mapping to libbpf and libbpf-rs is documented in
+[PARITY.md](PARITY.md).
+
 The crate currently provides:
 
 - owned ELF and BTF parsing, BTF-defined and legacy maps, global data and
@@ -104,12 +107,16 @@ The crate currently provides:
   alignment, weak/global and cross-object symbol resolution, relocation
   rewriting, BTF global type coalescing, data-section layout merging, and
   BTF.ext function, line, and CO-RE record remapping;
-- direct `bpf(2)` loading, standalone and reused maps, pinning, rich
-  map/program/link/BTF metadata, attachment queries, verifier logs, program
-  test runs, standard `Read` access to program output streams, type-accurate
-  map/program/helper capability probes, map CRUD and batch operations, per-CPU
-  values, spin-lock-aware element access, exclusive-program map identities,
-  and dynamically resized hash maps with checked initial-capacity hints;
+- direct `bpf(2)` loading, standalone and reused maps, transactional
+  whole-object pinning, device-bound maps, frozen map-content hashes, rich
+  map/program/link/BTF metadata (including bounded opt-in JIT, BTF record, and
+  fully decoded link-target arrays), attachment queries, program and modern
+  map-creation verifier logs, signed-program/keyring inputs, runtime statistics,
+  program test runs, standard `Read` access to program output streams,
+  type-accurate map/program/helper capability probes, map CRUD and batch
+  operations, per-CPU values, spin-lock-aware element access,
+  exclusive-program map identities, and dynamically resized hash maps with
+  checked initial-capacity hints;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
 - vmlinux and kernel-module split-BTF parsing, owned module BTF lookup, and
@@ -127,7 +134,7 @@ The crate currently provides:
   `.rodata`, and address-space global accessors;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netkit,
   netfilter, socket, perf-event, BTF-based, multi-kprobe, multi-uprobe,
-  multi-function BTF tracing, USDT,
+  multi-function BTF tracing, syscall-wrapper, probe-session, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with
   RAII link lifetimes, including before/after anchors and optimistic hook
   revision checks for ordered cgroup and device links;
