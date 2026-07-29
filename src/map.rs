@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bitflags::bitflags;
 
 use crate::sys;
-use crate::{Error, Result, TypeId};
+use crate::{Error, Link, Result, TypeId};
 
 bitflags! {
     /// Flags controlling map creation and access.
@@ -344,6 +344,21 @@ impl MapSpec {
         self.pinning
     }
 
+    /// NUMA node selected for map allocation.
+    pub const fn numa_node(&self) -> Option<u32> {
+        self.numa_node
+    }
+
+    /// Type-specific map creation value.
+    pub const fn map_extra(&self) -> u64 {
+        self.map_extra
+    }
+
+    /// Name of the inner-map template used by map-in-map definitions.
+    pub fn inner_map(&self) -> Option<&str> {
+        self.inner_map.as_deref()
+    }
+
     /// Initial value written to key zero while loading, when configured.
     ///
     /// ELF global-data and kconfig maps have an initial value by default.
@@ -357,6 +372,24 @@ impl MapSpec {
     /// without copying the entire section.
     pub fn initial_value_mut(&mut self) -> Option<&mut [u8]> {
         self.initial_value.as_deref_mut()
+    }
+
+    /// Changes the kernel map type before loading.
+    pub fn set_map_type(&mut self, map_type: MapType) -> &mut Self {
+        self.map_type = map_type;
+        self
+    }
+
+    /// Changes the key size before loading.
+    pub fn set_key_size(&mut self, key_size: u32) -> &mut Self {
+        self.key_size = key_size;
+        self
+    }
+
+    /// Changes the logical value size before loading.
+    pub fn set_value_size(&mut self, value_size: u32) -> &mut Self {
+        self.value_size = value_size;
+        self
     }
 
     /// Changes the maximum number of entries before loading.
@@ -387,6 +420,23 @@ impl MapSpec {
     /// Names the map whose descriptor should be used as the inner-map template.
     pub fn set_inner_map(&mut self, name: Option<impl Into<String>>) -> &mut Self {
         self.inner_map = name.map(Into::into);
+        self
+    }
+
+    /// Changes the type-specific extra map creation value.
+    pub fn set_map_extra(&mut self, map_extra: u64) -> &mut Self {
+        self.map_extra = map_extra;
+        self
+    }
+
+    /// Changes the BTF key and value type IDs.
+    ///
+    /// Standalone map creation cannot use nonzero IDs because the IDs belong
+    /// to a particular loaded BTF object. Object loading supplies that BTF
+    /// descriptor automatically.
+    pub fn set_btf_types(&mut self, key: TypeId, value: TypeId) -> &mut Self {
+        self.btf_key_type = key;
+        self.btf_value_type = value;
         self
     }
 
@@ -425,6 +475,12 @@ impl MapSpec {
         if self.map_type.is_map_of_maps() && self.inner_map.is_none() {
             return Err(Error::InvalidObject(format!(
                 "map-of-maps `{}` has no inner-map template",
+                self.name
+            )));
+        }
+        if !self.map_type.is_map_of_maps() && self.inner_map.is_some() {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a map-in-map but has an inner-map template",
                 self.name
             )));
         }
@@ -482,6 +538,16 @@ pub struct MapInfo {
     pub btf_value_type: TypeId,
     /// Type-specific extra value.
     pub map_extra: u64,
+    /// Network interface index for device-bound maps.
+    pub interface_index: u32,
+    /// Network namespace device containing the map.
+    pub network_namespace_device: u64,
+    /// Network namespace inode containing the map.
+    pub network_namespace_inode: u64,
+    /// Kernel BTF ID used for values whose layout comes from vmlinux.
+    pub btf_vmlinux_id: u32,
+    /// Vmlinux value type ID.
+    pub btf_vmlinux_value_type: TypeId,
 }
 
 /// Opaque continuation state for map batch lookup.
@@ -540,6 +606,72 @@ impl Map {
             fd: Arc::new(fd),
             spec,
         }
+    }
+
+    /// Creates a standalone kernel map from an owned definition.
+    ///
+    /// Map-in-map definitions must use [`Self::create_with_inner`].
+    pub fn create(spec: MapSpec) -> Result<Self> {
+        Self::create_impl(spec, None)
+    }
+
+    /// Creates a standalone map-in-map using `inner` as its template.
+    pub fn create_with_inner(mut spec: MapSpec, inner: &Self) -> Result<Self> {
+        if spec.inner_map.is_none() {
+            spec.inner_map = Some(inner.name().into());
+        }
+        Self::create_impl(spec, Some(inner))
+    }
+
+    fn create_impl(mut spec: MapSpec, inner: Option<&Self>) -> Result<Self> {
+        if spec.map_type.is_map_of_maps() != inner.is_some() {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` {} an inner-map template",
+                spec.name,
+                if spec.map_type.is_map_of_maps() {
+                    "requires"
+                } else {
+                    "does not accept"
+                }
+            )));
+        }
+        if spec.btf_key_type != TypeId::VOID || spec.btf_value_type != TypeId::VOID {
+            return Err(Error::Unsupported(
+                "standalone maps with BTF type IDs require an owning BTF object".into(),
+            ));
+        }
+        if spec.map_type == MapType::PerfEventArray && spec.max_entries == 0 {
+            spec.max_entries = u32::try_from(possible_cpu_count()?)
+                .map_err(|_| Error::InvalidObject("possible CPU count does not fit u32".into()))?;
+        }
+        spec.validate()?;
+        let fd = sys::map_create(&sys::MapCreate {
+            map_type: spec.map_type.as_raw(),
+            name: &spec.name,
+            key_size: spec.key_size,
+            value_size: spec.value_size,
+            max_entries: spec.max_entries,
+            flags: spec.flags.bits(),
+            inner_map_fd: inner.map(|map| map.fd.as_raw_fd()),
+            numa_node: spec.numa_node,
+            btf_fd: None,
+            btf_key_type_id: 0,
+            btf_value_type_id: 0,
+            map_extra: spec.map_extra,
+        })
+        .map_err(|source| Error::MapCreate {
+            map: spec.name.clone(),
+            source,
+        })?;
+        let map = Self::from_fd(fd, spec);
+        if let Some(initial) = &map.spec.initial_value {
+            sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
+                .map_err(|source| Error::system("initialize standalone map", source))?;
+        }
+        if map.spec.freeze_after_init {
+            map.freeze()?;
+        }
+        Ok(map)
     }
 
     /// Opens a map pinned in bpffs.
@@ -670,11 +802,34 @@ impl Map {
         sys::map_freeze(self.fd.as_raw_fd()).map_err(|source| Error::system("freeze map", source))
     }
 
+    /// Registers a loaded `struct_ops` map and returns its kernel link.
+    pub fn attach_struct_ops(&self) -> Result<Link> {
+        if self.spec.map_type != MapType::StructOps {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a struct_ops map",
+                self.name()
+            )));
+        }
+        let fd = sys::struct_ops_link_create(self.fd.as_raw_fd())
+            .map_err(|source| Error::system("attach struct_ops map", source))?;
+        Ok(Link::bpf(fd))
+    }
+
     /// Pins the map at a bpffs path.
     pub fn pin(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
         sys::object_pin(self.fd.as_raw_fd(), path).map_err(|source| Error::File {
             operation: "pin map",
+            path: path.into(),
+            source,
+        })
+    }
+
+    /// Removes a bpffs pin without closing this map handle.
+    pub fn unpin(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        fs::remove_file(path).map_err(|source| Error::File {
+            operation: "unpin map",
             path: path.into(),
             source,
         })
@@ -696,6 +851,11 @@ impl Map {
             btf_key_type: TypeId(raw.btf_key_type_id),
             btf_value_type: TypeId(raw.btf_value_type_id),
             map_extra: raw.map_extra,
+            interface_index: raw.ifindex,
+            network_namespace_device: raw.netns_dev,
+            network_namespace_inode: raw.netns_ino,
+            btf_vmlinux_id: raw.btf_vmlinux_id,
+            btf_vmlinux_value_type: TypeId(raw.btf_vmlinux_value_type_id),
         })
     }
 

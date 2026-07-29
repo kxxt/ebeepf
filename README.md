@@ -65,10 +65,13 @@ The crate currently provides:
 - owned ELF and BTF parsing, BTF-defined and legacy maps, global data and
   kconfig maps, subprogram linking, BTF.ext metadata, and CO-RE field
   relocations;
-- direct `bpf(2)` loading, pinning, kernel-ID queries, verifier logs, program
+- direct `bpf(2)` loading, standalone and reused maps, pinning, rich
+  map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, map CRUD and batch operations, and per-CPU values;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
-  socket, perf-event, and BTF-based attachments with RAII link lifetimes;
+  socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
+  `struct_ops`, legacy program, and iterator attachments with RAII link
+  lifetimes;
 - ring-buffer, user-ring-buffer, and perf-buffer consumers/producers without
   exposing C pointers in the public API;
 - build-script and CLI skeleton generation with named open/loaded
@@ -82,9 +85,9 @@ cargo test -p ebeepf --all-targets
 cargo clippy -p ebeepf --all-targets -- -D warnings
 ```
 
-An ignored end-to-end test generates an ELF object, loads it, and exercises map
-CRUD against the running kernel. Run it in an environment with root or
-`CAP_BPF`:
+Ignored end-to-end tests load real objects, exercise map CRUD, attach a
+Rust-emitted USDT probe, and verify its cookie through a kernel ring buffer.
+Run them in an environment with root or `CAP_BPF`:
 
 ```console
 cargo test -p ebeepf --test kernel_smoke -- --ignored

@@ -6,13 +6,14 @@ use std::str;
 
 use goblin::elf::header::{EI_CLASS, ELFCLASS64, EM_BPF, ET_REL};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
-use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT};
+use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT, STV_HIDDEN};
 use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfType, Endian};
 use crate::map::{possible_cpu_count, MapFlags, Pinning};
 use crate::program::{program_flags_from_section, ProgramKind, VerifierLog};
 use crate::sys::{self, MapCreate};
+use crate::usdt::UsdtManager;
 use crate::{
     Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType, Result,
     TypeId,
@@ -103,6 +104,7 @@ pub struct Object {
     core_relocations: Vec<CoreRelocation>,
     kfunc_relocations: Vec<KfuncRelocation>,
     pin_root: PathBuf,
+    reused_maps: BTreeMap<String, Map>,
 }
 
 impl Object {
@@ -134,6 +136,9 @@ impl Object {
 
         let sections = Sections::new(&elf, bytes)?;
         let mut btf = parse_btf(&elf, &sections)?;
+        if let Some(btf) = btf.as_mut() {
+            mark_hidden_subprograms_static(&elf, &sections, btf)?;
+        }
         let btf_ext = match (btf.as_ref(), sections.by_name(".BTF.ext")) {
             (Some(btf), Some((index, _))) => {
                 let data = relocated_metadata_section(&elf, &sections, index)?;
@@ -155,7 +160,7 @@ impl Object {
             .by_name("version")
             .map(|(_, data)| read_u32(data, 0, elf.little_endian, "kernel version"))
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or_else(running_kernel_version);
 
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
@@ -291,6 +296,7 @@ impl Object {
             core_relocations,
             kfunc_relocations,
             pin_root: "/sys/fs/bpf".into(),
+            reused_maps: BTreeMap::new(),
         })
     }
 
@@ -366,6 +372,17 @@ impl Object {
     pub fn set_pin_root(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.pin_root = path.into();
         self
+    }
+
+    /// Reuses an already loaded kernel map for a named object definition.
+    ///
+    /// Compatibility is checked transactionally during [`Self::load`].
+    pub fn reuse_map(&mut self, name: &str, map: &Map) -> Result<&mut Self> {
+        if !self.maps.contains_key(name) {
+            return Err(Error::MapNotFound(name.into()));
+        }
+        self.reused_maps.insert(name.into(), map.clone());
+        Ok(self)
     }
 
     /// Applies pending CO-RE relocations against an explicit target BTF.
@@ -451,15 +468,23 @@ impl Object {
             None => None,
         };
 
-        let maps = load_maps(&self.maps, btf_fd.as_ref(), &self.pin_root)?;
+        let maps = load_maps(
+            &self.maps,
+            &self.reused_maps,
+            btf_fd.as_ref(),
+            &self.pin_root,
+        )?;
         relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
+        let usdt_manager = UsdtManager::from_maps(&maps, self.btf.as_ref())?;
 
         let mut programs = BTreeMap::new();
         for (name, spec) in self.programs {
             if !spec.autoload {
                 continue;
             }
-            let program = Program::load(spec, &self.license, btf_fd.as_ref().map(OwnedFd::as_fd))?;
+            let mut program =
+                Program::load(spec, &self.license, btf_fd.as_ref().map(OwnedFd::as_fd))?;
+            program.set_usdt_manager(usdt_manager.clone());
             programs.insert(name, program);
         }
 
@@ -994,6 +1019,7 @@ fn add_kconfig_map(
 
     let name = format!("{}.kconfig", sanitize_kernel_name(object_name));
     let mut symbols = HashMap::new();
+    let mut initial_value = vec![0; size as usize];
     for variable in &variables {
         let BtfType::Variable {
             name: variable_name,
@@ -1011,13 +1037,27 @@ fn add_kconfig_map(
             )));
         };
         symbols.insert(variable_name.clone(), (name.clone(), variable.offset));
+        let virtual_value = match variable_name.as_str() {
+            "LINUX_KERNEL_VERSION" => Some(u64::from(running_kernel_version())),
+            "LINUX_HAS_BPF_COOKIE" => Some(u64::from(sys::supports_bpf_cookie())),
+            _ => None,
+        };
+        if let Some(value) = virtual_value {
+            write_kconfig_integer(
+                &mut initial_value,
+                variable.offset,
+                variable.size,
+                value,
+                btf.endian(),
+            )?;
+        }
     }
 
-    // Virtual and CONFIG_ externs default conservatively to zero, keeping
-    // optional feature paths disabled instead of guessing kernel state.
+    // Unsupported weak virtual externs and CONFIG_ externs default
+    // conservatively to zero. Known virtual values are detected above.
     let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
     spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
-    spec.initial_value = Some(vec![0; size as usize]);
+    spec.initial_value = Some(initial_value);
     spec.freeze_after_init = true;
     spec.btf_value_type = data_section_id;
     btf.set_data_section_size(".kconfig", size)?;
@@ -1027,6 +1067,53 @@ fn add_kconfig_map(
         )));
     }
     Ok(symbols)
+}
+
+fn mark_hidden_subprograms_static(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    btf: &mut Btf,
+) -> Result<()> {
+    for symbol in elf.syms.iter().filter(|symbol| {
+        symbol.st_type() == STT_FUNC && symbol.st_visibility() == STV_HIDDEN && symbol.st_shndx != 0
+    }) {
+        if !sections.name(symbol.st_shndx)?.starts_with(".text") {
+            continue;
+        }
+        let name = symbol_name(elf, &symbol)?;
+        btf.set_function_linkage(name, 0)?;
+    }
+    Ok(())
+}
+
+fn write_kconfig_integer(
+    bytes: &mut [u8],
+    offset: u32,
+    size: u32,
+    value: u64,
+    endian: Endian,
+) -> Result<()> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| Error::InvalidObject(".kconfig offset does not fit usize".into()))?;
+    let size = usize::try_from(size)
+        .map_err(|_| Error::InvalidObject(".kconfig value size does not fit usize".into()))?;
+    if !matches!(size, 1 | 2 | 4 | 8) {
+        return Err(Error::InvalidObject(format!(
+            "virtual .kconfig value has unsupported size {size}"
+        )));
+    }
+    let target = bytes
+        .get_mut(offset..offset.saturating_add(size))
+        .ok_or_else(|| Error::InvalidObject(".kconfig value lies outside its data map".into()))?;
+    let encoded = match endian {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    match endian {
+        Endian::Little => target.copy_from_slice(&encoded[..size]),
+        Endian::Big => target.copy_from_slice(&encoded[encoded.len() - size..]),
+    }
+    Ok(())
 }
 
 fn is_data_section(name: &str, header: &SectionHeader) -> bool {
@@ -1518,6 +1605,7 @@ fn relocate_maps(
 
 fn load_maps(
     specs: &BTreeMap<String, MapSpec>,
+    reused: &BTreeMap<String, Map>,
     btf_fd: Option<&OwnedFd>,
     pin_root: &Path,
 ) -> Result<BTreeMap<String, Map>> {
@@ -1536,12 +1624,26 @@ fn load_maps(
                 continue;
             }
             let pin_path = (spec.pinning == Pinning::ByName).then(|| pin_root.join(&name));
-            let existing = pin_path
+            let explicit = reused.get(&name).cloned();
+            let pinned = pin_path
                 .as_ref()
                 .filter(|path| path.exists())
                 .map(Map::open_pinned)
                 .transpose()?;
-            let map = if let Some(map) = existing {
+            let map = if let Some(map) = explicit {
+                ensure_map_compatible(spec, &map)?;
+                if let Some(pinned) = pinned {
+                    if pinned.info()?.id != map.info()?.id {
+                        return Err(Error::InvalidObject(format!(
+                            "reused map `{name}` differs from existing pin `{}`",
+                            pin_path.as_ref().expect("pinned path exists").display()
+                        )));
+                    }
+                } else if let Some(path) = &pin_path {
+                    map.pin(path)?;
+                }
+                map
+            } else if let Some(map) = pinned {
                 ensure_map_compatible(spec, &map)?;
                 map
             } else {
@@ -1624,6 +1726,28 @@ fn ensure_map_compatible(spec: &MapSpec, map: &Map) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn running_kernel_version() -> u32 {
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .and_then(|release| parse_kernel_version(&release))
+        .unwrap_or_default()
+}
+
+fn parse_kernel_version(release: &str) -> Option<u32> {
+    let mut components = release.trim().split('.');
+    let major = components.next()?.parse::<u32>().ok()?;
+    let minor = components.next()?.parse::<u32>().ok()?;
+    let patch = components
+        .next()?
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<u32>()
+        .ok()?;
+    (major <= u32::from(u16::MAX) && minor <= u32::from(u8::MAX))
+        .then(|| (major << 16) | (minor << 8) | patch.min(u32::from(u8::MAX)))
 }
 
 fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Result<()> {
@@ -3094,6 +3218,51 @@ mod tests {
         assert_eq!(object.maps().len(), 1);
         assert_eq!(object.programs().len(), 0);
         assert_eq!(object.map("only_map").unwrap().map_type(), MapType::Array);
+    }
+
+    #[test]
+    fn parses_kernel_release_for_program_loads() {
+        assert_eq!(
+            parse_kernel_version("6.19.14-200.fc43\n"),
+            Some(0x0006_130e)
+        );
+        assert_eq!(parse_kernel_version("4.19.260"), Some(0x0004_13ff));
+        assert_eq!(parse_kernel_version("not-a-release"), None);
+    }
+
+    #[test]
+    fn relocates_repository_usdt_btf_information_when_available() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/usdt.bpf.o");
+        if !path.exists() {
+            return;
+        }
+        let object = Object::open(path).unwrap();
+        let (_, BtfType::Function { linkage, .. }) = object
+            .btf()
+            .unwrap()
+            .find(crate::BtfKind::Function, "bpf_usdt_cookie")
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(*linkage, 0);
+        assert_eq!(
+            object.program("handle__usdt").unwrap().func_info,
+            [0_u32.to_le_bytes(), 59_u32.to_le_bytes()].concat()
+        );
+        assert_eq!(
+            object
+                .program("handle__usdt_with_cookie")
+                .unwrap()
+                .func_info,
+            [
+                0_u32.to_le_bytes(),
+                61_u32.to_le_bytes(),
+                27_u32.to_le_bytes(),
+                56_u32.to_le_bytes()
+            ]
+            .concat()
+        );
     }
 
     #[test]

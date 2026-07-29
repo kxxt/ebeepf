@@ -1283,10 +1283,19 @@ fn render_open_map_accessors(
             "    /// Mutably borrows the `{}` map specification.\n\
              pub fn {}(&mut self) -> {crate_path}::Result<&mut {crate_path}::MapSpec> {{\n\
                  self.object.map_mut({:?})\n\
+             }}\n\
+             \n\
+             /// Reuses an already loaded map for `{}`.\n\
+             pub fn reuse_{}(&mut self, map: &{crate_path}::Map) -> {crate_path}::Result<&mut Self> {{\n\
+                 self.object.reuse_map({:?}, map)?;\n\
+                 Ok(self)\n\
              }}",
             doc_text(&map.source),
             map.method,
-            map.source
+            map.source,
+            doc_text(&map.source),
+            map.method,
+            map.source,
         )
         .expect("String write");
     }

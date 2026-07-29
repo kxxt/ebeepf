@@ -1,6 +1,11 @@
 use std::collections::HashSet;
+use std::fs;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::Path;
 use std::str;
+use std::sync::Arc;
 
+use crate::sys;
 use crate::{Error, Result};
 
 const BTF_MAGIC: u16 = 0xeb9f;
@@ -347,6 +352,17 @@ pub struct Btf {
 }
 
 impl Btf {
+    /// Reads BTF for the running kernel from sysfs.
+    pub fn from_vmlinux() -> Result<Self> {
+        let path = Path::new("/sys/kernel/btf/vmlinux");
+        let bytes = fs::read(path).map_err(|source| Error::File {
+            operation: "read running kernel BTF",
+            path: path.into(),
+            source,
+        })?;
+        Self::parse(&bytes)
+    }
+
     /// Parses a `.BTF` section.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         let endian = Endian::detect(bytes)?;
@@ -577,6 +593,47 @@ impl Btf {
         self.endian
     }
 
+    pub(crate) fn set_function_linkage(&mut self, name: &str, linkage: u16) -> Result<bool> {
+        let mut changed = false;
+        for index in 0..self.types.len() {
+            let BtfType::Function {
+                name: function_name,
+                linkage: current,
+                ..
+            } = &mut self.types[index]
+            else {
+                continue;
+            };
+            if function_name != name || *current == linkage {
+                continue;
+            }
+            *current = linkage;
+            let record_offset = self
+                .type_section_offset
+                .checked_add(self.type_offsets[index])
+                .ok_or_else(|| Error::Btf("type record offset overflow".into()))?;
+            let info_offset = record_offset
+                .checked_add(4)
+                .ok_or_else(|| Error::Btf("function info offset overflow".into()))?;
+            let target = self
+                .raw
+                .get_mut(info_offset..info_offset.saturating_add(4))
+                .ok_or_else(|| Error::Btf("function info lies outside raw BTF".into()))?;
+            let mut info = match self.endian {
+                Endian::Little => u32::from_le_bytes(target.try_into().unwrap()),
+                Endian::Big => u32::from_be_bytes(target.try_into().unwrap()),
+            };
+            info = (info & !0xffff) | u32::from(linkage);
+            let encoded = match self.endian {
+                Endian::Little => info.to_le_bytes(),
+                Endian::Big => info.to_be_bytes(),
+            };
+            target.copy_from_slice(&encoded);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     pub(crate) fn set_data_section_size(&mut self, name: &str, size: u32) -> Result<bool> {
         let Some(index) = self.types.iter().position(
             |ty| matches!(ty, BtfType::DataSection { name: candidate, .. } if candidate == name),
@@ -655,6 +712,71 @@ impl Btf {
             }
         }
         Ok(())
+    }
+}
+
+/// Metadata for a BTF object loaded in the kernel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BtfInfo {
+    /// Kernel-assigned ID.
+    pub id: u32,
+    /// Kernel object name.
+    pub name: String,
+    /// Whether the BTF belongs to the kernel rather than a user-loaded object.
+    pub kernel: bool,
+    /// Encoded BTF size in bytes.
+    pub size: u32,
+}
+
+/// An owned reference to a BTF object loaded in the kernel.
+#[derive(Clone, Debug)]
+pub struct BtfObject {
+    fd: Arc<OwnedFd>,
+    btf: Btf,
+    info: BtfInfo,
+}
+
+impl BtfObject {
+    /// Opens and parses a kernel BTF object by ID.
+    pub fn from_id(id: u32) -> Result<Self> {
+        let fd = sys::object_get_fd_by_id(sys::ObjectKind::Btf, id)
+            .map_err(|source| Error::system("open BTF object by ID", source))?;
+        Self::from_fd(fd)
+    }
+
+    fn from_fd(fd: OwnedFd) -> Result<Self> {
+        let (raw, bytes, name) = sys::btf_info(fd.as_fd().as_raw_fd())
+            .map_err(|source| Error::system("read BTF object metadata", source))?;
+        let name_end = name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(name.len());
+        let info = BtfInfo {
+            id: raw.id,
+            name: String::from_utf8_lossy(&name[..name_end]).into_owned(),
+            kernel: raw.kernel_btf != 0,
+            size: raw.btf_size,
+        };
+        Ok(Self {
+            fd: Arc::new(fd),
+            btf: Btf::parse(&bytes)?,
+            info,
+        })
+    }
+
+    /// Borrows the parsed BTF table.
+    pub const fn btf(&self) -> &Btf {
+        &self.btf
+    }
+
+    /// Borrows kernel metadata captured while opening this object.
+    pub const fn info(&self) -> &BtfInfo {
+        &self.info
+    }
+
+    /// Borrows the kernel BTF descriptor.
+    pub fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
     }
 }
 

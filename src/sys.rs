@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::ptr;
+use std::sync::OnceLock;
 
 use crate::instruction::Instruction;
 
@@ -24,12 +25,15 @@ const BPF_MAP_GET_NEXT_KEY: u32 = 4;
 const BPF_PROG_LOAD: u32 = 5;
 const BPF_OBJ_PIN: u32 = 6;
 const BPF_OBJ_GET: u32 = 7;
+const BPF_PROG_ATTACH: u32 = 8;
+const BPF_PROG_DETACH: u32 = 9;
 const BPF_PROG_TEST_RUN: u32 = 10;
 const BPF_PROG_GET_NEXT_ID: u32 = 11;
 const BPF_MAP_GET_NEXT_ID: u32 = 12;
 const BPF_PROG_GET_FD_BY_ID: u32 = 13;
 const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
+const BPF_PROG_QUERY: u32 = 16;
 const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
 const BPF_BTF_LOAD: u32 = 18;
 const BPF_BTF_GET_FD_BY_ID: u32 = 19;
@@ -41,8 +45,10 @@ const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
 const BPF_MAP_UPDATE_BATCH: u32 = 26;
 const BPF_MAP_DELETE_BATCH: u32 = 27;
 const BPF_LINK_CREATE: u32 = 28;
+const BPF_LINK_UPDATE: u32 = 29;
 const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 const BPF_LINK_GET_NEXT_ID: u32 = 31;
+const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_DETACH: u32 = 34;
 
 const PERF_TYPE_TRACEPOINT: u32 = 2;
@@ -162,6 +168,28 @@ struct ProgramLoadAttr {
     line_info_cnt: u32,
     attach_btf_id: u32,
     attach_prog_fd: u32,
+    core_relocation_count: u32,
+    fd_array: u64,
+    core_relocations: u64,
+    core_relocation_record_size: u32,
+    log_true_size: u32,
+    program_token_fd: i32,
+    fd_array_count: u32,
+    signature: u64,
+    signature_size: u32,
+    keyring_id: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct ProgramAttachAttr {
+    target_fd: u32,
+    program_fd: u32,
+    attach_type: u32,
+    attach_flags: u32,
+    replace_program_fd: u32,
+    relative_fd_or_id: u32,
+    expected_revision: u64,
 }
 
 #[repr(C)]
@@ -180,6 +208,22 @@ struct ObjectInfoAttr {
     bpf_fd: u32,
     info_len: u32,
     info: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct ProgramQueryAttr {
+    target_fd_or_ifindex: u32,
+    attach_type: u32,
+    query_flags: u32,
+    attach_flags: u32,
+    program_ids: u64,
+    count: u32,
+    _padding: u32,
+    program_attach_flags: u64,
+    link_ids: u64,
+    link_attach_flags: u64,
+    revision: u64,
 }
 
 #[repr(C)]
@@ -211,6 +255,58 @@ struct LinkCreateAttr {
     target_btf_id: u32,
     _padding: u32,
     cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct LinkUpdateAttr {
+    link_fd: u32,
+    new_prog_fd: u32,
+    flags: u32,
+    old_prog_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct KprobeMultiLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    link_flags: u32,
+    multi_flags: u32,
+    count: u32,
+    symbols: u64,
+    addresses: u64,
+    cookies: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct UprobeMultiLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    link_flags: u32,
+    path: u64,
+    offsets: u64,
+    reference_counter_offsets: u64,
+    cookies: u64,
+    count: u32,
+    multi_flags: u32,
+    pid: u32,
+    path_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct IteratorLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    link_flags: u32,
+    iterator_info: u64,
+    iterator_info_length: u32,
+    _padding: u32,
 }
 
 #[repr(C)]
@@ -297,8 +393,11 @@ pub(crate) struct MapInfoRaw {
     pub btf_id: u32,
     pub btf_key_type_id: u32,
     pub btf_value_type_id: u32,
-    pub _padding: u32,
+    pub btf_vmlinux_id: u32,
     pub map_extra: u64,
+    pub hash: u64,
+    pub hash_size: u32,
+    pub _padding: u32,
 }
 
 #[repr(C)]
@@ -318,6 +417,63 @@ pub(crate) struct ProgramInfoRaw {
     pub name: [u8; BPF_OBJ_NAME_LEN],
     pub ifindex: u32,
     pub gpl_compatible: u32,
+    pub netns_dev: u64,
+    pub netns_ino: u64,
+    pub nr_jited_symbols: u32,
+    pub nr_jited_function_lengths: u32,
+    pub jited_symbols: u64,
+    pub jited_function_lengths: u64,
+    pub btf_id: u32,
+    pub function_info_record_size: u32,
+    pub function_info: u64,
+    pub function_info_count: u32,
+    pub line_info_count: u32,
+    pub line_info: u64,
+    pub jited_line_info: u64,
+    pub jited_line_info_count: u32,
+    pub line_info_record_size: u32,
+    pub jited_line_info_record_size: u32,
+    pub program_tag_count: u32,
+    pub program_tags: u64,
+    pub run_time_nanoseconds: u64,
+    pub run_count: u64,
+    pub recursion_misses: u64,
+    pub verified_instructions: u32,
+    pub attach_btf_object_id: u32,
+    pub attach_btf_id: u32,
+    pub _padding: u32,
+}
+
+#[repr(C, align(8))]
+pub(crate) struct LinkInfoRaw {
+    pub link_type: u32,
+    pub id: u32,
+    pub program_id: u32,
+    pub _padding: u32,
+    pub details: [u8; 48],
+}
+
+impl Default for LinkInfoRaw {
+    fn default() -> Self {
+        Self {
+            link_type: 0,
+            id: 0,
+            program_id: 0,
+            _padding: 0,
+            details: [0; 48],
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct BtfInfoRaw {
+    pub btf: u64,
+    pub btf_size: u32,
+    pub id: u32,
+    pub name: u64,
+    pub name_length: u32,
+    pub kernel_btf: u32,
 }
 
 pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
@@ -522,16 +678,16 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         license: pointer(options.license.as_ptr()),
         log_level: options.log_level,
         log_size: u32::try_from(log.len()).unwrap_or(u32::MAX),
-        log_buf: mut_pointer(log.as_mut_ptr()),
+        log_buf: mut_slice_pointer(&mut log),
         kern_version: options.kernel_version,
         prog_flags: options.flags,
         expected_attach_type: options.expected_attach_type,
         prog_btf_fd: fd_u32(options.btf_fd).unwrap_or_default(),
         func_info_rec_size: options.func_info_record_size,
-        func_info: pointer(options.func_info.as_ptr()),
+        func_info: slice_pointer(options.func_info),
         func_info_cnt: record_count(options.func_info, options.func_info_record_size),
         line_info_rec_size: options.line_info_record_size,
-        line_info: pointer(options.line_info.as_ptr()),
+        line_info: slice_pointer(options.line_info),
         line_info_cnt: record_count(options.line_info, options.line_info_record_size),
         attach_btf_id: options.attach_btf_id,
         attach_prog_fd: fd_u32(options.attach_program_fd).unwrap_or_default(),
@@ -539,6 +695,39 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
     };
     set_object_name(&mut attr.prog_name, options.name);
     command_fd(BPF_PROG_LOAD, &attr).map_err(|error| (error, log_string(&log)))
+}
+
+pub(crate) fn supports_bpf_cookie() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+
+    *SUPPORTED.get_or_init(probe_bpf_cookie)
+}
+
+fn probe_bpf_cookie() -> bool {
+    const BPF_FUNC_GET_ATTACH_COOKIE: i32 = 174;
+    let instructions = [
+        Instruction::new(0x85, 0, 0, 0, BPF_FUNC_GET_ATTACH_COOKIE),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    program_load(&ProgramLoad {
+        program_type: 5, // BPF_PROG_TYPE_TRACEPOINT
+        expected_attach_type: 0,
+        name: "",
+        instructions: &instructions,
+        license: b"GPL\0",
+        kernel_version: 0,
+        flags: 0,
+        btf_fd: None,
+        func_info: &[],
+        func_info_record_size: 0,
+        line_info: &[],
+        line_info_record_size: 0,
+        attach_btf_id: 0,
+        attach_program_fd: None,
+        log_level: 0,
+        log_size: 0,
+    })
+    .is_ok()
 }
 
 pub(crate) fn object_pin(fd: RawFd, path: &Path) -> io::Result<()> {
@@ -566,6 +755,107 @@ pub(crate) fn map_info(fd: RawFd) -> io::Result<MapInfoRaw> {
 
 pub(crate) fn program_info(fd: RawFd) -> io::Result<ProgramInfoRaw> {
     object_info(fd)
+}
+
+pub(crate) fn program_info_with_map_ids(fd: RawFd) -> io::Result<(ProgramInfoRaw, Vec<u32>)> {
+    let initial = program_info(fd)?;
+    let capacity = initial.nr_map_ids as usize;
+    if capacity == 0 {
+        return Ok((initial, Vec::new()));
+    }
+    let mut map_ids = vec![0_u32; capacity];
+    let mut info = ProgramInfoRaw {
+        map_ids: mut_slice_pointer(&mut map_ids),
+        nr_map_ids: u32::try_from(map_ids.len()).unwrap_or(u32::MAX),
+        ..Default::default()
+    };
+    object_info_into(fd, &mut info)?;
+    map_ids.truncate((info.nr_map_ids as usize).min(capacity));
+    info.map_ids = 0;
+    Ok((info, map_ids))
+}
+
+pub(crate) fn link_info(fd: RawFd) -> io::Result<LinkInfoRaw> {
+    object_info(fd)
+}
+
+pub(crate) fn btf_info(fd: RawFd) -> io::Result<(BtfInfoRaw, Vec<u8>, Vec<u8>)> {
+    let mut info = object_info::<BtfInfoRaw>(fd)?;
+    let btf_capacity = info.btf_size as usize;
+    let name_capacity = info.name_length as usize;
+    let mut btf = vec![0_u8; btf_capacity];
+    let mut name = vec![0_u8; name_capacity];
+    info.btf = mut_slice_pointer(&mut btf);
+    info.btf_size = u32::try_from(btf.len()).unwrap_or(u32::MAX);
+    info.name = mut_slice_pointer(&mut name);
+    info.name_length = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    object_info_into(fd, &mut info)?;
+    btf.truncate((info.btf_size as usize).min(btf_capacity));
+    name.truncate((info.name_length as usize).min(name_capacity));
+    info.btf = 0;
+    info.name = 0;
+    Ok((info, btf, name))
+}
+
+pub(crate) struct ProgramQueryResult {
+    pub attach_flags: u32,
+    pub revision: u64,
+    pub program_ids: Vec<u32>,
+    pub program_attach_flags: Vec<u32>,
+    pub link_ids: Vec<u32>,
+    pub link_attach_flags: Vec<u32>,
+}
+
+pub(crate) fn program_query(
+    target_fd_or_ifindex: u32,
+    attach_type: u32,
+    query_flags: u32,
+) -> io::Result<ProgramQueryResult> {
+    let mut attr = ProgramQueryAttr {
+        target_fd_or_ifindex,
+        attach_type,
+        query_flags,
+        ..Default::default()
+    };
+    match command_mut(BPF_PROG_QUERY, &mut attr) {
+        Ok(_) => {}
+        Err(error) if error.raw_os_error() == Some(libc::ENOSPC) => {}
+        Err(error) => return Err(error),
+    }
+    let capacity = attr.count as usize;
+    if capacity == 0 {
+        return Ok(ProgramQueryResult {
+            attach_flags: attr.attach_flags,
+            revision: attr.revision,
+            program_ids: Vec::new(),
+            program_attach_flags: Vec::new(),
+            link_ids: Vec::new(),
+            link_attach_flags: Vec::new(),
+        });
+    }
+    let mut program_ids = vec![0_u32; capacity];
+    let mut program_attach_flags = vec![0_u32; capacity];
+    let mut link_ids = vec![0_u32; capacity];
+    let mut link_attach_flags = vec![0_u32; capacity];
+    attr.count = u32::try_from(capacity).unwrap_or(u32::MAX);
+    attr.program_ids = mut_pointer(program_ids.as_mut_ptr());
+    attr.program_attach_flags = mut_pointer(program_attach_flags.as_mut_ptr());
+    attr.link_ids = mut_pointer(link_ids.as_mut_ptr());
+    attr.link_attach_flags = mut_pointer(link_attach_flags.as_mut_ptr());
+    command_mut(BPF_PROG_QUERY, &mut attr)?;
+    let actual = (attr.count as usize).min(capacity);
+    program_ids.truncate(actual);
+    program_attach_flags.truncate(actual);
+    link_ids.truncate(actual);
+    link_attach_flags.truncate(actual);
+    Ok(ProgramQueryResult {
+        attach_flags: attr.attach_flags,
+        revision: attr.revision,
+        program_ids,
+        program_attach_flags,
+        link_ids,
+        link_attach_flags,
+    })
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -612,16 +902,27 @@ pub(crate) fn object_get_fd_by_id(kind: ObjectKind, id: u32) -> io::Result<Owned
 
 fn object_info<T>(fd: RawFd) -> io::Result<T> {
     let mut info = MaybeUninit::<T>::zeroed();
+    let value = info.as_mut_ptr();
     let attr = ObjectInfoAttr {
         bpf_fd: raw_fd_u32(fd)?,
         info_len: u32::try_from(mem::size_of::<T>())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "info type is too large"))?,
-        info: mut_pointer(info.as_mut_ptr()),
+        info: mut_pointer(value),
     };
     command(BPF_OBJ_GET_INFO_BY_FD, &attr)?;
     // SAFETY: The value was zero-initialized, and the kernel only writes bytes
     // within the advertised `T` allocation. All info structs contain integers.
     Ok(unsafe { info.assume_init() })
+}
+
+fn object_info_into<T>(fd: RawFd, info: &mut T) -> io::Result<()> {
+    let attr = ObjectInfoAttr {
+        bpf_fd: raw_fd_u32(fd)?,
+        info_len: u32::try_from(mem::size_of::<T>())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "info type is too large"))?,
+        info: mut_pointer(info),
+    };
+    command(BPF_OBJ_GET_INFO_BY_FD, &attr).map(drop)
 }
 
 pub(crate) fn link_create(
@@ -677,6 +978,137 @@ pub(crate) fn link_detach(fd: RawFd) -> io::Result<()> {
         },
     )
     .map(drop)
+}
+
+pub(crate) fn link_update(
+    link_fd: RawFd,
+    new_program_fd: RawFd,
+    old_program_fd: Option<RawFd>,
+) -> io::Result<()> {
+    let attr = LinkUpdateAttr {
+        link_fd: raw_fd_u32(link_fd)?,
+        new_prog_fd: raw_fd_u32(new_program_fd)?,
+        flags: u32::from(old_program_fd.is_some()),
+        old_prog_fd: fd_u32(old_program_fd)?,
+    };
+    command(BPF_LINK_UPDATE, &attr).map(drop)
+}
+
+pub(crate) fn kprobe_multi_link_create(
+    program_fd: RawFd,
+    attach_type: u32,
+    symbols: Option<&[&str]>,
+    addresses: Option<&[u64]>,
+    cookies: Option<&[u64]>,
+    return_probe: bool,
+) -> io::Result<OwnedFd> {
+    if symbols.is_some() == addresses.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "exactly one of kprobe symbols or addresses is required",
+        ));
+    }
+    let count = symbols.map_or_else(|| addresses.map_or(0, <[u64]>::len), <[&str]>::len);
+    if count == 0 || cookies.is_some_and(|cookies| cookies.len() != count) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "kprobe target and cookie counts do not match",
+        ));
+    }
+    let symbol_strings = symbols
+        .unwrap_or_default()
+        .iter()
+        .map(|symbol| {
+            CString::new(*symbol).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "kprobe symbol contains NUL")
+            })
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let symbol_pointers = symbol_strings
+        .iter()
+        .map(|symbol| pointer(symbol.as_ptr()))
+        .collect::<Vec<_>>();
+    let attr = KprobeMultiLinkCreateAttr {
+        prog_fd: raw_fd_u32(program_fd)?,
+        attach_type,
+        multi_flags: u32::from(return_probe),
+        count: u32_len(count, "kprobe target count")?,
+        symbols: slice_pointer(&symbol_pointers),
+        addresses: addresses.map_or(0, slice_pointer),
+        cookies: cookies.map_or(0, slice_pointer),
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
+pub(crate) struct UprobeMultiTarget<'a> {
+    pub program_fd: RawFd,
+    pub attach_type: u32,
+    pub path: &'a Path,
+    pub offsets: &'a [u64],
+    pub reference_counter_offsets: Option<&'a [u64]>,
+    pub cookies: Option<&'a [u64]>,
+    pub pid: Option<u32>,
+    pub return_probe: bool,
+}
+
+pub(crate) fn uprobe_multi_link_create(target: &UprobeMultiTarget<'_>) -> io::Result<OwnedFd> {
+    let count = target.offsets.len();
+    if count == 0
+        || target
+            .reference_counter_offsets
+            .is_some_and(|offsets| offsets.len() != count)
+        || target.cookies.is_some_and(|cookies| cookies.len() != count)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "uprobe target and optional metadata counts do not match",
+        ));
+    }
+    let path = path_cstring(target.path.as_os_str())?;
+    let attr = UprobeMultiLinkCreateAttr {
+        prog_fd: raw_fd_u32(target.program_fd)?,
+        attach_type: target.attach_type,
+        path: pointer(path.as_ptr()),
+        offsets: slice_pointer(target.offsets),
+        reference_counter_offsets: target.reference_counter_offsets.map_or(0, slice_pointer),
+        cookies: target.cookies.map_or(0, slice_pointer),
+        count: u32_len(count, "uprobe target count")?,
+        multi_flags: u32::from(target.return_probe),
+        pid: target.pid.unwrap_or_default(),
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
+pub(crate) fn iterator_link_create(
+    program_fd: RawFd,
+    attach_type: u32,
+    iterator_info: Option<&[u8; 16]>,
+) -> io::Result<OwnedFd> {
+    let attr = IteratorLinkCreateAttr {
+        prog_fd: raw_fd_u32(program_fd)?,
+        attach_type,
+        iterator_info: iterator_info.map_or(0, |info| pointer(info.as_ptr())),
+        iterator_info_length: if iterator_info.is_some() { 16 } else { 0 },
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
+pub(crate) fn iterator_create(link_fd: RawFd) -> io::Result<OwnedFd> {
+    #[repr(C)]
+    struct Attr {
+        link_fd: u32,
+        flags: u32,
+    }
+    command_fd(
+        BPF_ITER_CREATE,
+        &Attr {
+            link_fd: raw_fd_u32(link_fd)?,
+            flags: 0,
+        },
+    )
 }
 
 pub(crate) fn raw_tracepoint_open(
@@ -739,6 +1171,45 @@ pub(crate) fn program_test_run(options: &TestRun<'_>) -> io::Result<TestRunResul
         data: data_output,
         context: context_output,
     })
+}
+
+pub(crate) fn program_attach(
+    program_fd: RawFd,
+    target_fd: RawFd,
+    attach_type: u32,
+    flags: u32,
+) -> io::Result<()> {
+    let attr = ProgramAttachAttr {
+        target_fd: raw_fd_u32(target_fd)?,
+        program_fd: raw_fd_u32(program_fd)?,
+        attach_type,
+        attach_flags: flags,
+        ..Default::default()
+    };
+    command(BPF_PROG_ATTACH, &attr).map(drop)
+}
+
+pub(crate) fn program_detach(
+    program_fd: RawFd,
+    target_fd: RawFd,
+    attach_type: u32,
+) -> io::Result<()> {
+    let attr = ProgramAttachAttr {
+        target_fd: raw_fd_u32(target_fd)?,
+        program_fd: raw_fd_u32(program_fd)?,
+        attach_type,
+        ..Default::default()
+    };
+    command(BPF_PROG_DETACH, &attr).map(drop)
+}
+
+pub(crate) fn struct_ops_link_create(map_fd: RawFd) -> io::Result<OwnedFd> {
+    let attr = LinkCreateAttr {
+        prog_fd: raw_fd_u32(map_fd)?,
+        attach_type: 44,
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
 }
 
 pub(crate) fn tracepoint_perf_event(
@@ -966,16 +1437,24 @@ fn pointer<T>(pointer: *const T) -> u64 {
     pointer as usize as u64
 }
 
-fn slice_pointer(bytes: &[u8]) -> u64 {
-    if bytes.is_empty() {
+fn slice_pointer<T>(slice: &[T]) -> u64 {
+    if slice.is_empty() {
         0
     } else {
-        pointer(bytes.as_ptr())
+        pointer(slice.as_ptr())
     }
 }
 
 fn mut_pointer<T>(pointer: *mut T) -> u64 {
     pointer as usize as u64
+}
+
+fn mut_slice_pointer<T>(slice: &mut [T]) -> u64 {
+    if slice.is_empty() {
+        0
+    } else {
+        mut_pointer(slice.as_mut_ptr())
+    }
 }
 
 fn command_fd<T>(command_number: u32, attr: &T) -> io::Result<OwnedFd> {
@@ -1072,12 +1551,22 @@ mod tests {
         assert_eq!(MAP_CREATE_ATTR_SIZE, 92);
         assert_eq!(mem::size_of::<MapElementAttr>(), 32);
         assert_eq!(mem::size_of::<MapBatchAttr>(), 56);
-        assert_eq!(mem::size_of::<ProgramLoadAttr>(), 120);
+        assert_eq!(mem::size_of::<ProgramLoadAttr>(), 168);
         assert_eq!(mem::size_of::<BtfLoadAttr>(), 32);
         assert_eq!(mem::size_of::<ObjectPathAttr>(), 24);
         assert_eq!(mem::size_of::<GetIdAttr>(), 12);
+        assert_eq!(mem::size_of::<ProgramAttachAttr>(), 32);
+        assert_eq!(mem::size_of::<ProgramQueryAttr>(), 64);
         assert_eq!(mem::size_of::<LinkCreateAttr>(), 32);
+        assert_eq!(mem::size_of::<LinkUpdateAttr>(), 16);
+        assert_eq!(mem::size_of::<KprobeMultiLinkCreateAttr>(), 48);
+        assert_eq!(mem::size_of::<UprobeMultiLinkCreateAttr>(), 64);
+        assert_eq!(mem::size_of::<IteratorLinkCreateAttr>(), 32);
         assert_eq!(mem::size_of::<NetfilterLinkCreateAttr>(), 32);
+        assert_eq!(mem::size_of::<MapInfoRaw>(), 104);
+        assert_eq!(mem::size_of::<ProgramInfoRaw>(), 232);
+        assert_eq!(mem::size_of::<LinkInfoRaw>(), 64);
+        assert_eq!(mem::size_of::<BtfInfoRaw>(), 32);
         // PERF_ATTR_SIZE_VER5. Newer fields are optional ABI suffixes.
         assert_eq!(mem::size_of::<PerfEventAttr>(), 112);
         assert_eq!(mem::size_of::<ProgramTestRunAttr>(), 80);

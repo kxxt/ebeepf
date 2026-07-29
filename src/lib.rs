@@ -12,6 +12,7 @@
 mod btf;
 mod error;
 mod instruction;
+mod iter;
 mod link;
 mod map;
 mod object;
@@ -21,12 +22,14 @@ pub mod query;
 mod ringbuf;
 pub mod skel;
 mod sys;
+mod usdt;
 mod user_ringbuf;
 
-pub use crate::btf::{Btf, BtfKind, BtfMember, BtfType, TypeId};
+pub use crate::btf::{Btf, BtfInfo, BtfKind, BtfMember, BtfObject, BtfType, TypeId};
 pub use crate::error::{Error, Result};
 pub use crate::instruction::Instruction;
-pub use crate::link::{AttachType, Link};
+pub use crate::iter::BpfIterator;
+pub use crate::link::{AttachType, Link, LinkInfo, LinkType};
 pub use crate::map::{
     BatchCursor, KeyIterator, Map, MapBatch, MapFlags, MapInfo, MapSpec, MapType, Pinning,
     UpdateMode,
@@ -34,11 +37,13 @@ pub use crate::map::{
 pub use crate::object::{LoadedObject, Object};
 pub use crate::perfbuf::{PerfBuffer, PerfBufferBuilder, PerfEvent};
 pub use crate::program::{
-    Program, ProgramInfo, ProgramKind, ProgramSpec, ProgramType, TestRunOptions, TestRunOutput,
-    VerifierLog,
+    CgroupIteratorOrder, IteratorOptions, KprobeMultiOptions, KprobeMultiTargets, Program,
+    ProgramInfo, ProgramKind, ProgramSpec, ProgramType, TestRunOptions, TestRunOutput,
+    UprobeMultiOptions, UprobeMultiTargets, VerifierLog,
 };
 pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
 pub use crate::skel::{
     DataSection, DataSectionMut, DataValue, OpenSkeleton, Skeleton, SkeletonBuilder,
 };
+pub use crate::usdt::{discover_usdt_probes, UsdtOptions, UsdtProbe};
 pub use crate::user_ringbuf::{UserRingBuffer, UserRingReservation};

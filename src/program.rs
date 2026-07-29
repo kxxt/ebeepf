@@ -6,9 +6,13 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
+use goblin::elf::sym::STT_FUNC;
+use goblin::elf::Elf;
+
 use crate::link::{AttachType, Link};
-use crate::map::kernel_name;
+use crate::map::{kernel_name, Map};
 use crate::sys::{self, ProgramLoad};
+use crate::usdt::{UsdtManager, UsdtOptions};
 use crate::{Error, Instruction, Result};
 
 /// A kernel eBPF program type.
@@ -240,9 +244,16 @@ impl ProgramKind {
                 function: target.into(),
                 return_probe: true,
             },
-            "uprobe" | "uprobe.s" | "usdt" | "usdt.s" => Self::Uprobe {
+            "uprobe" | "uprobe.s" => Self::Uprobe {
                 target: target.into(),
                 return_probe: false,
+            },
+            // BPF-side USDT helpers inspect the uprobe-multi attachment
+            // context, so the expected attach type must be present when the
+            // program is verified (not merely when its link is created).
+            "usdt" | "usdt.s" => Self::Other {
+                program_type: ProgramType::Kprobe,
+                attach_type: Some(AttachType::TraceUprobeMulti),
             },
             "uretprobe" | "uretprobe.s" => Self::Uprobe {
                 target: target.into(),
@@ -734,6 +745,227 @@ pub struct ProgramInfo {
     pub created_by_uid: u32,
     /// Whether the program may call GPL-only helpers.
     pub gpl_compatible: bool,
+    /// IDs of maps referenced by the program.
+    pub map_ids: Vec<u32>,
+    /// Network interface index for device-bound programs.
+    pub interface_index: u32,
+    /// Network namespace device containing the program.
+    pub network_namespace_device: u64,
+    /// Network namespace inode containing the program.
+    pub network_namespace_inode: u64,
+    /// BTF object ID describing the program.
+    pub btf_id: u32,
+    /// Accumulated runtime in nanoseconds when statistics are enabled.
+    pub run_time_nanoseconds: u64,
+    /// Number of executions when statistics are enabled.
+    pub run_count: u64,
+    /// Number of missed recursive executions.
+    pub recursion_misses: u64,
+    /// Number of verifier-processed instructions.
+    pub verified_instructions: u32,
+    /// BTF object containing the attachment target.
+    pub attach_btf_object_id: u32,
+    /// BTF type ID of the attachment target.
+    pub attach_btf_id: u32,
+}
+
+/// Kernel targets used by a multi-kprobe attachment.
+#[derive(Clone, Copy, Debug)]
+pub enum KprobeMultiTargets<'target> {
+    /// Kernel function names.
+    Symbols(&'target [&'target str]),
+    /// Kernel function addresses.
+    Addresses(&'target [u64]),
+}
+
+/// Options for attaching one program to multiple kernel probes.
+#[derive(Clone, Copy, Debug)]
+pub struct KprobeMultiOptions<'target> {
+    targets: KprobeMultiTargets<'target>,
+    cookies: Option<&'target [u64]>,
+    return_probe: bool,
+    session: bool,
+}
+
+impl<'target> KprobeMultiOptions<'target> {
+    /// Creates options targeting kernel function names.
+    pub const fn symbols(symbols: &'target [&'target str]) -> Self {
+        Self {
+            targets: KprobeMultiTargets::Symbols(symbols),
+            cookies: None,
+            return_probe: false,
+            session: false,
+        }
+    }
+
+    /// Creates options targeting kernel function addresses.
+    pub const fn addresses(addresses: &'target [u64]) -> Self {
+        Self {
+            targets: KprobeMultiTargets::Addresses(addresses),
+            cookies: None,
+            return_probe: false,
+            session: false,
+        }
+    }
+
+    /// Supplies one attachment cookie per target.
+    pub const fn cookies(mut self, cookies: &'target [u64]) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Selects return probes instead of entry probes.
+    pub const fn return_probe(mut self, enabled: bool) -> Self {
+        self.return_probe = enabled;
+        self
+    }
+
+    /// Selects a kprobe session link.
+    pub const fn session(mut self, enabled: bool) -> Self {
+        self.session = enabled;
+        self
+    }
+}
+
+/// Userspace targets used by a multi-uprobe attachment.
+#[derive(Clone, Copy, Debug)]
+pub enum UprobeMultiTargets<'target> {
+    /// File offsets into the executable or shared object.
+    Offsets(&'target [u64]),
+    /// Exact ELF function symbols resolved by this crate.
+    Symbols(&'target [&'target str]),
+}
+
+/// Options for attaching one program to multiple userspace probes.
+#[derive(Clone, Debug)]
+pub struct UprobeMultiOptions<'target> {
+    path: PathBuf,
+    targets: UprobeMultiTargets<'target>,
+    reference_counter_offsets: Option<&'target [u64]>,
+    cookies: Option<&'target [u64]>,
+    pid: Option<u32>,
+    return_probe: bool,
+    session: bool,
+}
+
+/// Order used when a BPF iterator walks cgroups.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum CgroupIteratorOrder {
+    /// Kernel default.
+    #[default]
+    Default,
+    /// Only the selected cgroup.
+    SelfOnly,
+    /// Descendants in pre-order.
+    DescendantsPre,
+    /// Descendants in post-order.
+    DescendantsPost,
+    /// Ancestors upward.
+    AncestorsUp,
+}
+
+impl CgroupIteratorOrder {
+    const fn as_raw(self) -> u32 {
+        match self {
+            Self::Default => 0,
+            Self::SelfOnly => 1,
+            Self::DescendantsPre => 2,
+            Self::DescendantsPost => 3,
+            Self::AncestorsUp => 4,
+        }
+    }
+}
+
+/// Optional target information for a BPF iterator link.
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum IteratorOptions<'target> {
+    /// No target-specific information.
+    None,
+    /// Iterate over the contents of a map.
+    Map(&'target Map),
+    /// Walk cgroups starting at an open cgroup descriptor.
+    Cgroup {
+        /// Open cgroup directory.
+        cgroup: BorrowedFd<'target>,
+        /// Traversal order.
+        order: CgroupIteratorOrder,
+    },
+    /// Walk cgroups starting at a kernel cgroup ID.
+    CgroupId {
+        /// Kernel cgroup ID.
+        id: u64,
+        /// Traversal order.
+        order: CgroupIteratorOrder,
+    },
+    /// Iterate tasks, optionally filtering by thread and process IDs.
+    Task {
+        /// Thread ID, or zero for all threads.
+        thread_id: u32,
+        /// Process ID, or zero for all processes.
+        process_id: u32,
+        /// Optional pidfd used by newer kernels.
+        process_fd: Option<BorrowedFd<'target>>,
+    },
+}
+
+impl<'target> UprobeMultiOptions<'target> {
+    /// Creates options targeting exact file offsets.
+    pub fn offsets(path: impl Into<PathBuf>, offsets: &'target [u64]) -> Self {
+        Self {
+            path: path.into(),
+            targets: UprobeMultiTargets::Offsets(offsets),
+            reference_counter_offsets: None,
+            cookies: None,
+            pid: None,
+            return_probe: false,
+            session: false,
+        }
+    }
+
+    /// Creates options targeting exact ELF function symbols.
+    pub fn symbols(path: impl Into<PathBuf>, symbols: &'target [&'target str]) -> Self {
+        Self {
+            path: path.into(),
+            targets: UprobeMultiTargets::Symbols(symbols),
+            reference_counter_offsets: None,
+            cookies: None,
+            pid: None,
+            return_probe: false,
+            session: false,
+        }
+    }
+
+    /// Supplies one reference-counter file offset per target.
+    pub const fn reference_counter_offsets(mut self, offsets: &'target [u64]) -> Self {
+        self.reference_counter_offsets = Some(offsets);
+        self
+    }
+
+    /// Supplies one attachment cookie per target.
+    pub const fn cookies(mut self, cookies: &'target [u64]) -> Self {
+        self.cookies = Some(cookies);
+        self
+    }
+
+    /// Limits probes to a process. `None` means system-wide.
+    pub const fn pid(mut self, pid: Option<u32>) -> Self {
+        self.pid = pid;
+        self
+    }
+
+    /// Selects return probes instead of entry probes.
+    pub const fn return_probe(mut self, enabled: bool) -> Self {
+        self.return_probe = enabled;
+        self
+    }
+
+    /// Selects an uprobe session link.
+    pub const fn session(mut self, enabled: bool) -> Self {
+        self.session = enabled;
+        self
+    }
 }
 
 /// Inputs and execution controls for [`Program::test_run`].
@@ -807,6 +1039,7 @@ pub struct TestRunOutput {
 pub struct Program {
     pub(crate) fd: Arc<OwnedFd>,
     spec: ProgramSpec,
+    usdt_manager: Option<Arc<UsdtManager>>,
 }
 
 impl fmt::Debug for Program {
@@ -815,6 +1048,7 @@ impl fmt::Debug for Program {
             .debug_struct("Program")
             .field("fd", &self.fd.as_raw_fd())
             .field("spec", &self.spec)
+            .field("has_usdt_manager", &self.usdt_manager.is_some())
             .finish()
     }
 }
@@ -864,6 +1098,7 @@ impl Program {
         Ok(Self {
             fd: Arc::new(fd),
             spec,
+            usdt_manager: None,
         })
     }
 
@@ -912,7 +1147,12 @@ impl Program {
         Ok(Self {
             fd: Arc::new(fd),
             spec,
+            usdt_manager: None,
         })
+    }
+
+    pub(crate) fn set_usdt_manager(&mut self, manager: Option<Arc<UsdtManager>>) {
+        self.usdt_manager = manager;
     }
 
     /// Parsed program definition.
@@ -932,7 +1172,7 @@ impl Program {
 
     /// Reads current metadata from the kernel.
     pub fn info(&self) -> Result<ProgramInfo> {
-        let raw = sys::program_info(self.fd.as_raw_fd())
+        let (raw, map_ids) = sys::program_info_with_map_ids(self.fd.as_raw_fd())
             .map_err(|source| Error::system("read program metadata", source))?;
         Ok(ProgramInfo {
             id: raw.id,
@@ -944,6 +1184,17 @@ impl Program {
             load_time: raw.load_time,
             created_by_uid: raw.created_by_uid,
             gpl_compatible: raw.gpl_compatible != 0,
+            map_ids,
+            interface_index: raw.ifindex,
+            network_namespace_device: raw.netns_dev,
+            network_namespace_inode: raw.netns_ino,
+            btf_id: raw.btf_id,
+            run_time_nanoseconds: raw.run_time_nanoseconds,
+            run_count: raw.run_count,
+            recursion_misses: raw.recursion_misses,
+            verified_instructions: raw.verified_instructions,
+            attach_btf_object_id: raw.attach_btf_object_id,
+            attach_btf_id: raw.attach_btf_id,
         })
     }
 
@@ -952,6 +1203,16 @@ impl Program {
         let path = path.as_ref();
         sys::object_pin(self.fd.as_raw_fd(), path).map_err(|source| Error::File {
             operation: "pin program",
+            path: path.into(),
+            source,
+        })
+    }
+
+    /// Removes a bpffs pin without closing this program handle.
+    pub fn unpin(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        fs::remove_file(path).map_err(|source| Error::File {
+            operation: "unpin program",
             path: path.into(),
             source,
         })
@@ -1037,6 +1298,34 @@ impl Program {
         Ok(Link::perf_events(fds))
     }
 
+    /// Attaches to many kernel functions with one kernel link.
+    pub fn attach_kprobe_multi(&self, options: KprobeMultiOptions<'_>) -> Result<Link> {
+        if options.return_probe && options.session {
+            return Err(Error::InvalidObject(
+                "kprobe sessions cannot be return probes".into(),
+            ));
+        }
+        let (symbols, addresses) = match options.targets {
+            KprobeMultiTargets::Symbols(symbols) => (Some(symbols), None),
+            KprobeMultiTargets::Addresses(addresses) => (None, Some(addresses)),
+        };
+        let attach_type = if options.session {
+            AttachType::TraceKprobeSession
+        } else {
+            AttachType::TraceKprobeMulti
+        };
+        let fd = sys::kprobe_multi_link_create(
+            self.fd.as_raw_fd(),
+            attach_type.as_raw(),
+            symbols,
+            addresses,
+            options.cookies,
+            options.return_probe,
+        )
+        .map_err(|source| Error::system("attach multi-kprobe program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
     /// Attaches to an offset in a userspace executable or shared object.
     ///
     /// With `pid = None`, the probe is system-wide. With a process ID, only
@@ -1076,6 +1365,55 @@ impl Program {
         Ok(Link::perf_events(fds))
     }
 
+    /// Attaches to many locations in one executable with one kernel link.
+    pub fn attach_uprobe_multi(&self, options: UprobeMultiOptions<'_>) -> Result<Link> {
+        if options.return_probe && options.session {
+            return Err(Error::InvalidObject(
+                "uprobe sessions cannot be return probes".into(),
+            ));
+        }
+        let resolved;
+        let offsets = match options.targets {
+            UprobeMultiTargets::Offsets(offsets) => offsets,
+            UprobeMultiTargets::Symbols(symbols) => {
+                resolved = resolve_elf_symbols(&options.path, symbols)?;
+                &resolved
+            }
+        };
+        let attach_type = if options.session {
+            AttachType::TraceUprobeSession
+        } else {
+            AttachType::TraceUprobeMulti
+        };
+        let fd = sys::uprobe_multi_link_create(&sys::UprobeMultiTarget {
+            program_fd: self.fd.as_raw_fd(),
+            attach_type: attach_type.as_raw(),
+            path: &options.path,
+            offsets,
+            reference_counter_offsets: options.reference_counter_offsets,
+            cookies: options.cookies,
+            pid: options.pid,
+            return_probe: options.return_probe,
+        })
+        .map_err(|source| Error::system("attach multi-uprobe program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
+    /// Attaches to every call site for one `SystemTap` USDT probe.
+    ///
+    /// The owning object must contain the support maps emitted by
+    /// `bpf/usdt.bpf.h`. Spec IDs, argument layouts, cookies, semaphore
+    /// offsets, and cleanup are managed automatically.
+    pub fn attach_usdt(&self, options: UsdtOptions) -> Result<Link> {
+        let manager = self.usdt_manager.as_ref().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "program `{}` has no USDT support maps in its loaded object",
+                self.name()
+            ))
+        })?;
+        manager.attach(self, options)
+    }
+
     /// Creates a cgroup link.
     pub fn attach_cgroup(&self, cgroup: impl AsFd, attach_type: AttachType) -> Result<Link> {
         let target = u32::try_from(cgroup.as_fd().as_raw_fd())
@@ -1083,6 +1421,35 @@ impl Program {
         let fd = sys::link_create(self.fd.as_raw_fd(), target, attach_type.as_raw(), 0, 0, 0)
             .map_err(|source| Error::system("attach cgroup program", source))?;
         Ok(Link::bpf(fd))
+    }
+
+    /// Attaches through the generic `BPF_PROG_ATTACH` API.
+    ///
+    /// This covers hooks such as socket-map verdicts and flow dissectors that
+    /// do not necessarily expose a `bpf_link` on all supported kernels. The
+    /// returned RAII link owns duplicate descriptors and detaches on drop.
+    pub fn attach_legacy(
+        &self,
+        target: impl AsFd,
+        attach_type: AttachType,
+        flags: u32,
+    ) -> Result<Link> {
+        let target = target
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|source| Error::system("duplicate attachment target descriptor", source))?;
+        let program = self
+            .fd
+            .try_clone()
+            .map_err(|source| Error::system("duplicate eBPF program descriptor", source))?;
+        sys::program_attach(
+            program.as_raw_fd(),
+            target.as_raw_fd(),
+            attach_type.as_raw(),
+            flags,
+        )
+        .map_err(|source| Error::system("attach legacy eBPF program", source))?;
+        Ok(Link::legacy(target, program, attach_type))
     }
 
     /// Creates an XDP link on a network interface.
@@ -1172,6 +1539,72 @@ impl Program {
         Ok(Link::bpf(fd))
     }
 
+    /// Creates a BPF iterator link with optional map, cgroup, or task scope.
+    pub fn attach_iterator(&self, options: IteratorOptions<'_>) -> Result<Link> {
+        if !matches!(
+            self.spec.kind(),
+            ProgramKind::Tracing {
+                attach_type: AttachType::TraceIterator,
+                ..
+            }
+        ) {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` is not a BPF iterator",
+                self.name()
+            )));
+        }
+        let info = match options {
+            IteratorOptions::None => None,
+            IteratorOptions::Map(map) => {
+                let mut info = [0_u8; 16];
+                let fd = u32::try_from(map.as_fd().as_raw_fd())
+                    .map_err(|_| Error::InvalidObject("map descriptor is negative".into()))?;
+                info[..4].copy_from_slice(&fd.to_ne_bytes());
+                Some(info)
+            }
+            IteratorOptions::Cgroup { cgroup, order } => {
+                let mut info = [0_u8; 16];
+                let fd = u32::try_from(cgroup.as_raw_fd())
+                    .map_err(|_| Error::InvalidObject("cgroup descriptor is negative".into()))?;
+                info[..4].copy_from_slice(&order.as_raw().to_ne_bytes());
+                info[4..8].copy_from_slice(&fd.to_ne_bytes());
+                Some(info)
+            }
+            IteratorOptions::CgroupId { id, order } => {
+                let mut info = [0_u8; 16];
+                info[..4].copy_from_slice(&order.as_raw().to_ne_bytes());
+                info[8..16].copy_from_slice(&id.to_ne_bytes());
+                Some(info)
+            }
+            IteratorOptions::Task {
+                thread_id,
+                process_id,
+                process_fd,
+            } => {
+                let mut info = [0_u8; 16];
+                let process_fd = process_fd
+                    .map(|fd| {
+                        u32::try_from(fd.as_raw_fd()).map_err(|_| {
+                            Error::InvalidObject("process descriptor is negative".into())
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                info[..4].copy_from_slice(&thread_id.to_ne_bytes());
+                info[4..8].copy_from_slice(&process_id.to_ne_bytes());
+                info[8..12].copy_from_slice(&process_fd.to_ne_bytes());
+                Some(info)
+            }
+        };
+        let fd = sys::iterator_link_create(
+            self.fd.as_raw_fd(),
+            AttachType::TraceIterator.as_raw(),
+            info.as_ref(),
+        )
+        .map_err(|source| Error::system("attach BPF iterator program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
     /// Attaches using the target encoded in the program section when no extra
     /// runtime argument is required.
     pub fn attach(&self) -> Result<Link> {
@@ -1182,6 +1615,10 @@ impl Program {
             } => self.attach_kprobe(function, 0, *return_probe),
             ProgramKind::Tracepoint { category, event } => self.attach_tracepoint(category, event),
             ProgramKind::RawTracepoint { name, .. } => self.attach_raw_tracepoint(name),
+            ProgramKind::Tracing {
+                attach_type: AttachType::TraceIterator,
+                ..
+            } if self.spec.auto_attachable() => self.attach_iterator(IteratorOptions::None),
             ProgramKind::Tracing { attach_type, .. } if self.spec.auto_attachable() => {
                 if self.spec.attach_btf_id == 0 {
                     return Err(Error::InvalidObject(format!(
@@ -1197,6 +1634,59 @@ impl Program {
             ))),
         }
     }
+}
+
+fn resolve_elf_symbols(path: &Path, symbols: &[&str]) -> Result<Vec<u64>> {
+    if symbols.is_empty() {
+        return Err(Error::InvalidObject(
+            "multi-uprobe symbol list cannot be empty".into(),
+        ));
+    }
+    let bytes = fs::read(path).map_err(|source| Error::File {
+        operation: "read userspace probe ELF",
+        path: path.into(),
+        source,
+    })?;
+    let elf = Elf::parse(&bytes)
+        .map_err(|error| Error::InvalidObject(format!("invalid userspace probe ELF: {error}")))?;
+    symbols
+        .iter()
+        .map(|requested| {
+            elf.syms
+                .iter()
+                .filter(|symbol| symbol.st_type() == STT_FUNC && symbol.st_shndx != 0)
+                .find(|symbol| elf.strtab.get_at(symbol.st_name) == Some(*requested))
+                .or_else(|| {
+                    elf.dynsyms
+                        .iter()
+                        .filter(|symbol| symbol.st_type() == STT_FUNC && symbol.st_shndx != 0)
+                        .find(|symbol| elf.dynstrtab.get_at(symbol.st_name) == Some(*requested))
+                })
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "ELF symbol `{requested}` was not found in `{}`",
+                        path.display()
+                    ))
+                })
+                .and_then(|symbol| {
+                    let section = elf.section_headers.get(symbol.st_shndx).ok_or_else(|| {
+                        Error::InvalidObject(format!(
+                            "ELF symbol `{requested}` has invalid section {}",
+                            symbol.st_shndx
+                        ))
+                    })?;
+                    symbol
+                        .st_value
+                        .checked_sub(section.sh_addr)
+                        .and_then(|offset| offset.checked_add(section.sh_offset))
+                        .ok_or_else(|| {
+                            Error::InvalidObject(format!(
+                                "ELF symbol `{requested}` file offset overflows"
+                            ))
+                        })
+                })
+        })
+        .collect()
 }
 
 fn tracepoint_id(category: &str, event: &str) -> Result<u64> {
@@ -1320,6 +1810,10 @@ mod tests {
                 .program_type(),
             ProgramType::Tracing
         );
+        assert_eq!(
+            ProgramKind::from_section("usdt").unwrap().attach_type(),
+            Some(AttachType::TraceUprobeMulti)
+        );
         assert!(ProgramKind::from_section("made_up/foo").is_err());
     }
 
@@ -1331,21 +1825,21 @@ mod tests {
                 .unwrap()
                 .auto_attachable()
         );
-        assert!(
-            ProgramSpec::new("entry", "tracepoint/sched/sched_switch", instructions.clone())
-                .unwrap()
-                .auto_attachable()
-        );
+        assert!(ProgramSpec::new(
+            "entry",
+            "tracepoint/sched/sched_switch",
+            instructions.clone()
+        )
+        .unwrap()
+        .auto_attachable());
         assert!(
             !ProgramSpec::new("entry", "fentry.multi/do_*", instructions.clone())
                 .unwrap()
                 .auto_attachable()
         );
-        assert!(
-            !ProgramSpec::new("entry", "xdp", instructions)
-                .unwrap()
-                .auto_attachable()
-        );
+        assert!(!ProgramSpec::new("entry", "xdp", instructions)
+            .unwrap()
+            .auto_attachable());
     }
 
     #[test]

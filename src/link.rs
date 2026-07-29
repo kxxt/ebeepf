@@ -1,10 +1,11 @@
 use std::fmt;
+use std::fs;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use crate::sys;
-use crate::{Error, Result};
+use crate::{Error, Program, Result};
 
 /// A Linux eBPF attachment type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -278,10 +279,122 @@ impl AttachType {
     }
 }
 
+/// Kernel type of a `bpf_link` object.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum LinkType {
+    /// Unspecified.
+    Unspecified,
+    /// Raw tracepoint.
+    RawTracepoint,
+    /// BTF tracing, LSM, or extension.
+    Tracing,
+    /// Cgroup.
+    Cgroup,
+    /// BPF iterator.
+    Iterator,
+    /// Network namespace.
+    NetworkNamespace,
+    /// XDP.
+    Xdp,
+    /// Perf event.
+    PerfEvent,
+    /// Multi-kprobe or kprobe session.
+    KprobeMulti,
+    /// `struct_ops`.
+    StructOps,
+    /// Netfilter.
+    Netfilter,
+    /// TCX.
+    Tcx,
+    /// Multi-uprobe or uprobe session.
+    UprobeMulti,
+    /// Netkit.
+    Netkit,
+    /// Socket map.
+    SocketMap,
+    /// A type introduced after this crate version.
+    Other(u32),
+}
+
+impl LinkType {
+    /// Converts a Linux UAPI value.
+    pub const fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Unspecified,
+            1 => Self::RawTracepoint,
+            2 => Self::Tracing,
+            3 => Self::Cgroup,
+            4 => Self::Iterator,
+            5 => Self::NetworkNamespace,
+            6 => Self::Xdp,
+            7 => Self::PerfEvent,
+            8 => Self::KprobeMulti,
+            9 => Self::StructOps,
+            10 => Self::Netfilter,
+            11 => Self::Tcx,
+            12 => Self::UprobeMulti,
+            13 => Self::Netkit,
+            14 => Self::SocketMap,
+            value => Self::Other(value),
+        }
+    }
+
+    /// Returns the Linux UAPI value.
+    pub const fn as_raw(self) -> u32 {
+        match self {
+            Self::Unspecified => 0,
+            Self::RawTracepoint => 1,
+            Self::Tracing => 2,
+            Self::Cgroup => 3,
+            Self::Iterator => 4,
+            Self::NetworkNamespace => 5,
+            Self::Xdp => 6,
+            Self::PerfEvent => 7,
+            Self::KprobeMulti => 8,
+            Self::StructOps => 9,
+            Self::Netfilter => 10,
+            Self::Tcx => 11,
+            Self::UprobeMulti => 12,
+            Self::Netkit => 13,
+            Self::SocketMap => 14,
+            Self::Other(value) => value,
+        }
+    }
+}
+
+/// Metadata common to a kernel `bpf_link`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkInfo {
+    /// Kernel-assigned link ID.
+    pub id: u32,
+    /// Link type.
+    pub link_type: LinkType,
+    /// Attached program ID.
+    pub program_id: u32,
+    /// Hook attachment type when exposed by this link kind.
+    pub attach_type: Option<AttachType>,
+    /// Network interface index for device links.
+    pub interface_index: Option<u32>,
+    /// Map ID for map-backed links.
+    pub map_id: Option<u32>,
+    /// BTF object ID for tracing links.
+    pub target_btf_object_id: Option<u32>,
+    /// BTF type ID for tracing links.
+    pub target_btf_id: Option<u32>,
+    /// Cgroup kernel ID for cgroup links.
+    pub cgroup_id: Option<u64>,
+}
+
 enum LinkFd {
     Bpf(OwnedFd),
     PerfEvents(Vec<OwnedFd>),
     Socket(OwnedFd),
+    Legacy {
+        target: OwnedFd,
+        program: OwnedFd,
+        attach_type: AttachType,
+    },
     Detached,
 }
 
@@ -291,6 +404,7 @@ enum LinkFd {
 /// program unless the link was pinned.
 pub struct Link {
     fd: LinkFd,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl fmt::Debug for Link {
@@ -311,6 +425,16 @@ impl fmt::Debug for Link {
                 .debug_struct("Link")
                 .field("socket_fd", &fd.as_raw_fd())
                 .finish(),
+            LinkFd::Legacy {
+                target,
+                program,
+                attach_type,
+            } => formatter
+                .debug_struct("Link")
+                .field("legacy_target_fd", &target.as_raw_fd())
+                .field("program_fd", &program.as_raw_fd())
+                .field("attach_type", attach_type)
+                .finish(),
             LinkFd::Detached => formatter.write_str("Link { detached: true }"),
         }
     }
@@ -320,19 +444,38 @@ impl Link {
     pub(crate) fn bpf(fd: OwnedFd) -> Self {
         Self {
             fd: LinkFd::Bpf(fd),
+            cleanup: None,
         }
     }
 
     pub(crate) fn perf_events(fds: Vec<OwnedFd>) -> Self {
         Self {
             fd: LinkFd::PerfEvents(fds),
+            cleanup: None,
         }
     }
 
     pub(crate) fn socket(fd: OwnedFd) -> Self {
         Self {
             fd: LinkFd::Socket(fd),
+            cleanup: None,
         }
+    }
+
+    pub(crate) fn legacy(target: OwnedFd, program: OwnedFd, attach_type: AttachType) -> Self {
+        Self {
+            fd: LinkFd::Legacy {
+                target,
+                program,
+                attach_type,
+            },
+            cleanup: None,
+        }
+    }
+
+    pub(crate) fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        self.cleanup = Some(Box::new(cleanup));
+        self
     }
 
     /// Opens a link pinned in bpffs.
@@ -360,7 +503,10 @@ impl Link {
     pub fn as_fd(&self) -> Option<BorrowedFd<'_>> {
         match &self.fd {
             LinkFd::Bpf(fd) => Some(fd.as_fd()),
-            LinkFd::PerfEvents(_) | LinkFd::Socket(_) | LinkFd::Detached => None,
+            LinkFd::PerfEvents(_)
+            | LinkFd::Socket(_)
+            | LinkFd::Legacy { .. }
+            | LinkFd::Detached => None,
         }
     }
 
@@ -369,13 +515,90 @@ impl Link {
         let path = path.as_ref();
         let LinkFd::Bpf(fd) = &self.fd else {
             return Err(Error::Unsupported(
-                "perf-event links cannot be pinned as bpf_link objects".into(),
+                "this attachment is not represented by a pinnable bpf_link".into(),
             ));
         };
         sys::object_pin(fd.as_raw_fd(), path).map_err(|source| Error::File {
             operation: "pin link",
             path: path.into(),
             source,
+        })
+    }
+
+    /// Removes a bpffs pin without detaching this live link handle.
+    pub fn unpin(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        fs::remove_file(path).map_err(|source| Error::File {
+            operation: "unpin link",
+            path: path.into(),
+            source,
+        })
+    }
+
+    /// Atomically changes a kernel link to run `program`.
+    pub fn update(&self, program: &Program) -> Result<()> {
+        self.update_if(program, None)
+    }
+
+    /// Atomically changes a kernel link only if it still runs `expected`.
+    pub fn update_if(&self, program: &Program, expected: Option<&Program>) -> Result<()> {
+        let LinkFd::Bpf(fd) = &self.fd else {
+            return Err(Error::Unsupported(
+                "only kernel bpf_link attachments support program updates".into(),
+            ));
+        };
+        sys::link_update(
+            fd.as_raw_fd(),
+            program.as_fd().as_raw_fd(),
+            expected.map(|program| program.as_fd().as_raw_fd()),
+        )
+        .map_err(|source| Error::system("update eBPF link program", source))
+    }
+
+    /// Reads current metadata for a kernel `bpf_link`.
+    pub fn info(&self) -> Result<LinkInfo> {
+        let LinkFd::Bpf(fd) = &self.fd else {
+            return Err(Error::Unsupported(
+                "this attachment is not represented by a kernel bpf_link".into(),
+            ));
+        };
+        let raw = sys::link_info(fd.as_raw_fd())
+            .map_err(|source| Error::system("read eBPF link metadata", source))?;
+        let link_type = LinkType::from_raw(raw.link_type);
+        let detail_u32 = |offset: usize| {
+            u32::from_ne_bytes(
+                raw.details[offset..offset + 4]
+                    .try_into()
+                    .expect("fixed link-info range"),
+            )
+        };
+        let detail_u64 = |offset: usize| {
+            u64::from_ne_bytes(
+                raw.details[offset..offset + 8]
+                    .try_into()
+                    .expect("fixed link-info range"),
+            )
+        };
+        let attach_type = match link_type {
+            LinkType::Tracing => Some(AttachType::from_raw(detail_u32(0))),
+            LinkType::Cgroup => Some(AttachType::from_raw(detail_u32(8))),
+            LinkType::Tcx | LinkType::Netkit | LinkType::SocketMap => {
+                Some(AttachType::from_raw(detail_u32(4)))
+            }
+            _ => None,
+        };
+        Ok(LinkInfo {
+            id: raw.id,
+            link_type,
+            program_id: raw.program_id,
+            attach_type,
+            interface_index: matches!(link_type, LinkType::Xdp | LinkType::Tcx | LinkType::Netkit)
+                .then(|| detail_u32(0)),
+            map_id: matches!(link_type, LinkType::StructOps | LinkType::SocketMap)
+                .then(|| detail_u32(0)),
+            target_btf_object_id: (link_type == LinkType::Tracing).then(|| detail_u32(4)),
+            target_btf_id: (link_type == LinkType::Tracing).then(|| detail_u32(8)),
+            cgroup_id: (link_type == LinkType::Cgroup).then(|| detail_u64(0)),
         })
     }
 
@@ -390,6 +613,16 @@ impl Link {
                 .map_err(|source| Error::system("detach eBPF link", source)),
             LinkFd::Socket(fd) => sys::socket_detach_bpf(fd.as_raw_fd())
                 .map_err(|source| Error::system("detach socket filter", source)),
+            LinkFd::Legacy {
+                target,
+                program,
+                attach_type,
+            } => sys::program_detach(
+                program.as_raw_fd(),
+                target.as_raw_fd(),
+                attach_type.as_raw(),
+            )
+            .map_err(|source| Error::system("detach legacy eBPF program", source)),
             LinkFd::PerfEvents(_) | LinkFd::Detached => Ok(()),
         }
     }
@@ -397,8 +630,25 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        if let LinkFd::Socket(fd) = &self.fd {
-            drop(sys::socket_detach_bpf(fd.as_raw_fd()));
+        let fd = mem::replace(&mut self.fd, LinkFd::Detached);
+        match &fd {
+            LinkFd::Socket(socket) => drop(sys::socket_detach_bpf(socket.as_raw_fd())),
+            LinkFd::Legacy {
+                target,
+                program,
+                attach_type,
+            } => drop(sys::program_detach(
+                program.as_raw_fd(),
+                target.as_raw_fd(),
+                attach_type.as_raw(),
+            )),
+            LinkFd::Bpf(_) | LinkFd::PerfEvents(_) | LinkFd::Detached => {}
+        }
+        // Close attachment descriptors before releasing any auxiliary state
+        // that a concurrently running program may still access.
+        drop(fd);
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
         }
     }
 }
