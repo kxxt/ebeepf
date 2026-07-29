@@ -717,6 +717,18 @@ fn render_skeleton(
             method: unique_identifier(snake_identifier(program.name()), &mut program_names),
         })
         .collect::<Vec<_>>();
+    let mut link_names = programs
+        .iter()
+        .map(|program| program.method.clone())
+        .collect::<HashSet<_>>();
+    let struct_ops_links = object
+        .maps()
+        .filter(|map| map.map_type() == crate::MapType::StructOps)
+        .map(|map| NamedItem {
+            source: map.name().to_owned(),
+            method: unique_identifier(snake_identifier(map.name()), &mut link_names),
+        })
+        .collect::<Vec<_>>();
     let (data_sections, data_types) = collect_data_sections(object, &type_name, crate_path)?;
     let mut loaded_data_fields = String::new();
     let mut loaded_data_setup = String::new();
@@ -895,7 +907,13 @@ fn render_skeleton(
         &programs_name,
         crate_path,
     );
-    render_links(&mut output, &programs, &links_name, crate_path);
+    render_links(
+        &mut output,
+        &programs,
+        &struct_ops_links,
+        &links_name,
+        crate_path,
+    );
 
     writeln!(
         output,
@@ -932,7 +950,7 @@ fn render_skeleton(
              /// after every new automatic attachment succeeds.\n\
              pub fn attach(&mut self) -> {crate_path}::Result<&mut Self> {{\n\
                  {} links = {links_name}::default();",
-        if programs.is_empty() {
+        if programs.is_empty() && struct_ops_links.is_empty() {
             "let"
         } else {
             "let mut"
@@ -946,6 +964,16 @@ fn render_skeleton(
                  links.{} = Some(program.attach()?);\n\
              }}",
             program.source, program.method
+        )
+        .expect("String write");
+    }
+    for map in &struct_ops_links {
+        writeln!(
+            output,
+            "        if let Some(map) = self.object.maps().find(|map| map.name() == {:?} && map.spec().auto_attach()) {{\n\
+                 links.{} = Some(map.attach_struct_ops()?);\n\
+             }}",
+            map.source, map.method
         )
         .expect("String write");
     }
@@ -1675,7 +1703,13 @@ fn render_loaded_accessors(
     writeln!(output, "}}\n").expect("String write");
 }
 
-fn render_links(output: &mut String, programs: &[NamedItem], links: &str, crate_path: &str) {
+fn render_links(
+    output: &mut String,
+    programs: &[NamedItem],
+    struct_ops_maps: &[NamedItem],
+    links: &str,
+    crate_path: &str,
+) {
     writeln!(
         output,
         "/// Link slots for every program in the object.\n\
@@ -1692,6 +1726,9 @@ fn render_links(output: &mut String, programs: &[NamedItem], links: &str, crate_
             program.method
         )
         .expect("String write");
+    }
+    for map in struct_ops_maps {
+        writeln!(output, "    {}: Option<{crate_path}::Link>,", map.method).expect("String write");
     }
     writeln!(output, "}}\n\nimpl {links} {{").expect("String write");
     for program in programs {
@@ -1716,6 +1753,31 @@ fn render_links(output: &mut String, programs: &[NamedItem], links: &str, crate_
             doc_text(&program.source),
             program.method,
             program.method
+        )
+        .expect("String write");
+    }
+    for map in struct_ops_maps {
+        writeln!(
+            output,
+            "    /// Borrows the retained struct_ops link for `{}` when attached.\n\
+             pub fn {}(&self) -> Option<&{crate_path}::Link> {{ self.{}.as_ref() }}\n\
+             \n\
+             /// Replaces the retained struct_ops link for `{}`.\n\
+             pub fn set_{}(&mut self, link: {crate_path}::Link) -> Option<{crate_path}::Link> {{\n\
+                 self.{}.replace(link)\n\
+             }}\n\
+             \n\
+             /// Removes and returns the retained struct_ops link for `{}`.\n\
+             pub fn take_{}(&mut self) -> Option<{crate_path}::Link> {{ self.{}.take() }}",
+            doc_text(&map.source),
+            map.method,
+            map.method,
+            doc_text(&map.source),
+            map.method,
+            map.method,
+            doc_text(&map.source),
+            map.method,
+            map.method
         )
         .expect("String write");
     }

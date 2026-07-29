@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::str;
@@ -22,6 +23,7 @@ use crate::{
 };
 
 const R_BPF_64_64: u32 = 1;
+const R_BPF_64_ABS64: u32 = 2;
 const R_BPF_64_32: u32 = 10;
 const R_BPF_64_ABS32: u32 = 3;
 const R_BPF_64_NODYLD32: u32 = 4;
@@ -55,6 +57,26 @@ struct KfuncRelocation {
     instruction_index: usize,
     name: String,
     weak: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructOpsCallback {
+    member_index: usize,
+    program: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedStructOps {
+    kernel_value_type: TypeId,
+    value: Vec<u8>,
+    callbacks: Vec<(String, usize)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StructOpsDefinition {
+    source_type: TypeId,
+    callbacks: Vec<StructOpsCallback>,
+    prepared: Option<PreparedStructOps>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,6 +127,7 @@ pub struct Object {
     map_relocations: Vec<MapRelocation>,
     core_relocations: Vec<CoreRelocation>,
     kfunc_relocations: Vec<KfuncRelocation>,
+    struct_ops: BTreeMap<String, StructOpsDefinition>,
     pin_root: PathBuf,
     reused_maps: BTreeMap<String, Map>,
     token: Option<BpfToken>,
@@ -168,6 +191,7 @@ impl Object {
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
         let extern_data = add_kconfig_map(&name, btf.as_mut(), &mut maps)?;
+        let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
         resolve_inner_maps(&elf, &sections, &mut maps)?;
 
         let mut programs = BTreeMap::new();
@@ -292,6 +316,7 @@ impl Object {
                 )));
             }
         }
+        collect_struct_ops_relocations(&elf, btf.as_ref(), &maps, &programs, &mut struct_ops)?;
 
         Ok(Self {
             name,
@@ -302,6 +327,7 @@ impl Object {
             map_relocations,
             core_relocations,
             kfunc_relocations,
+            struct_ops,
             pin_root: "/sys/fs/bpf".into(),
             reused_maps: BTreeMap::new(),
             token: None,
@@ -470,6 +496,12 @@ impl Object {
         if !self.core_relocations.is_empty() {
             self.relocate_for_running_kernel()?;
         }
+        prepare_struct_ops(
+            self.btf.as_ref(),
+            &mut self.maps,
+            &mut self.programs,
+            &mut self.struct_ops,
+        )?;
         resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations)?;
         resolve_attach_btf_ids(&mut self.programs)?;
 
@@ -495,12 +527,13 @@ impl Object {
             None => None,
         };
 
-        let maps = load_maps(
+        let mut maps = load_maps(
             &self.maps,
             &self.reused_maps,
             btf_fd.as_ref(),
             &self.pin_root,
             token_fd,
+            &self.struct_ops,
         )?;
         relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
         let usdt_manager = UsdtManager::from_maps(&maps, self.btf.as_ref())?;
@@ -519,6 +552,7 @@ impl Object {
             program.set_usdt_manager(usdt_manager.clone());
             programs.insert(name, program);
         }
+        finalize_struct_ops_values(&mut maps, &programs, &self.struct_ops)?;
 
         Ok(LoadedObject {
             name: self.name,
@@ -1029,6 +1063,261 @@ fn add_data_maps(
         result.insert(index, name);
     }
     Ok(result)
+}
+
+fn add_struct_ops_maps(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    btf: Option<&Btf>,
+    maps: &mut BTreeMap<String, MapSpec>,
+) -> Result<BTreeMap<String, StructOpsDefinition>> {
+    let mut definitions = BTreeMap::new();
+    for (section_index, _) in elf.section_headers.iter().enumerate() {
+        let section_name = sections.name(section_index)?;
+        let normalized = section_name.strip_prefix('?').unwrap_or(section_name);
+        if !matches!(normalized, ".struct_ops" | ".struct_ops.link") {
+            continue;
+        }
+        let btf = btf.ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "`{section_name}` requires an object BTF data-section definition"
+            ))
+        })?;
+        let (_, BtfType::DataSection { variables, .. }) = btf
+            .find(crate::BtfKind::DataSection, section_name)
+            .or_else(|| btf.find(crate::BtfKind::DataSection, normalized))
+            .ok_or_else(|| {
+                Error::InvalidObject(format!("`{section_name}` is absent from the object BTF"))
+            })?
+        else {
+            unreachable!("BTF lookup was constrained to data sections");
+        };
+        let data = sections.owned_data(section_index)?;
+        for variable in variables {
+            let BtfType::Variable {
+                name: variable_name,
+                ty,
+                ..
+            } = btf.type_by_id(variable.ty).ok_or_else(|| {
+                Error::Btf(format!(
+                    "`{section_name}` references missing variable type {}",
+                    variable.ty.0
+                ))
+            })?
+            else {
+                return Err(Error::Btf(format!(
+                    "`{section_name}` type {} is not a variable",
+                    variable.ty.0
+                )));
+            };
+            let source_type = btf.resolve_type(*ty)?;
+            let BtfType::Struct {
+                name: type_name,
+                size,
+                ..
+            } = btf.type_by_id(source_type).ok_or_else(|| {
+                Error::Btf(format!(
+                    "struct_ops variable `{variable_name}` has a missing type"
+                ))
+            })?
+            else {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` is not a structure"
+                )));
+            };
+            if type_name.is_empty() {
+                return Err(Error::Unsupported(format!(
+                    "struct_ops variable `{variable_name}` has an anonymous structure type"
+                )));
+            }
+            let offset = usize::try_from(variable.offset).map_err(|_| {
+                Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` offset is too large"
+                ))
+            })?;
+            let size = usize::try_from(*size).map_err(|_| {
+                Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` is too large"
+                ))
+            })?;
+            let end = offset.checked_add(size).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` range overflows"
+                ))
+            })?;
+            let initial = data.get(offset..end).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` lies outside `{section_name}`"
+                ))
+            })?;
+
+            let value_size = u32::try_from(size).map_err(|_| {
+                Error::InvalidObject(format!(
+                    "struct_ops variable `{variable_name}` is too large"
+                ))
+            })?;
+            let mut spec = MapSpec::new(variable_name, MapType::StructOps, 4, value_size, 1);
+            spec.flags
+                .set(MapFlags::LINK, normalized == ".struct_ops.link");
+            spec.autocreate = !section_name.starts_with('?');
+            spec.auto_attach = true;
+            spec.btf_value_type = source_type;
+            spec.initial_value = Some(initial.to_vec());
+            spec.section_index = Some(section_index);
+            spec.section_offset = u64::from(variable.offset);
+            if maps.insert(variable_name.clone(), spec).is_some()
+                || definitions
+                    .insert(
+                        variable_name.clone(),
+                        StructOpsDefinition {
+                            source_type,
+                            callbacks: Vec::new(),
+                            prepared: None,
+                        },
+                    )
+                    .is_some()
+            {
+                return Err(Error::InvalidObject(format!(
+                    "duplicate map definition `{variable_name}`"
+                )));
+            }
+        }
+    }
+    Ok(definitions)
+}
+
+fn collect_struct_ops_relocations(
+    elf: &Elf<'_>,
+    btf: Option<&Btf>,
+    maps: &BTreeMap<String, MapSpec>,
+    programs: &BTreeMap<String, ProgramSpec>,
+    definitions: &mut BTreeMap<String, StructOpsDefinition>,
+) -> Result<()> {
+    if definitions.is_empty() {
+        return Ok(());
+    }
+    let btf = btf.ok_or_else(|| Error::InvalidObject("struct_ops requires object BTF".into()))?;
+    for (relocation_index, relocations) in &elf.shdr_relocs {
+        let target_section = elf.section_headers[*relocation_index].sh_info as usize;
+        for relocation in relocations {
+            let Some((map_name, map)) = maps.iter().find(|(name, map)| {
+                definitions.contains_key(*name)
+                    && map.section_index == Some(target_section)
+                    && map.section_offset <= relocation.r_offset
+                    && relocation.r_offset
+                        < map.section_offset.saturating_add(u64::from(map.value_size))
+            }) else {
+                continue;
+            };
+            if !matches!(relocation.r_type, R_BPF_64_64 | R_BPF_64_ABS64) {
+                return Err(Error::Unsupported(format!(
+                    "struct_ops map `{map_name}` uses relocation type {}",
+                    relocation.r_type
+                )));
+            }
+            let relative_offset = relocation
+                .r_offset
+                .checked_sub(map.section_offset)
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "struct_ops relocation for `{map_name}` precedes its value"
+                    ))
+                })?;
+            let definition = definitions
+                .get_mut(map_name)
+                .expect("map was selected through the definitions table");
+            let BtfType::Struct { members, .. } =
+                btf.type_by_id(definition.source_type).ok_or_else(|| {
+                    Error::Btf(format!("struct_ops map `{map_name}` type is missing"))
+                })?
+            else {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops map `{map_name}` value is not a structure"
+                )));
+            };
+            let bit_offset = u32::try_from(relative_offset)
+                .ok()
+                .and_then(|offset| offset.checked_mul(8))
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "struct_ops relocation offset for `{map_name}` is too large"
+                    ))
+                })?;
+            let (member_index, member) = members
+                .iter()
+                .enumerate()
+                .find(|(_, member)| {
+                    member.bit_offset == bit_offset && member.bitfield_size.is_none()
+                })
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "struct_ops relocation at byte {relative_offset} in `{map_name}` does not target a member"
+                    ))
+                })?;
+            let member_type = btf.resolve_type(member.ty)?;
+            let BtfType::Pointer { ty } = btf
+                .type_by_id(member_type)
+                .ok_or_else(|| Error::Btf(format!("member `{}` type is missing", member.name)))?
+            else {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops relocation targets non-function-pointer member `{}`",
+                    member.name
+                )));
+            };
+            let prototype = btf.resolve_type(*ty)?;
+            if !matches!(
+                btf.type_by_id(prototype),
+                Some(BtfType::FunctionPrototype { .. })
+            ) {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops relocation member `{}` is not a function pointer",
+                    member.name
+                )));
+            }
+
+            let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
+                Error::Elf(format!(
+                    "struct_ops relocation references missing symbol {}",
+                    relocation.r_sym
+                ))
+            })?;
+            let target_offset =
+                i128::from(symbol.st_value) + i128::from(relocation.r_addend.unwrap_or_default());
+            let program = programs
+                .values()
+                .find(|program| {
+                    program.section_index == symbol.st_shndx
+                        && i128::from(program.section_offset) == target_offset
+                })
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "struct_ops callback `{}` in `{map_name}` does not resolve to a program",
+                        symbol_name(elf, &symbol).unwrap_or("<invalid>")
+                    ))
+                })?;
+            if program.program_type() != ProgramType::StructOps {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops member `{}` references non-struct_ops program `{}`",
+                    member.name, program.name
+                )));
+            }
+            if definition
+                .callbacks
+                .iter()
+                .any(|callback| callback.member_index == member_index)
+            {
+                return Err(Error::InvalidObject(format!(
+                    "struct_ops member `{}` in `{map_name}` has multiple relocations",
+                    member.name
+                )));
+            }
+            definition.callbacks.push(StructOpsCallback {
+                member_index,
+                program: program.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn add_kconfig_map(
@@ -1642,15 +1931,332 @@ fn relocate_maps(
     Ok(())
 }
 
+fn prepare_struct_ops(
+    object_btf: Option<&Btf>,
+    maps: &mut BTreeMap<String, MapSpec>,
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    definitions: &mut BTreeMap<String, StructOpsDefinition>,
+) -> Result<()> {
+    if definitions.is_empty() {
+        return Ok(());
+    }
+    let object_btf =
+        object_btf.ok_or_else(|| Error::InvalidObject("struct_ops requires object BTF".into()))?;
+    let mut callback_loading = HashMap::<&str, bool>::new();
+    for (map_name, definition) in definitions.iter() {
+        let map_is_created = maps.get(map_name).is_some_and(|map| map.autocreate);
+        for callback in &definition.callbacks {
+            callback_loading
+                .entry(&callback.program)
+                .and_modify(|autoload| *autoload |= map_is_created)
+                .or_insert(map_is_created);
+        }
+    }
+    for (program_name, autoload) in callback_loading {
+        programs
+            .get_mut(program_name)
+            .ok_or_else(|| Error::ProgramNotFound(program_name.into()))?
+            .autoload = autoload;
+    }
+    if !definitions
+        .keys()
+        .any(|name| maps.get(name).is_some_and(|map| map.autocreate))
+    {
+        return Ok(());
+    }
+    let kernel_bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+        operation: "read kernel BTF for struct_ops",
+        path: "/sys/kernel/btf/vmlinux".into(),
+        source,
+    })?;
+    let kernel_btf = Btf::parse(&kernel_bytes)?;
+
+    for (map_name, definition) in definitions.iter_mut() {
+        if !maps.get(map_name).is_some_and(|map| map.autocreate) {
+            continue;
+        }
+        let BtfType::Struct {
+            name: source_name,
+            members: source_members,
+            ..
+        } = object_btf
+            .type_by_id(definition.source_type)
+            .ok_or_else(|| Error::Btf(format!("struct_ops map `{map_name}` type is missing")))?
+        else {
+            return Err(Error::InvalidObject(format!(
+                "struct_ops map `{map_name}` value is not a structure"
+            )));
+        };
+        let source_name = essential_name(source_name);
+        let (kernel_type_id, kernel_members) = kernel_btf
+            .types()
+            .find_map(|(id, ty)| match ty {
+                BtfType::Struct { name, members, .. } if essential_name(name) == source_name => {
+                    Some((id, members))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "kernel BTF has no struct `{source_name}` required by `{map_name}`"
+                ))
+            })?;
+        let wrapper_name = format!("bpf_struct_ops_{source_name}");
+        let (kernel_value_type, wrapper_size, data_offset) = kernel_btf
+            .types()
+            .find_map(|(id, ty)| {
+                let BtfType::Struct {
+                    name,
+                    size,
+                    members,
+                } = ty
+                else {
+                    return None;
+                };
+                if name != &wrapper_name {
+                    return None;
+                }
+                members.iter().find_map(|member| {
+                    (member.bitfield_size.is_none()
+                        && member.bit_offset % 8 == 0
+                        && kernel_btf.resolve_type(member.ty).ok() == Some(kernel_type_id))
+                    .then_some((id, *size, member.bit_offset as usize / 8))
+                })
+            })
+            .ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "kernel BTF has no `{wrapper_name}` value wrapper for `{map_name}`"
+                ))
+            })?;
+        let map = maps
+            .get_mut(map_name)
+            .ok_or_else(|| Error::MapNotFound(map_name.clone()))?;
+        let source_value = map.initial_value.as_deref().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "struct_ops map `{map_name}` has no initial implementation value"
+            ))
+        })?;
+        let mut value = vec![
+            0;
+            usize::try_from(wrapper_size).map_err(|_| {
+                Error::InvalidObject(format!("struct_ops map `{map_name}` value is too large"))
+            })?
+        ];
+        let callbacks_by_member = definition
+            .callbacks
+            .iter()
+            .map(|callback| (callback.member_index, callback.program.as_str()))
+            .collect::<HashMap<_, _>>();
+        let mut prepared_callbacks = Vec::new();
+
+        for (member_index, source_member) in source_members.iter().enumerate() {
+            if source_member.bitfield_size.is_some() || source_member.bit_offset % 8 != 0 {
+                return Err(Error::Unsupported(format!(
+                    "struct_ops member `{}` in `{map_name}` is a bit field",
+                    source_member.name
+                )));
+            }
+            let source_offset = source_member.bit_offset as usize / 8;
+            let source_size = object_btf.size_of(source_member.ty)?;
+            let source_end = source_offset.checked_add(source_size).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "struct_ops member `{}` range overflows",
+                    source_member.name
+                ))
+            })?;
+            let source_bytes = source_value.get(source_offset..source_end).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "struct_ops member `{}` lies outside `{map_name}`",
+                    source_member.name
+                ))
+            })?;
+            let Some((kernel_member_index, kernel_member)) =
+                kernel_members.iter().enumerate().find(|(_, member)| {
+                    essential_name(&member.name) == essential_name(&source_member.name)
+                })
+            else {
+                if source_bytes.iter().any(|byte| *byte != 0)
+                    || callbacks_by_member.contains_key(&member_index)
+                {
+                    return Err(Error::Unsupported(format!(
+                        "kernel struct `{source_name}` has no configured member `{}`",
+                        source_member.name
+                    )));
+                }
+                continue;
+            };
+            if kernel_member.bitfield_size.is_some() || kernel_member.bit_offset % 8 != 0 {
+                return Err(Error::Unsupported(format!(
+                    "kernel struct_ops member `{}` is a bit field",
+                    kernel_member.name
+                )));
+            }
+            let source_type = object_btf.resolve_type(source_member.ty)?;
+            let kernel_type = kernel_btf.resolve_type(kernel_member.ty)?;
+            let source_kind = object_btf
+                .type_by_id(source_type)
+                .ok_or_else(|| Error::Btf(format!("source type {} is missing", source_type.0)))?
+                .kind();
+            let kernel_kind = kernel_btf
+                .type_by_id(kernel_type)
+                .ok_or_else(|| Error::Btf(format!("kernel type {} is missing", kernel_type.0)))?
+                .kind();
+            if source_kind != kernel_kind {
+                return Err(Error::Unsupported(format!(
+                    "struct_ops member `{}` has incompatible object and kernel BTF kinds",
+                    source_member.name
+                )));
+            }
+            let kernel_offset = data_offset
+                .checked_add(kernel_member.bit_offset as usize / 8)
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "kernel offset for struct_ops member `{}` overflows",
+                        source_member.name
+                    ))
+                })?;
+
+            if let BtfType::Pointer { ty: kernel_pointee } = kernel_btf
+                .type_by_id(kernel_type)
+                .ok_or_else(|| Error::Btf(format!("kernel type {} is missing", kernel_type.0)))?
+            {
+                let Some(program_name) = callbacks_by_member.get(&member_index).copied() else {
+                    if source_bytes.iter().any(|byte| *byte != 0) {
+                        return Err(Error::InvalidObject(format!(
+                            "struct_ops pointer member `{}` has no program relocation",
+                            source_member.name
+                        )));
+                    }
+                    continue;
+                };
+                let kernel_prototype = kernel_btf.resolve_type(*kernel_pointee)?;
+                if !matches!(
+                    kernel_btf.type_by_id(kernel_prototype),
+                    Some(BtfType::FunctionPrototype { .. })
+                ) {
+                    return Err(Error::Unsupported(format!(
+                        "kernel struct_ops member `{}` is not a function pointer",
+                        source_member.name
+                    )));
+                }
+                let program = programs
+                    .get_mut(program_name)
+                    .ok_or_else(|| Error::ProgramNotFound(program_name.to_owned()))?;
+                if program.attach_btf_id != 0 && program.attach_btf_id != kernel_type_id.0 {
+                    return Err(Error::InvalidObject(format!(
+                        "struct_ops program `{program_name}` is reused for incompatible structures"
+                    )));
+                }
+                let expected_attach_type =
+                    crate::AttachType::Other(u32::try_from(kernel_member_index).map_err(|_| {
+                        Error::InvalidObject("struct_ops member index does not fit u32".into())
+                    })?);
+                let ProgramKind::Other {
+                    program_type: ProgramType::StructOps,
+                    attach_type,
+                } = &mut program.kind
+                else {
+                    return Err(Error::InvalidObject(format!(
+                        "callback `{program_name}` is not a struct_ops program"
+                    )));
+                };
+                if attach_type.is_some_and(|attach| attach != expected_attach_type) {
+                    return Err(Error::InvalidObject(format!(
+                        "struct_ops program `{program_name}` is reused for incompatible members"
+                    )));
+                }
+                *attach_type = Some(expected_attach_type);
+                program.attach_btf_id = kernel_type_id.0;
+                prepared_callbacks.push((program_name.to_owned(), kernel_offset));
+                continue;
+            }
+
+            let kernel_size = kernel_btf.size_of(kernel_member.ty)?;
+            if source_size != kernel_size {
+                return Err(Error::Unsupported(format!(
+                    "struct_ops member `{}` has size {source_size}, kernel expects {kernel_size}",
+                    source_member.name
+                )));
+            }
+            let kernel_end = kernel_offset.checked_add(kernel_size).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "kernel range for struct_ops member `{}` overflows",
+                    source_member.name
+                ))
+            })?;
+            let destination = value.get_mut(kernel_offset..kernel_end).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "kernel struct_ops member `{}` lies outside its value wrapper",
+                    source_member.name
+                ))
+            })?;
+            destination.copy_from_slice(source_bytes);
+        }
+
+        map.value_size = wrapper_size;
+        map.initial_value = Some(value.clone());
+        definition.prepared = Some(PreparedStructOps {
+            kernel_value_type,
+            value,
+            callbacks: prepared_callbacks,
+        });
+    }
+    Ok(())
+}
+
+fn finalize_struct_ops_values(
+    maps: &mut BTreeMap<String, Map>,
+    programs: &BTreeMap<String, Program>,
+    definitions: &BTreeMap<String, StructOpsDefinition>,
+) -> Result<()> {
+    for (map_name, definition) in definitions {
+        if !maps.contains_key(map_name) {
+            continue;
+        }
+        let prepared = definition.prepared.as_ref().ok_or_else(|| {
+            Error::InvalidObject(format!("struct_ops map `{map_name}` was not prepared"))
+        })?;
+        let mut value = prepared.value.clone();
+        for (program_name, offset) in &prepared.callbacks {
+            let program = programs
+                .get(program_name)
+                .ok_or_else(|| Error::ProgramNotFound(program_name.clone()))?;
+            let fd = u64::try_from(program.fd.as_raw_fd()).map_err(|_| {
+                Error::InvalidObject(format!(
+                    "struct_ops callback `{program_name}` has an invalid descriptor"
+                ))
+            })?;
+            let end = offset.checked_add(size_of::<u64>()).ok_or_else(|| {
+                Error::InvalidObject("struct_ops callback offset overflows".into())
+            })?;
+            let slot = value.get_mut(*offset..end).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "struct_ops callback `{program_name}` lies outside the kernel value"
+                ))
+            })?;
+            slot.copy_from_slice(&fd.to_ne_bytes());
+        }
+        maps.get_mut(map_name)
+            .ok_or_else(|| Error::MapNotFound(map_name.clone()))?
+            .set_struct_ops_value(value)?;
+    }
+    Ok(())
+}
+
 fn load_maps(
     specs: &BTreeMap<String, MapSpec>,
     reused: &BTreeMap<String, Map>,
     btf_fd: Option<&OwnedFd>,
     pin_root: &Path,
     token_fd: Option<i32>,
+    struct_ops: &BTreeMap<String, StructOpsDefinition>,
 ) -> Result<BTreeMap<String, Map>> {
     let mut loaded = BTreeMap::new();
-    let mut pending = specs.keys().cloned().collect::<HashSet<_>>();
+    let mut pending = specs
+        .iter()
+        .filter(|(_, spec)| spec.autocreate)
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
     while !pending.is_empty() {
         let mut progress = false;
         let names = pending.iter().cloned().collect::<Vec<_>>();
@@ -1693,6 +2299,7 @@ fn load_maps(
                     .and_then(|inner| loaded.get(inner))
                     .map(|map: &Map| map.fd.as_raw_fd());
                 let accepts_btf = spec.map_type.accepts_btf_types();
+                let struct_ops_definition = struct_ops.get(&name);
                 let create = |with_btf: bool| {
                     sys::map_create(&MapCreate {
                         map_type: spec.map_type.as_raw(),
@@ -1705,7 +2312,15 @@ fn load_maps(
                         numa_node: spec.numa_node,
                         btf_fd: with_btf.then_some(btf_fd).flatten().map(AsRawFd::as_raw_fd),
                         btf_key_type_id: if with_btf { spec.btf_key_type.0 } else { 0 },
-                        btf_value_type_id: if with_btf { spec.btf_value_type.0 } else { 0 },
+                        btf_value_type_id: if with_btf && spec.map_type != MapType::StructOps {
+                            spec.btf_value_type.0
+                        } else {
+                            0
+                        },
+                        btf_vmlinux_value_type_id: struct_ops_definition
+                            .and_then(|definition| definition.prepared.as_ref())
+                            .map_or(0, |prepared| prepared.kernel_value_type.0),
+                        value_type_btf_obj_fd: None,
                         map_extra: spec.map_extra,
                         token_fd,
                     })
@@ -1727,9 +2342,11 @@ fn load_maps(
                     }
                 };
                 let map = Map::from_fd(fd, spec.clone());
-                if let Some(initial) = &spec.initial_value {
-                    sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
-                        .map_err(|source| Error::system("initialize data map", source))?;
+                if spec.map_type != MapType::StructOps {
+                    if let Some(initial) = &spec.initial_value {
+                        sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
+                            .map_err(|source| Error::system("initialize data map", source))?;
+                    }
                 }
                 if spec.freeze_after_init {
                     map.freeze()?;

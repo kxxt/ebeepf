@@ -15,8 +15,8 @@ use std::time::Duration;
 use ebeepf::{
     AttachType, BpfToken, Btf, BtfObject, HelperId, Instruction, LinkType, Map, MapCreateOptions,
     MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType, RingBuffer,
-    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions, Xdp,
-    XdpAttachOptions, XdpFlags,
+    SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode,
+    UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -624,4 +624,48 @@ fn loads_and_attaches_sockmap_program() {
     let info = link.info().unwrap();
     assert_eq!(info.link_type, LinkType::SocketMap);
     assert_eq!(info.map_id, Some(map.info().unwrap().id));
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and struct_ops link support"]
+fn loads_and_attaches_elf_struct_ops() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/struct-ops.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("struct-ops.bpf.o");
+    compile_bpf(&source, &object);
+
+    let mut generator = SkeletonBuilder::new();
+    generator.object(&object).format(false);
+    let skeleton = generator.render().unwrap();
+    assert!(skeleton.contains("map.attach_struct_ops()?"));
+    assert!(skeleton.contains("map.spec().auto_attach()"));
+    assert!(skeleton.contains("pub fn ebeepf_ca(&self) -> Option<&::ebeepf::Link>"));
+
+    let open = Object::open(&object).unwrap();
+    let map = open.map("ebeepf_ca").unwrap();
+    assert_eq!(map.map_type(), MapType::StructOps);
+    assert!(map.flags().contains(MapFlags::LINK));
+    assert_eq!(map.value_size(), 48);
+    let legacy_map = open.map("ebeepf_legacy_ca").unwrap();
+    assert!(!legacy_map.flags().contains(MapFlags::LINK));
+    assert_eq!(
+        open.program("ebeepf_ca_init").unwrap().program_type(),
+        ProgramType::StructOps
+    );
+
+    let loaded = open.load().unwrap();
+    let map = loaded.map("ebeepf_ca").unwrap();
+    assert!(map.info().unwrap().value_size > 48);
+    let callback = loaded.program("ebeepf_ca_init").unwrap();
+    assert_ne!(callback.spec().attach_btf_id(), 0);
+    let link = map.attach_struct_ops().unwrap();
+    let info = link.info().unwrap();
+    assert_eq!(info.link_type, LinkType::StructOps);
+    assert_eq!(info.map_id, Some(map.info().unwrap().id));
+    let legacy_link = loaded
+        .map("ebeepf_legacy_ca")
+        .unwrap()
+        .attach_struct_ops()
+        .unwrap();
+    assert!(legacy_link.as_fd().is_none());
 }

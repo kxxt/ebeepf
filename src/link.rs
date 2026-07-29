@@ -3,6 +3,7 @@ use std::fs;
 use std::mem;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::sys;
 use crate::{Error, Program, Result};
@@ -399,6 +400,7 @@ enum LinkFd {
         program: OwnedFd,
         attach_type: AttachType,
     },
+    StructOpsLegacy(Arc<OwnedFd>),
     Detached,
 }
 
@@ -443,6 +445,10 @@ impl fmt::Debug for Link {
                 .field("legacy_target_fd", &target.as_raw_fd())
                 .field("program_fd", &program.as_raw_fd())
                 .field("attach_type", attach_type)
+                .finish(),
+            LinkFd::StructOpsLegacy(fd) => formatter
+                .debug_struct("Link")
+                .field("legacy_struct_ops_map_fd", &fd.as_raw_fd())
                 .finish(),
             LinkFd::Detached => formatter.write_str("Link { detached: true }"),
         }
@@ -489,6 +495,13 @@ impl Link {
         }
     }
 
+    pub(crate) fn struct_ops_legacy(map: Arc<OwnedFd>) -> Self {
+        Self {
+            fd: LinkFd::StructOpsLegacy(map),
+            cleanup: None,
+        }
+    }
+
     pub(crate) fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
         self.cleanup = Some(Box::new(cleanup));
         self
@@ -523,6 +536,7 @@ impl Link {
             LinkFd::PerfEvents(_)
             | LinkFd::Socket(_)
             | LinkFd::Legacy { .. }
+            | LinkFd::StructOpsLegacy(_)
             | LinkFd::Detached => None,
         }
     }
@@ -658,6 +672,9 @@ impl Link {
                 attach_type.as_raw(),
             )
             .map_err(|source| Error::system("detach legacy eBPF program", source)),
+            LinkFd::StructOpsLegacy(map) => sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes())
+                .map(drop)
+                .map_err(|source| Error::system("detach legacy struct_ops map", source)),
             LinkFd::PerfEvents(_) | LinkFd::Detached => Ok(()),
         }
     }
@@ -679,6 +696,9 @@ impl Drop for Link {
             )),
             LinkFd::BpfPerfEvent { event, .. } => {
                 drop(sys::perf_event_disable(event.as_raw_fd()));
+            }
+            LinkFd::StructOpsLegacy(map) => {
+                drop(sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes()));
             }
             LinkFd::Bpf(_) | LinkFd::PerfEvents(_) | LinkFd::Detached => {}
         }

@@ -291,6 +291,8 @@ pub struct MapSpec {
     pub(crate) btf_key_type: TypeId,
     pub(crate) btf_value_type: TypeId,
     pub(crate) inner_map: Option<String>,
+    pub(crate) autocreate: bool,
+    pub(crate) auto_attach: bool,
     pub(crate) initial_value: Option<Vec<u8>>,
     pub(crate) freeze_after_init: bool,
     pub(crate) section_index: Option<usize>,
@@ -319,6 +321,8 @@ impl MapSpec {
             btf_key_type: TypeId::VOID,
             btf_value_type: TypeId::VOID,
             inner_map: None,
+            autocreate: true,
+            auto_attach: false,
             initial_value: None,
             freeze_after_init: false,
             section_index: None,
@@ -386,6 +390,18 @@ impl MapSpec {
         self.inner_map.as_deref()
     }
 
+    /// Whether object loading creates or reuses this map.
+    pub const fn autocreate(&self) -> bool {
+        self.autocreate
+    }
+
+    /// Whether generated skeletons automatically attach this map.
+    ///
+    /// This is meaningful for ELF-defined `struct_ops` maps.
+    pub const fn auto_attach(&self) -> bool {
+        self.auto_attach
+    }
+
     /// Initial value written to key zero while loading, when configured.
     ///
     /// ELF global-data and kconfig maps have an initial value by default.
@@ -447,6 +463,18 @@ impl MapSpec {
     /// Names the map whose descriptor should be used as the inner-map template.
     pub fn set_inner_map(&mut self, name: Option<impl Into<String>>) -> &mut Self {
         self.inner_map = name.map(Into::into);
+        self
+    }
+
+    /// Enables or disables creation during object loading.
+    pub fn set_autocreate(&mut self, autocreate: bool) -> &mut Self {
+        self.autocreate = autocreate;
+        self
+    }
+
+    /// Enables or disables automatic attachment by generated skeletons.
+    pub fn set_auto_attach(&mut self, auto_attach: bool) -> &mut Self {
+        self.auto_attach = auto_attach;
         self
     }
 
@@ -665,6 +693,18 @@ impl Map {
         }
     }
 
+    pub(crate) fn set_struct_ops_value(&mut self, value: Vec<u8>) -> Result<()> {
+        if self.spec.map_type != MapType::StructOps {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a struct_ops map",
+                self.name()
+            )));
+        }
+        validate_size("struct_ops map value", self.spec.value_size, value.len())?;
+        self.spec.initial_value = Some(value);
+        Ok(())
+    }
+
     /// Creates a standalone kernel map from an owned definition.
     ///
     /// Map-in-map definitions must use [`Self::create_with_inner`].
@@ -719,6 +759,8 @@ impl Map {
             btf_fd: None,
             btf_key_type_id: 0,
             btf_value_type_id: 0,
+            btf_vmlinux_value_type_id: 0,
+            value_type_btf_obj_fd: None,
             map_extra: spec.map_extra,
             token_fd: options.token.map(|token| token.as_fd().as_raw_fd()),
         })
@@ -955,9 +997,28 @@ impl Map {
                 self.name()
             )));
         }
-        let fd = sys::struct_ops_link_create(self.fd.as_raw_fd())
-            .map_err(|source| Error::system("attach struct_ops map", source))?;
-        Ok(Link::bpf(fd))
+        let value = self.spec.initial_value.as_deref().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "struct_ops map `{}` has no prepared implementation value",
+                self.name()
+            ))
+        })?;
+        match sys::map_update(self.fd.as_raw_fd(), &0_u32.to_ne_bytes(), value, 0) {
+            Ok(()) => {}
+            Err(source)
+                if self.spec.flags.contains(MapFlags::LINK)
+                    && source.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(source) => {
+                return Err(Error::system("initialize struct_ops map", source));
+            }
+        }
+        if self.spec.flags.contains(MapFlags::LINK) {
+            let fd = sys::struct_ops_link_create(self.fd.as_raw_fd())
+                .map_err(|source| Error::system("attach struct_ops map", source))?;
+            Ok(Link::bpf(fd))
+        } else {
+            Ok(Link::struct_ops_legacy(Arc::clone(&self.fd)))
+        }
     }
 
     /// Pins the map at a bpffs path.
@@ -1515,11 +1576,15 @@ mod tests {
         let mut spec = MapSpec::new("counts", MapType::Hash, 4, 8, 1);
         spec.set_numa_node(Some(2))
             .set_max_entries(1024)
-            .set_pinning(Pinning::ByName);
+            .set_pinning(Pinning::ByName)
+            .set_autocreate(false)
+            .set_auto_attach(true);
         spec.set_initial_value(7_u64.to_ne_bytes()).unwrap();
         assert_eq!(spec.max_entries(), 1024);
         assert!(spec.flags().contains(MapFlags::NUMA_NODE));
         assert_eq!(spec.pinning(), Pinning::ByName);
+        assert!(!spec.autocreate());
+        assert!(spec.auto_attach());
         assert_eq!(spec.initial_value(), Some(7_u64.to_ne_bytes().as_slice()));
         assert!(spec.set_initial_value([0; 4]).is_err());
     }

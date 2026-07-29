@@ -90,6 +90,10 @@ The crate currently provides:
   batch operations, and per-CPU values;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
+- ELF-defined `.struct_ops` and `.struct_ops.link` implementations, including
+  callback relocations, kernel-BTF wrapper layout translation, vmlinux value
+  type metadata, modern link and legacy registration lifetimes, and
+  transactional skeleton auto-attachment;
 - safe mmapable array-map views using volatile snapshots/writes instead of
   aliasable shared-memory slices; generated skeletons retain these mappings
   and expose live typed `.bss`, `.data`, and read-only `.rodata` accessors;
@@ -119,8 +123,8 @@ cargo clippy -p ebeepf --all-targets -- -D warnings
 
 Ignored end-to-end tests load real objects, exercise map CRUD, attach a
 Rust-emitted USDT probe, verify its cookie through a kernel ring buffer,
-compile and exercise a live BTF `freplace` target, and manage XDP and TC on an
-isolated temporary interface. Run them in an
+compile and exercise live BTF `freplace` and ELF-defined `struct_ops` targets,
+and manage XDP and TC on an isolated temporary interface. Run them in an
 environment with root or the corresponding `CAP_BPF` and `CAP_NET_ADMIN`
 capabilities:
 

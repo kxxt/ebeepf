@@ -78,6 +78,8 @@ pub(crate) struct MapCreate<'a> {
     pub btf_fd: Option<RawFd>,
     pub btf_key_type_id: u32,
     pub btf_value_type_id: u32,
+    pub btf_vmlinux_value_type_id: u32,
+    pub value_type_btf_obj_fd: Option<RawFd>,
     pub map_extra: u64,
     pub token_fd: Option<RawFd>,
 }
@@ -532,17 +534,22 @@ pub(crate) struct BtfInfoRaw {
 
 pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
     let token_flag = u32::from(options.token_fd.is_some()) * BPF_F_TOKEN_FD;
+    let value_type_flag = u32::from(options.value_type_btf_obj_fd.is_some()) * (1_u32 << 15);
     let mut attr = MapCreateAttr {
         map_type: options.map_type,
         key_size: options.key_size,
         value_size: options.value_size,
         max_entries: options.max_entries,
-        map_flags: (options.flags & !BPF_F_TOKEN_FD) | token_flag,
+        map_flags: (options.flags & !(BPF_F_TOKEN_FD | (1_u32 << 15)))
+            | token_flag
+            | value_type_flag,
         inner_map_fd: fd_u32(options.inner_map_fd)?,
         numa_node: options.numa_node.unwrap_or_default(),
         btf_fd: fd_u32(options.btf_fd)?,
         btf_key_type_id: options.btf_key_type_id,
         btf_value_type_id: options.btf_value_type_id,
+        btf_vmlinux_value_type_id: options.btf_vmlinux_value_type_id,
+        value_type_btf_obj_fd: options.value_type_btf_obj_fd.unwrap_or_default(),
         map_extra: options.map_extra,
         map_token_fd: options.token_fd.unwrap_or_default(),
         ..Default::default()
@@ -631,6 +638,8 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             btf_fd: None,
             btf_key_type_id: 0,
             btf_value_type_id: 0,
+            btf_vmlinux_value_type_id: 0,
+            value_type_btf_obj_fd: None,
             map_extra: 0,
             token_fd: None,
         }) {
