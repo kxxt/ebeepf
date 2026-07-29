@@ -508,7 +508,16 @@ impl Object {
             source,
         })?;
         let target_btf = Btf::parse(&kernel_bytes)?;
-        self.relocate_for(&target_btf)
+        apply_core_relocations_for_running_kernel(
+            self.btf
+                .as_ref()
+                .ok_or_else(|| Error::InvalidObject("CO-RE records require BTF".into()))?,
+            &target_btf,
+            &mut self.programs,
+            &self.core_relocations,
+        )?;
+        self.core_relocations.clear();
+        Ok(self)
     }
 
     /// Creates maps, applies relocations, and loads programs into the kernel.
@@ -3658,19 +3667,116 @@ fn apply_core_relocations(
     }
     for relocation in relocations {
         let value = evaluate_core_relocation(local_btf, target_btf, relocation)?;
-        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
-            Error::InvalidObject(format!(
-                "CO-RE relocation references missing program `{}`",
-                relocation.program
-            ))
-        })?;
-        patch_core_instruction(
-            &mut program.instructions,
-            relocation.instruction_index,
-            value,
-        )?;
+        apply_core_value(programs, relocation, value)?;
     }
     Ok(())
+}
+
+fn apply_core_relocations_for_running_kernel(
+    local_btf: &Btf,
+    vmlinux_btf: &Btf,
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[CoreRelocation],
+) -> Result<()> {
+    let mut pending = Vec::new();
+    for relocation in relocations {
+        if relocation.kind == 6 || core_target_exists(local_btf, vmlinux_btf, relocation)? {
+            let value = evaluate_core_relocation(local_btf, vmlinux_btf, relocation)?;
+            apply_core_value(programs, relocation, value)?;
+        } else {
+            pending.push(relocation);
+        }
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let directory = match fs::read_dir("/sys/kernel/btf") {
+        Ok(directory) => directory,
+        Err(source) if source.kind() == ErrorKind::NotFound => {
+            for relocation in pending {
+                let value = evaluate_core_relocation(local_btf, vmlinux_btf, relocation)?;
+                apply_core_value(programs, relocation, value)?;
+            }
+            return Ok(());
+        }
+        Err(source) => {
+            return Err(Error::File {
+                operation: "enumerate kernel module BTF",
+                path: "/sys/kernel/btf".into(),
+                source,
+            });
+        }
+    };
+    let mut paths = directory
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|source| Error::File {
+            operation: "enumerate kernel module BTF",
+            path: "/sys/kernel/btf".into(),
+            source,
+        })?;
+    paths.retain(|path| path.file_name().is_some_and(|name| name != "vmlinux"));
+    paths.sort();
+    for path in paths {
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(source) if source.kind() == ErrorKind::NotFound => continue,
+            Err(source) => {
+                return Err(Error::File {
+                    operation: "read kernel module BTF for CO-RE",
+                    path,
+                    source,
+                });
+            }
+        };
+        let module_btf = Btf::parse_split(&bytes, vmlinux_btf)?;
+        let mut unresolved = Vec::new();
+        for relocation in pending {
+            if core_target_exists(local_btf, &module_btf, relocation)? {
+                let value = evaluate_core_relocation(local_btf, &module_btf, relocation)?;
+                apply_core_value(programs, relocation, value)?;
+            } else {
+                unresolved.push(relocation);
+            }
+        }
+        pending = unresolved;
+        if pending.is_empty() {
+            return Ok(());
+        }
+    }
+    for relocation in pending {
+        let value = evaluate_core_relocation(local_btf, vmlinux_btf, relocation)?;
+        apply_core_value(programs, relocation, value)?;
+    }
+    Ok(())
+}
+
+fn core_target_exists(
+    local_btf: &Btf,
+    target_btf: &Btf,
+    relocation: &CoreRelocation,
+) -> Result<bool> {
+    let local_root = local_btf.resolve_type(relocation.type_id)?;
+    Ok(!target_type_candidates(local_btf, target_btf, local_root)?.is_empty())
+}
+
+fn apply_core_value(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocation: &CoreRelocation,
+    value: CoreValue,
+) -> Result<()> {
+    let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+        Error::InvalidObject(format!(
+            "CO-RE relocation references missing program `{}`",
+            relocation.program
+        ))
+    })?;
+    patch_core_instruction(
+        &mut program.instructions,
+        relocation.instruction_index,
+        value,
+    )
 }
 
 #[derive(Clone, Copy, Debug)]

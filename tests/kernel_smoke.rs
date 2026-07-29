@@ -222,6 +222,25 @@ fn opens_kernel_module_split_btf() {
 }
 
 #[test]
+#[ignore = "requires root or CAP_BPF, clang with CO-RE support, and the zram module with BTF"]
+fn relocates_core_against_kernel_module_btf() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-core.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("module-core.bpf.o");
+    compile_bpf(&source, &object_path);
+
+    let mut object = Object::open(&object_path).unwrap();
+    object.relocate_for_running_kernel().unwrap();
+    let loaded = object.load().unwrap();
+    let output = loaded
+        .program("module_type_exists")
+        .unwrap()
+        .test_run(TestRunOptions::new(&[0_u8; 64]))
+        .unwrap();
+    assert_eq!(output.return_value, 1);
+}
+
+#[test]
 #[ignore = "requires root or CAP_BPF, clang with the BPF target, and the dummy module with BTF"]
 fn loads_and_attaches_kernel_module_fentry() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-fentry.bpf.c");
