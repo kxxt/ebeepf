@@ -15,6 +15,7 @@ mod instruction;
 mod iter;
 mod link;
 mod map;
+mod netlink;
 mod object;
 mod perfbuf;
 mod program;
@@ -22,8 +23,10 @@ pub mod query;
 mod ringbuf;
 pub mod skel;
 mod sys;
+mod tc;
 mod usdt;
 mod user_ringbuf;
+mod xdp;
 
 pub use crate::btf::{Btf, BtfInfo, BtfKind, BtfMember, BtfObject, BtfType, TypeId};
 pub use crate::error::{Error, Result};
@@ -45,5 +48,7 @@ pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
 pub use crate::skel::{
     DataSection, DataSectionMut, DataValue, OpenSkeleton, Skeleton, SkeletonBuilder,
 };
+pub use crate::tc::{TcAttachOptions, TcAttachPoint, TcFilter, TcFilterId, TcFilterInfo, TcHook};
 pub use crate::usdt::{discover_usdt_probes, UsdtOptions, UsdtProbe};
 pub use crate::user_ringbuf::{UserRingBuffer, UserRingReservation};
+pub use crate::xdp::{Xdp, XdpAttachMode, XdpAttachOptions, XdpFeatures, XdpFlags, XdpInfo};

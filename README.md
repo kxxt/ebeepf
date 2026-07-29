@@ -72,6 +72,9 @@ The crate currently provides:
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
   `struct_ops`, legacy program, and iterator attachments with RAII link
   lifetimes;
+- persistent legacy XDP and classic TC `clsact` management through a private
+  pure Rust netlink transport, including mode queries, driver features,
+  compare-and-replace, and RAII-owned TC filters;
 - ring-buffer, user-ring-buffer, and perf-buffer consumers/producers without
   exposing C pointers in the public API;
 - build-script and CLI skeleton generation with named open/loaded
@@ -86,8 +89,10 @@ cargo clippy -p ebeepf --all-targets -- -D warnings
 ```
 
 Ignored end-to-end tests load real objects, exercise map CRUD, attach a
-Rust-emitted USDT probe, and verify its cookie through a kernel ring buffer.
-Run them in an environment with root or `CAP_BPF`:
+Rust-emitted USDT probe, verify its cookie through a kernel ring buffer, and
+manage XDP and TC on an isolated temporary interface. Run them in an
+environment with root or the corresponding `CAP_BPF` and `CAP_NET_ADMIN`
+capabilities:
 
 ```console
 cargo test -p ebeepf --test kernel_smoke -- --ignored
