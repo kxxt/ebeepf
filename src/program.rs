@@ -232,23 +232,41 @@ impl ProgramKind {
         let (prefix, target) = section.split_once('/').unwrap_or((section, ""));
         let kind = match prefix {
             "socket" | "sk_filter" => Self::SocketFilter,
-            "kprobe" => Self::Kprobe {
+            "kprobe" | "ksyscall" => Self::Kprobe {
                 function: target.into(),
                 return_probe: false,
             },
-            "kretprobe" => Self::Kprobe {
+            "kretprobe" | "kretsyscall" => Self::Kprobe {
                 function: target.into(),
                 return_probe: true,
             },
-            "uprobe" => Self::Uprobe {
+            "uprobe" | "uprobe.s" | "usdt" | "usdt.s" => Self::Uprobe {
                 target: target.into(),
                 return_probe: false,
             },
-            "uretprobe" => Self::Uprobe {
+            "uretprobe" | "uretprobe.s" => Self::Uprobe {
                 target: target.into(),
                 return_probe: true,
             },
-            "tracepoint" | "tp" => {
+            "kprobe.multi" | "kretprobe.multi" => Self::Other {
+                program_type: ProgramType::Kprobe,
+                attach_type: Some(AttachType::TraceKprobeMulti),
+            },
+            "kprobe.session" => Self::Other {
+                program_type: ProgramType::Kprobe,
+                attach_type: Some(AttachType::TraceKprobeSession),
+            },
+            "uprobe.multi" | "uprobe.multi.s" | "uretprobe.multi" | "uretprobe.multi.s" => {
+                Self::Other {
+                    program_type: ProgramType::Kprobe,
+                    attach_type: Some(AttachType::TraceUprobeMulti),
+                }
+            }
+            "uprobe.session" | "uprobe.session.s" => Self::Other {
+                program_type: ProgramType::Kprobe,
+                attach_type: Some(AttachType::TraceUprobeSession),
+            },
+            "tracepoint" | "tp" | "tracepoint.s" | "tp.s" => {
                 let (category, event) = target.split_once('/').ok_or_else(|| {
                     Error::InvalidObject(format!(
                         "tracepoint section `{section}` must name category/event"
@@ -259,7 +277,7 @@ impl ProgramKind {
                     event: event.into(),
                 }
             }
-            "raw_tracepoint" | "raw_tp" => Self::RawTracepoint {
+            "raw_tracepoint" | "raw_tp" | "raw_tracepoint.s" | "raw_tp.s" => Self::RawTracepoint {
                 name: target.into(),
                 writable: false,
             },
@@ -267,20 +285,86 @@ impl ProgramKind {
                 name: target.into(),
                 writable: true,
             },
+            "xdp" | "xdp.frags" if target == "devmap" => Self::Other {
+                program_type: ProgramType::Xdp,
+                attach_type: Some(AttachType::XdpDeviceMap),
+            },
+            "xdp" | "xdp.frags" if target == "cpumap" => Self::Other {
+                program_type: ProgramType::Xdp,
+                attach_type: Some(AttachType::XdpCpuMap),
+            },
             "xdp" | "xdp.frags" => Self::Xdp,
             "perf_event" => Self::PerfEvent,
+            "sk_reuseport" if target == "migrate" => Self::Other {
+                program_type: ProgramType::SocketReuseport,
+                attach_type: Some(AttachType::ReuseportSelectOrMigrate),
+            },
+            "sk_reuseport" => Self::Other {
+                program_type: ProgramType::SocketReuseport,
+                attach_type: Some(AttachType::ReuseportSelect),
+            },
             "cgroup_skb" if target == "ingress" => Self::Cgroup {
                 attach_type: AttachType::CgroupInetIngress,
             },
             "cgroup_skb" if target == "egress" => Self::Cgroup {
                 attach_type: AttachType::CgroupInetEgress,
             },
-            "cgroup/dev" => Self::Cgroup {
+            "cgroup" if target == "dev" => Self::Cgroup {
                 attach_type: AttachType::CgroupDevice,
             },
-            "cgroup/sysctl" => Self::Cgroup {
+            "cgroup" if target == "sysctl" => Self::Cgroup {
                 attach_type: AttachType::CgroupSysctl,
             },
+            "cgroup" if target == "sock_create" || target == "sock" => Self::Cgroup {
+                attach_type: AttachType::CgroupInetSocketCreate,
+            },
+            "cgroup" if target == "sock_release" => Self::Cgroup {
+                attach_type: AttachType::CgroupInetSocketRelease,
+            },
+            "cgroup" if target == "post_bind4" => Self::Cgroup {
+                attach_type: AttachType::CgroupInet4PostBind,
+            },
+            "cgroup" if target == "post_bind6" => Self::Cgroup {
+                attach_type: AttachType::CgroupInet6PostBind,
+            },
+            "cgroup" if target == "getsockopt" => Self::Other {
+                program_type: ProgramType::CgroupSocketOption,
+                attach_type: Some(AttachType::CgroupGetSocketOption),
+            },
+            "cgroup" if target == "setsockopt" => Self::Other {
+                program_type: ProgramType::CgroupSocketOption,
+                attach_type: Some(AttachType::CgroupSetSocketOption),
+            },
+            "cgroup" => {
+                let attach_type = match target {
+                    "bind4" => AttachType::CgroupInet4Bind,
+                    "bind6" => AttachType::CgroupInet6Bind,
+                    "connect4" => AttachType::CgroupInet4Connect,
+                    "connect6" => AttachType::CgroupInet6Connect,
+                    "connect_unix" => AttachType::CgroupUnixConnect,
+                    "sendmsg4" => AttachType::CgroupUdp4SendMessage,
+                    "sendmsg6" => AttachType::CgroupUdp6SendMessage,
+                    "sendmsg_unix" => AttachType::CgroupUnixSendMessage,
+                    "recvmsg4" => AttachType::CgroupUdp4ReceiveMessage,
+                    "recvmsg6" => AttachType::CgroupUdp6ReceiveMessage,
+                    "recvmsg_unix" => AttachType::CgroupUnixReceiveMessage,
+                    "getpeername4" => AttachType::CgroupInet4GetPeerName,
+                    "getpeername6" => AttachType::CgroupInet6GetPeerName,
+                    "getpeername_unix" => AttachType::CgroupUnixGetPeerName,
+                    "getsockname4" => AttachType::CgroupInet4GetSocketName,
+                    "getsockname6" => AttachType::CgroupInet6GetSocketName,
+                    "getsockname_unix" => AttachType::CgroupUnixGetSocketName,
+                    _ => {
+                        return Err(Error::Unsupported(format!(
+                            "cannot infer cgroup program type from ELF section `{section}`"
+                        )));
+                    }
+                };
+                Self::Other {
+                    program_type: ProgramType::CgroupSocketAddress,
+                    attach_type: Some(attach_type),
+                }
+            }
             "fentry" | "fentry.s" => Self::Tracing {
                 attach_type: AttachType::TraceFunctionEntry,
                 target: target.into(),
@@ -305,12 +389,113 @@ impl ProgramKind {
                 attach_type: AttachType::TraceRawTracepoint,
                 target: target.into(),
             },
+            "fsession" | "fsession.s" => Self::Tracing {
+                attach_type: AttachType::TraceFunctionSession,
+                target: target.into(),
+            },
+            "fentry.multi" | "fentry.multi.s" => Self::Tracing {
+                attach_type: AttachType::TraceFunctionEntryMulti,
+                target: target.into(),
+            },
+            "fexit.multi" | "fexit.multi.s" => Self::Tracing {
+                attach_type: AttachType::TraceFunctionExitMulti,
+                target: target.into(),
+            },
+            "fsession.multi" | "fsession.multi.s" => Self::Tracing {
+                attach_type: AttachType::TraceFunctionSessionMulti,
+                target: target.into(),
+            },
+            "lsm_cgroup" => Self::Tracing {
+                attach_type: AttachType::LsmCgroup,
+                target: target.into(),
+            },
             "classifier" | "tc" | "sched_cls" => Self::Other {
                 program_type: ProgramType::SchedulerClassifier,
-                attach_type: None,
+                attach_type: match target {
+                    "ingress" => Some(AttachType::TcxIngress),
+                    "egress" => Some(AttachType::TcxEgress),
+                    _ => None,
+                },
+            },
+            "tcx" => Self::Other {
+                program_type: ProgramType::SchedulerClassifier,
+                attach_type: match target {
+                    "ingress" => Some(AttachType::TcxIngress),
+                    "egress" => Some(AttachType::TcxEgress),
+                    _ => None,
+                },
+            },
+            "netkit" => Self::Other {
+                program_type: ProgramType::SchedulerClassifier,
+                attach_type: match target {
+                    "primary" => Some(AttachType::NetkitPrimary),
+                    "peer" => Some(AttachType::NetkitPeer),
+                    _ => None,
+                },
             },
             "action" | "sched_act" => Self::Other {
                 program_type: ProgramType::SchedulerAction,
+                attach_type: None,
+            },
+            "lwt_in" => Self::Other {
+                program_type: ProgramType::LightweightTunnelInput,
+                attach_type: None,
+            },
+            "lwt_out" => Self::Other {
+                program_type: ProgramType::LightweightTunnelOutput,
+                attach_type: None,
+            },
+            "lwt_xmit" => Self::Other {
+                program_type: ProgramType::LightweightTunnelTransmit,
+                attach_type: None,
+            },
+            "lwt_seg6local" => Self::Other {
+                program_type: ProgramType::LightweightTunnelSeg6Local,
+                attach_type: None,
+            },
+            "sockops" => Self::Other {
+                program_type: ProgramType::SocketOps,
+                attach_type: Some(AttachType::CgroupSocketOps),
+            },
+            "sk_skb" => Self::Other {
+                program_type: ProgramType::SocketBuffer,
+                attach_type: match target {
+                    "stream_parser" => Some(AttachType::StreamParser),
+                    "stream_verdict" => Some(AttachType::StreamVerdict),
+                    "verdict" => Some(AttachType::SocketVerdict),
+                    _ => None,
+                },
+            },
+            "sk_msg" => Self::Other {
+                program_type: ProgramType::SocketMessage,
+                attach_type: Some(AttachType::SocketMessageVerdict),
+            },
+            "lirc_mode2" => Self::Other {
+                program_type: ProgramType::LircMode2,
+                attach_type: Some(AttachType::LircMode2),
+            },
+            "flow_dissector" => Self::Other {
+                program_type: ProgramType::FlowDissector,
+                attach_type: Some(AttachType::FlowDissector),
+            },
+            "sk_lookup" => Self::Other {
+                program_type: ProgramType::SocketLookup,
+                attach_type: Some(AttachType::SocketLookup),
+            },
+            "syscall" => Self::Other {
+                program_type: ProgramType::Syscall,
+                attach_type: None,
+            },
+            "netfilter" => Self::Other {
+                program_type: ProgramType::Netfilter,
+                attach_type: Some(AttachType::Netfilter),
+            },
+            "struct_ops" | "struct_ops.s" => Self::Other {
+                program_type: ProgramType::StructOps,
+                attach_type: None,
+            },
+            "freplace" => Self::Other {
+                program_type: ProgramType::Extension,
                 attach_type: None,
             },
             _ => {
@@ -408,13 +593,14 @@ impl ProgramSpec {
     ) -> Result<Self> {
         let section = section.into();
         let kind = ProgramKind::from_section(&section)?;
+        let flags = program_flags_from_section(&section);
         Ok(Self {
             name: name.into(),
             section,
             kind,
             instructions,
             autoload: true,
-            flags: 0,
+            flags,
             kernel_version: 0,
             attach_btf_id: 0,
             func_info: Vec::new(),
@@ -637,6 +823,54 @@ impl Program {
         })
     }
 
+    /// Opens a program pinned in bpffs.
+    pub fn open_pinned(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let fd = sys::object_get(path).map_err(|source| Error::File {
+            operation: "open pinned program",
+            path: path.into(),
+            source,
+        })?;
+        Self::from_kernel_fd(fd)
+    }
+
+    /// Opens a program by its kernel ID.
+    pub fn from_id(id: u32) -> Result<Self> {
+        let fd = sys::object_get_fd_by_id(sys::ObjectKind::Program, id)
+            .map_err(|source| Error::system("open program by ID", source))?;
+        Self::from_kernel_fd(fd)
+    }
+
+    fn from_kernel_fd(fd: OwnedFd) -> Result<Self> {
+        let raw = sys::program_info(fd.as_raw_fd())
+            .map_err(|source| Error::system("read program metadata", source))?;
+        let program_type = ProgramType::from_raw(raw.program_type);
+        let spec = ProgramSpec {
+            name: kernel_name(&raw.name),
+            section: String::new(),
+            kind: ProgramKind::Other {
+                program_type,
+                attach_type: None,
+            },
+            instructions: Vec::new(),
+            autoload: false,
+            flags: 0,
+            kernel_version: 0,
+            attach_btf_id: 0,
+            func_info: Vec::new(),
+            func_info_record_size: 0,
+            line_info: Vec::new(),
+            line_info_record_size: 0,
+            verifier_log: VerifierLog::default(),
+            section_index: 0,
+            section_offset: 0,
+        };
+        Ok(Self {
+            fd: Arc::new(fd),
+            spec,
+        })
+    }
+
     /// Parsed program definition.
     pub fn spec(&self) -> &ProgramSpec {
         &self.spec
@@ -701,9 +935,28 @@ impl Program {
 
     /// Attaches to a raw tracepoint.
     pub fn attach_raw_tracepoint(&self, name: &str) -> Result<Link> {
-        let fd = sys::raw_tracepoint_open(name, self.fd.as_raw_fd())
+        self.attach_raw_tracepoint_with_cookie(name, 0)
+    }
+
+    /// Attaches to a raw tracepoint with an attachment cookie.
+    pub fn attach_raw_tracepoint_with_cookie(&self, name: &str, cookie: u64) -> Result<Link> {
+        let fd = sys::raw_tracepoint_open(name, self.fd.as_raw_fd(), cookie)
             .map_err(|source| Error::system("attach raw tracepoint", source))?;
         Ok(Link::bpf(fd))
+    }
+
+    /// Attaches this program as a classic socket filter.
+    ///
+    /// The returned link owns a duplicate socket descriptor and detaches the
+    /// filter when dropped.
+    pub fn attach_socket(&self, socket: impl AsFd) -> Result<Link> {
+        let socket = socket
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|source| Error::system("duplicate socket descriptor", source))?;
+        sys::socket_attach_bpf(socket.as_raw_fd(), self.fd.as_raw_fd())
+            .map_err(|source| Error::system("attach socket filter", source))?;
+        Ok(Link::socket(socket))
     }
 
     /// Attaches to a tracepoint on every online CPU.
@@ -802,6 +1055,65 @@ impl Program {
         Ok(Link::bpf(fd))
     }
 
+    /// Creates a TCX ingress or egress link on a network interface.
+    pub fn attach_tcx(
+        &self,
+        interface_index: u32,
+        attach_type: AttachType,
+        flags: u32,
+    ) -> Result<Link> {
+        if !matches!(attach_type, AttachType::TcxIngress | AttachType::TcxEgress) {
+            return Err(Error::InvalidObject(format!(
+                "{attach_type:?} is not a TCX attachment type"
+            )));
+        }
+        let fd = sys::link_create(
+            self.fd.as_raw_fd(),
+            interface_index,
+            attach_type.as_raw(),
+            flags,
+            0,
+            0,
+        )
+        .map_err(|source| Error::system("attach TCX program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
+    /// Creates a netfilter link.
+    pub fn attach_netfilter(
+        &self,
+        protocol_family: u32,
+        hook_number: u32,
+        priority: i32,
+        flags: u32,
+    ) -> Result<Link> {
+        let fd = sys::netfilter_link_create(&sys::NetfilterLink {
+            program_fd: self.fd.as_raw_fd(),
+            protocol_family,
+            hook_number,
+            priority,
+            flags,
+        })
+        .map_err(|source| Error::system("attach netfilter program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
+    /// Links the program to an already-open perf event.
+    pub fn attach_perf_event(&self, event: impl AsFd, cookie: u64) -> Result<Link> {
+        let target = u32::try_from(event.as_fd().as_raw_fd())
+            .map_err(|_| Error::InvalidObject("perf-event descriptor is negative".into()))?;
+        let fd = sys::link_create(
+            self.fd.as_raw_fd(),
+            target,
+            AttachType::PerfEvent.as_raw(),
+            0,
+            0,
+            cookie,
+        )
+        .map_err(|source| Error::system("attach program to perf event", source))?;
+        Ok(Link::bpf(fd))
+    }
+
     /// Creates a BTF tracing, LSM, or iterator link.
     pub fn attach_btf(&self, attach_type: AttachType, target_btf_id: u32) -> Result<Link> {
         let fd = sys::link_create(
@@ -865,7 +1177,7 @@ fn tracepoint_id(category: &str, event: &str) -> Result<u64> {
     )))
 }
 
-fn online_cpus() -> Result<Vec<i32>> {
+pub(crate) fn online_cpus() -> Result<Vec<i32>> {
     let text = fs::read_to_string("/sys/devices/system/cpu/online")
         .map_err(|source| Error::system("read online CPU list", source))?;
     parse_cpu_set(text.trim())
@@ -910,6 +1222,23 @@ fn read_u32(path: &str, what: &'static str) -> Result<u32> {
         .trim()
         .parse()
         .map_err(|_| Error::InvalidObject(format!("{what} is not an integer")))
+}
+
+pub(crate) fn program_flags_from_section(section: &str) -> u32 {
+    const BPF_F_SLEEPABLE: u32 = 1 << 4;
+    const BPF_F_XDP_HAS_FRAGS: u32 = 1 << 5;
+
+    let prefix = section
+        .split_once('/')
+        .map_or(section, |(prefix, _)| prefix);
+    let mut flags = 0;
+    if prefix.ends_with(".s") {
+        flags |= BPF_F_SLEEPABLE;
+    }
+    if prefix == "xdp.frags" {
+        flags |= BPF_F_XDP_HAS_FRAGS;
+    }
+    flags
 }
 
 #[cfg(test)]
@@ -973,5 +1302,12 @@ mod tests {
         assert_eq!(options.context_output_size, 16);
         assert_eq!(options.repeat, 1);
         assert_eq!(options.cpu, Some(3));
+    }
+
+    #[test]
+    fn section_suffixes_enable_kernel_program_flags() {
+        assert_eq!(program_flags_from_section("fentry.s/do_open"), 1 << 4);
+        assert_eq!(program_flags_from_section("xdp.frags/devmap"), 1 << 5);
+        assert_eq!(program_flags_from_section("xdp"), 0);
     }
 }

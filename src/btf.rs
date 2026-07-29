@@ -340,6 +340,8 @@ impl BtfType {
 pub struct Btf {
     raw: Vec<u8>,
     types: Vec<BtfType>,
+    type_offsets: Vec<usize>,
+    type_section_offset: usize,
     strings: Vec<u8>,
     endian: Endian,
 }
@@ -386,13 +388,17 @@ impl Btf {
 
         let mut reader = Reader::new(type_bytes, endian);
         let mut types = Vec::new();
+        let mut type_offsets = Vec::new();
         while !reader.is_empty() {
+            type_offsets.push(reader.position());
             types.push(parse_type(&mut reader, strings)?);
         }
 
         let btf = Self {
             raw: bytes.to_vec(),
             types,
+            type_offsets,
+            type_section_offset: type_start,
             strings: strings.to_vec(),
             endian,
         };
@@ -569,6 +575,36 @@ impl Btf {
 
     pub(crate) const fn endian(&self) -> Endian {
         self.endian
+    }
+
+    pub(crate) fn set_data_section_size(&mut self, name: &str, size: u32) -> Result<bool> {
+        let Some(index) = self.types.iter().position(
+            |ty| matches!(ty, BtfType::DataSection { name: candidate, .. } if candidate == name),
+        ) else {
+            return Ok(false);
+        };
+        let BtfType::DataSection {
+            size: current_size, ..
+        } = &mut self.types[index]
+        else {
+            unreachable!();
+        };
+        *current_size = size;
+        let offset = self
+            .type_section_offset
+            .checked_add(self.type_offsets[index])
+            .and_then(|offset| offset.checked_add(8))
+            .ok_or_else(|| Error::Btf("data-section size offset overflow".into()))?;
+        let target = self
+            .raw
+            .get_mut(offset..offset.saturating_add(4))
+            .ok_or_else(|| Error::Btf("data-section size lies outside raw BTF".into()))?;
+        let encoded = match self.endian {
+            Endian::Little => size.to_le_bytes(),
+            Endian::Big => size.to_be_bytes(),
+        };
+        target.copy_from_slice(&encoded);
+        Ok(true)
     }
 }
 
@@ -793,6 +829,7 @@ impl Endian {
 #[derive(Debug)]
 struct Reader<'a> {
     remaining: &'a [u8],
+    original_len: usize,
     endian: Endian,
 }
 
@@ -800,12 +837,17 @@ impl<'a> Reader<'a> {
     fn new(bytes: &'a [u8], endian: Endian) -> Self {
         Self {
             remaining: bytes,
+            original_len: bytes.len(),
             endian,
         }
     }
 
     fn is_empty(&self) -> bool {
         self.remaining.is_empty()
+    }
+
+    fn position(&self) -> usize {
+        self.original_len - self.remaining.len()
     }
 
     fn take(&mut self, len: usize) -> Result<&'a [u8]> {
@@ -945,5 +987,35 @@ mod tests {
 
         let btf = Btf::parse(&bytes).unwrap();
         assert_eq!(btf.size_of(TypeId(1)).unwrap(), 1);
+    }
+
+    #[test]
+    fn patches_data_section_size_in_model_and_kernel_bytes() {
+        let strings = b"\0.rodata\0";
+        let mut bytes = Vec::new();
+        bytes.extend(BTF_MAGIC.to_le_bytes());
+        bytes.push(BTF_VERSION);
+        bytes.push(0);
+        bytes.extend(u32_bytes(BTF_HEADER_LEN as u32));
+        bytes.extend(u32_bytes(0));
+        bytes.extend(u32_bytes(12));
+        bytes.extend(u32_bytes(12));
+        bytes.extend(u32_bytes(strings.len() as u32));
+        bytes.extend(u32_bytes(1));
+        bytes.extend(u32_bytes(15 << 24));
+        bytes.extend(u32_bytes(0));
+        bytes.extend(strings);
+
+        let mut btf = Btf::parse(&bytes).unwrap();
+        assert!(btf.set_data_section_size(".rodata", 64).unwrap());
+        assert!(!btf.set_data_section_size(".missing", 1).unwrap());
+        assert!(matches!(
+            btf.type_by_id(TypeId(1)),
+            Some(BtfType::DataSection { size: 64, .. })
+        ));
+        assert_eq!(
+            &btf.as_bytes()[BTF_HEADER_LEN + 8..BTF_HEADER_LEN + 12],
+            &64_u32.to_le_bytes()
+        );
     }
 }

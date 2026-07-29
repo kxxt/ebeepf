@@ -68,6 +68,14 @@ pub enum AttachType {
     LsmMac,
     /// BPF iterator.
     TraceIterator,
+    /// IPv4 peer-name lookup.
+    CgroupInet4GetPeerName,
+    /// IPv6 peer-name lookup.
+    CgroupInet6GetPeerName,
+    /// IPv4 local-name lookup.
+    CgroupInet4GetSocketName,
+    /// IPv6 local-name lookup.
+    CgroupInet6GetSocketName,
     /// XDP device-map program.
     XdpDeviceMap,
     /// Cgroup socket release.
@@ -100,6 +108,32 @@ pub enum AttachType {
     TcxEgress,
     /// Multi-uprobe.
     TraceUprobeMulti,
+    /// Unix-domain connect.
+    CgroupUnixConnect,
+    /// Unix-domain send.
+    CgroupUnixSendMessage,
+    /// Unix-domain receive.
+    CgroupUnixReceiveMessage,
+    /// Unix-domain peer-name lookup.
+    CgroupUnixGetPeerName,
+    /// Unix-domain local-name lookup.
+    CgroupUnixGetSocketName,
+    /// Primary netkit device.
+    NetkitPrimary,
+    /// Peer netkit device.
+    NetkitPeer,
+    /// Kprobe session.
+    TraceKprobeSession,
+    /// Uprobe session.
+    TraceUprobeSession,
+    /// Function tracing session.
+    TraceFunctionSession,
+    /// Multi-function entry tracing.
+    TraceFunctionEntryMulti,
+    /// Multi-function exit tracing.
+    TraceFunctionExitMulti,
+    /// Multi-function tracing session.
+    TraceFunctionSessionMulti,
     /// A type introduced after this crate version.
     Other(u32),
 }
@@ -137,6 +171,10 @@ impl AttachType {
             26 => Self::ModifyReturn,
             27 => Self::LsmMac,
             28 => Self::TraceIterator,
+            29 => Self::CgroupInet4GetPeerName,
+            30 => Self::CgroupInet6GetPeerName,
+            31 => Self::CgroupInet4GetSocketName,
+            32 => Self::CgroupInet6GetSocketName,
             33 => Self::XdpDeviceMap,
             34 => Self::CgroupInetSocketRelease,
             35 => Self::XdpCpuMap,
@@ -153,6 +191,19 @@ impl AttachType {
             46 => Self::TcxIngress,
             47 => Self::TcxEgress,
             48 => Self::TraceUprobeMulti,
+            49 => Self::CgroupUnixConnect,
+            50 => Self::CgroupUnixSendMessage,
+            51 => Self::CgroupUnixReceiveMessage,
+            52 => Self::CgroupUnixGetPeerName,
+            53 => Self::CgroupUnixGetSocketName,
+            54 => Self::NetkitPrimary,
+            55 => Self::NetkitPeer,
+            56 => Self::TraceKprobeSession,
+            57 => Self::TraceUprobeSession,
+            58 => Self::TraceFunctionSession,
+            59 => Self::TraceFunctionEntryMulti,
+            60 => Self::TraceFunctionExitMulti,
+            61 => Self::TraceFunctionSessionMulti,
             value => Self::Other(value),
         }
     }
@@ -189,6 +240,10 @@ impl AttachType {
             Self::ModifyReturn => 26,
             Self::LsmMac => 27,
             Self::TraceIterator => 28,
+            Self::CgroupInet4GetPeerName => 29,
+            Self::CgroupInet6GetPeerName => 30,
+            Self::CgroupInet4GetSocketName => 31,
+            Self::CgroupInet6GetSocketName => 32,
             Self::XdpDeviceMap => 33,
             Self::CgroupInetSocketRelease => 34,
             Self::XdpCpuMap => 35,
@@ -205,6 +260,19 @@ impl AttachType {
             Self::TcxIngress => 46,
             Self::TcxEgress => 47,
             Self::TraceUprobeMulti => 48,
+            Self::CgroupUnixConnect => 49,
+            Self::CgroupUnixSendMessage => 50,
+            Self::CgroupUnixReceiveMessage => 51,
+            Self::CgroupUnixGetPeerName => 52,
+            Self::CgroupUnixGetSocketName => 53,
+            Self::NetkitPrimary => 54,
+            Self::NetkitPeer => 55,
+            Self::TraceKprobeSession => 56,
+            Self::TraceUprobeSession => 57,
+            Self::TraceFunctionSession => 58,
+            Self::TraceFunctionEntryMulti => 59,
+            Self::TraceFunctionExitMulti => 60,
+            Self::TraceFunctionSessionMulti => 61,
             Self::Other(value) => value,
         }
     }
@@ -213,6 +281,7 @@ impl AttachType {
 enum LinkFd {
     Bpf(OwnedFd),
     PerfEvents(Vec<OwnedFd>),
+    Socket(OwnedFd),
     Detached,
 }
 
@@ -238,6 +307,10 @@ impl fmt::Debug for Link {
                     &fds.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
                 )
                 .finish(),
+            LinkFd::Socket(fd) => formatter
+                .debug_struct("Link")
+                .field("socket_fd", &fd.as_raw_fd())
+                .finish(),
             LinkFd::Detached => formatter.write_str("Link { detached: true }"),
         }
     }
@@ -256,6 +329,30 @@ impl Link {
         }
     }
 
+    pub(crate) fn socket(fd: OwnedFd) -> Self {
+        Self {
+            fd: LinkFd::Socket(fd),
+        }
+    }
+
+    /// Opens a link pinned in bpffs.
+    pub fn open_pinned(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let fd = sys::object_get(path).map_err(|source| Error::File {
+            operation: "open pinned link",
+            path: path.into(),
+            source,
+        })?;
+        Ok(Self::bpf(fd))
+    }
+
+    /// Opens a link by its kernel ID.
+    pub fn from_id(id: u32) -> Result<Self> {
+        let fd = sys::object_get_fd_by_id(sys::ObjectKind::Link, id)
+            .map_err(|source| Error::system("open link by ID", source))?;
+        Ok(Self::bpf(fd))
+    }
+
     /// Borrows the link FD when this is a kernel `bpf_link`.
     ///
     /// Perf-event based attachments consist of multiple descriptors and return
@@ -263,7 +360,7 @@ impl Link {
     pub fn as_fd(&self) -> Option<BorrowedFd<'_>> {
         match &self.fd {
             LinkFd::Bpf(fd) => Some(fd.as_fd()),
-            LinkFd::PerfEvents(_) | LinkFd::Detached => None,
+            LinkFd::PerfEvents(_) | LinkFd::Socket(_) | LinkFd::Detached => None,
         }
     }
 
@@ -291,7 +388,17 @@ impl Link {
         match fd {
             LinkFd::Bpf(fd) => sys::link_detach(fd.as_raw_fd())
                 .map_err(|source| Error::system("detach eBPF link", source)),
+            LinkFd::Socket(fd) => sys::socket_detach_bpf(fd.as_raw_fd())
+                .map_err(|source| Error::system("detach socket filter", source)),
             LinkFd::PerfEvents(_) | LinkFd::Detached => Ok(()),
+        }
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        if let LinkFd::Socket(fd) = &self.fd {
+            drop(sys::socket_detach_bpf(fd.as_raw_fd()));
         }
     }
 }

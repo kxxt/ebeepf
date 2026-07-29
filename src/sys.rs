@@ -25,14 +25,30 @@ const BPF_PROG_LOAD: u32 = 5;
 const BPF_OBJ_PIN: u32 = 6;
 const BPF_OBJ_GET: u32 = 7;
 const BPF_PROG_TEST_RUN: u32 = 10;
+const BPF_PROG_GET_NEXT_ID: u32 = 11;
+const BPF_MAP_GET_NEXT_ID: u32 = 12;
+const BPF_PROG_GET_FD_BY_ID: u32 = 13;
+const BPF_MAP_GET_FD_BY_ID: u32 = 14;
 const BPF_OBJ_GET_INFO_BY_FD: u32 = 15;
 const BPF_RAW_TRACEPOINT_OPEN: u32 = 17;
 const BPF_BTF_LOAD: u32 = 18;
+const BPF_BTF_GET_FD_BY_ID: u32 = 19;
+const BPF_MAP_LOOKUP_AND_DELETE_ELEM: u32 = 21;
 const BPF_MAP_FREEZE: u32 = 22;
+const BPF_BTF_GET_NEXT_ID: u32 = 23;
+const BPF_MAP_LOOKUP_BATCH: u32 = 24;
+const BPF_MAP_LOOKUP_AND_DELETE_BATCH: u32 = 25;
+const BPF_MAP_UPDATE_BATCH: u32 = 26;
+const BPF_MAP_DELETE_BATCH: u32 = 27;
 const BPF_LINK_CREATE: u32 = 28;
+const BPF_LINK_GET_FD_BY_ID: u32 = 30;
+const BPF_LINK_GET_NEXT_ID: u32 = 31;
 const BPF_LINK_DETACH: u32 = 34;
 
 const PERF_TYPE_TRACEPOINT: u32 = 2;
+const PERF_TYPE_SOFTWARE: u32 = 1;
+const PERF_COUNT_SW_BPF_OUTPUT: u64 = 10;
+const PERF_SAMPLE_RAW: u64 = 1 << 10;
 const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
 const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 1 << 3;
@@ -90,7 +106,14 @@ struct MapCreateAttr {
     btf_value_type_id: u32,
     btf_vmlinux_value_type_id: u32,
     map_extra: u64,
+    value_type_btf_obj_fd: i32,
+    map_token_fd: i32,
+    excl_prog_hash: u64,
+    excl_prog_hash_size: u32,
 }
+
+const MAP_CREATE_ATTR_SIZE: usize =
+    mem::offset_of!(MapCreateAttr, excl_prog_hash_size) + mem::size_of::<u32>();
 
 #[repr(C)]
 #[derive(Default)]
@@ -99,6 +122,19 @@ struct MapElementAttr {
     _padding: u32,
     key: u64,
     value_or_next_key: u64,
+    flags: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct MapBatchAttr {
+    in_batch: u64,
+    out_batch: u64,
+    keys: u64,
+    values: u64,
+    count: u32,
+    map_fd: u32,
+    element_flags: u64,
     flags: u64,
 }
 
@@ -148,6 +184,14 @@ struct ObjectInfoAttr {
 
 #[repr(C)]
 #[derive(Default)]
+struct GetIdAttr {
+    start_id: u32,
+    next_id: u32,
+    open_flags: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
 struct BtfLoadAttr {
     btf: u64,
     btf_log_buf: u64,
@@ -167,6 +211,19 @@ struct LinkCreateAttr {
     target_btf_id: u32,
     _padding: u32,
     cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct NetfilterLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    link_flags: u32,
+    protocol_family: u32,
+    hook_number: u32,
+    priority: i32,
+    netfilter_flags: u32,
 }
 
 #[repr(C)]
@@ -279,13 +336,16 @@ pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
         ..Default::default()
     };
     set_object_name(&mut attr.map_name, options.name);
-    command_fd(BPF_MAP_CREATE, &attr)
+    // The UAPI's map-create payload ends at `excl_prog_hash_size` (byte 92).
+    // `repr(C)` rounds this Rust structure up to 96 bytes for its u64
+    // alignment, but the four tail-padding bytes are not part of the ABI.
+    command_fd_sized(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE)
 }
 
 pub(crate) fn map_lookup(fd: RawFd, key: &[u8], value: &mut [u8], flags: u64) -> io::Result<bool> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
-        key: pointer(key.as_ptr()),
+        key: slice_pointer(key),
         value_or_next_key: mut_pointer(value.as_mut_ptr()),
         flags,
         ..Default::default()
@@ -300,7 +360,7 @@ pub(crate) fn map_lookup(fd: RawFd, key: &[u8], value: &mut [u8], flags: u64) ->
 pub(crate) fn map_update(fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> io::Result<()> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
-        key: pointer(key.as_ptr()),
+        key: slice_pointer(key),
         value_or_next_key: pointer(value.as_ptr()),
         flags,
         ..Default::default()
@@ -311,7 +371,7 @@ pub(crate) fn map_update(fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> io:
 pub(crate) fn map_delete(fd: RawFd, key: &[u8]) -> io::Result<bool> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
-        key: pointer(key.as_ptr()),
+        key: slice_pointer(key),
         ..Default::default()
     };
     match command(BPF_MAP_DELETE_ELEM, &attr) {
@@ -339,12 +399,97 @@ pub(crate) fn map_next_key(
     }
 }
 
+pub(crate) fn map_lookup_and_delete(fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<bool> {
+    let attr = MapElementAttr {
+        map_fd: raw_fd_u32(fd)?,
+        key: slice_pointer(key),
+        value_or_next_key: mut_pointer(value.as_mut_ptr()),
+        ..Default::default()
+    };
+    match command(BPF_MAP_LOOKUP_AND_DELETE_ELEM, &attr) {
+        Ok(_) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn map_freeze(fd: RawFd) -> io::Result<()> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
         ..Default::default()
     };
     command(BPF_MAP_FREEZE, &attr).map(drop)
+}
+
+pub(crate) struct BatchLookup<'a> {
+    pub fd: RawFd,
+    pub cursor: Option<&'a [u8]>,
+    pub next_cursor: &'a mut [u8],
+    pub keys: &'a mut [u8],
+    pub values: &'a mut [u8],
+    pub count: u32,
+    pub delete: bool,
+}
+
+pub(crate) struct BatchLookupResult {
+    pub count: u32,
+    pub done: bool,
+}
+
+pub(crate) fn map_lookup_batch(options: &mut BatchLookup<'_>) -> io::Result<BatchLookupResult> {
+    let mut attr = MapBatchAttr {
+        in_batch: options.cursor.map_or(0, |cursor| pointer(cursor.as_ptr())),
+        out_batch: mut_pointer(options.next_cursor.as_mut_ptr()),
+        keys: mut_pointer(options.keys.as_mut_ptr()),
+        values: mut_pointer(options.values.as_mut_ptr()),
+        count: options.count,
+        map_fd: raw_fd_u32(options.fd)?,
+        ..Default::default()
+    };
+    let command_number = if options.delete {
+        BPF_MAP_LOOKUP_AND_DELETE_BATCH
+    } else {
+        BPF_MAP_LOOKUP_BATCH
+    };
+    let done = match command_mut(command_number, &mut attr) {
+        Ok(_) => false,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => true,
+        Err(error) => return Err(error),
+    };
+    Ok(BatchLookupResult {
+        count: attr.count,
+        done,
+    })
+}
+
+pub(crate) fn map_update_batch(
+    fd: RawFd,
+    keys: &[u8],
+    values: &[u8],
+    count: u32,
+    element_flags: u64,
+) -> io::Result<u32> {
+    let mut attr = MapBatchAttr {
+        keys: pointer(keys.as_ptr()),
+        values: pointer(values.as_ptr()),
+        count,
+        map_fd: raw_fd_u32(fd)?,
+        element_flags,
+        ..Default::default()
+    };
+    command_mut(BPF_MAP_UPDATE_BATCH, &mut attr)?;
+    Ok(attr.count)
+}
+
+pub(crate) fn map_delete_batch(fd: RawFd, keys: &[u8], count: u32) -> io::Result<u32> {
+    let mut attr = MapBatchAttr {
+        keys: pointer(keys.as_ptr()),
+        count,
+        map_fd: raw_fd_u32(fd)?,
+        ..Default::default()
+    };
+    command_mut(BPF_MAP_DELETE_BATCH, &mut attr)?;
+    Ok(attr.count)
 }
 
 pub(crate) fn load_btf(bytes: &[u8], log_size: usize) -> Result<OwnedFd, (io::Error, String)> {
@@ -423,6 +568,48 @@ pub(crate) fn program_info(fd: RawFd) -> io::Result<ProgramInfoRaw> {
     object_info(fd)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ObjectKind {
+    Map,
+    Program,
+    Link,
+    Btf,
+}
+
+pub(crate) fn next_id(kind: ObjectKind, start: u32) -> io::Result<Option<u32>> {
+    let command_number = match kind {
+        ObjectKind::Map => BPF_MAP_GET_NEXT_ID,
+        ObjectKind::Program => BPF_PROG_GET_NEXT_ID,
+        ObjectKind::Link => BPF_LINK_GET_NEXT_ID,
+        ObjectKind::Btf => BPF_BTF_GET_NEXT_ID,
+    };
+    let mut attr = GetIdAttr {
+        start_id: start,
+        ..Default::default()
+    };
+    match command_mut(command_number, &mut attr) {
+        Ok(_) => Ok(Some(attr.next_id)),
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn object_get_fd_by_id(kind: ObjectKind, id: u32) -> io::Result<OwnedFd> {
+    let command_number = match kind {
+        ObjectKind::Map => BPF_MAP_GET_FD_BY_ID,
+        ObjectKind::Program => BPF_PROG_GET_FD_BY_ID,
+        ObjectKind::Link => BPF_LINK_GET_FD_BY_ID,
+        ObjectKind::Btf => BPF_BTF_GET_FD_BY_ID,
+    };
+    command_fd(
+        command_number,
+        &GetIdAttr {
+            start_id: id,
+            ..Default::default()
+        },
+    )
+}
+
 fn object_info<T>(fd: RawFd) -> io::Result<T> {
     let mut info = MaybeUninit::<T>::zeroed();
     let attr = ObjectInfoAttr {
@@ -457,6 +644,27 @@ pub(crate) fn link_create(
     command_fd(BPF_LINK_CREATE, &attr)
 }
 
+pub(crate) struct NetfilterLink {
+    pub program_fd: RawFd,
+    pub protocol_family: u32,
+    pub hook_number: u32,
+    pub priority: i32,
+    pub flags: u32,
+}
+
+pub(crate) fn netfilter_link_create(options: &NetfilterLink) -> io::Result<OwnedFd> {
+    let attr = NetfilterLinkCreateAttr {
+        prog_fd: raw_fd_u32(options.program_fd)?,
+        attach_type: 45, // BPF_NETFILTER
+        protocol_family: options.protocol_family,
+        hook_number: options.hook_number,
+        priority: options.priority,
+        netfilter_flags: options.flags,
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
 pub(crate) fn link_detach(fd: RawFd) -> io::Result<()> {
     #[repr(C)]
     struct Attr {
@@ -471,12 +679,17 @@ pub(crate) fn link_detach(fd: RawFd) -> io::Result<()> {
     .map(drop)
 }
 
-pub(crate) fn raw_tracepoint_open(name: &str, program_fd: RawFd) -> io::Result<OwnedFd> {
+pub(crate) fn raw_tracepoint_open(
+    name: &str,
+    program_fd: RawFd,
+    cookie: u64,
+) -> io::Result<OwnedFd> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tracepoint name contains NUL"))?;
     let attr = RawTracepointAttr {
         name: pointer(name.as_ptr()),
         prog_fd: raw_fd_u32(program_fd)?,
+        cookie,
         ..Default::default()
     };
     command_fd(BPF_RAW_TRACEPOINT_OPEN, &attr)
@@ -598,12 +811,87 @@ pub(crate) fn uprobe_perf_event(target: &UprobeTarget<'_>) -> io::Result<OwnedFd
     perf_event_attach(&attr, pid, target.cpu, target.program_fd)
 }
 
+pub(crate) fn perf_output_event(cpu: i32) -> io::Result<OwnedFd> {
+    let attr = PerfEventAttr {
+        event_type: PERF_TYPE_SOFTWARE,
+        size: mem::size_of::<PerfEventAttr>() as u32,
+        config: PERF_COUNT_SW_BPF_OUTPUT,
+        sample_period: 1,
+        sample_type: PERF_SAMPLE_RAW,
+        flags: 1,
+        wakeup_events: 1,
+        ..Default::default()
+    };
+    perf_event_open(&attr, -1, cpu)
+}
+
+pub(crate) fn perf_event_enable(fd: RawFd) -> io::Result<()> {
+    // SAFETY: PERF_EVENT_IOC_ENABLE takes an ignored integer argument and `fd`
+    // is expected to be a perf-event descriptor.
+    if unsafe { libc::ioctl(fd, PERF_EVENT_IOC_ENABLE, 0) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn socket_attach_bpf(socket_fd: RawFd, program_fd: RawFd) -> io::Result<()> {
+    let program_fd = raw_fd_u32(program_fd)?;
+    // SAFETY: The option value points to a live `u32` program descriptor and
+    // the kernel validates both descriptors.
+    let result = unsafe {
+        libc::setsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_ATTACH_BPF,
+            ptr::from_ref(&program_fd).cast(),
+            mem::size_of_val(&program_fd) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn socket_detach_bpf(socket_fd: RawFd) -> io::Result<()> {
+    let zero = 0_u32;
+    // SAFETY: SO_DETACH_BPF ignores the option payload but Linux requires a
+    // valid pointer and length on some versions.
+    let result = unsafe {
+        libc::setsockopt(
+            socket_fd,
+            libc::SOL_SOCKET,
+            libc::SO_DETACH_BPF,
+            ptr::from_ref(&zero).cast(),
+            mem::size_of_val(&zero) as libc::socklen_t,
+        )
+    };
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn perf_event_attach(
     attr: &PerfEventAttr,
     pid: i32,
     cpu: i32,
     program_fd: RawFd,
 ) -> io::Result<OwnedFd> {
+    let fd = perf_event_open(attr, pid, cpu)?;
+    // SAFETY: This ioctl command takes an integer program descriptor and `fd`
+    // is a perf-event descriptor.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_SET_BPF, program_fd) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    perf_event_enable(fd.as_raw_fd())?;
+    Ok(fd)
+}
+
+fn perf_event_open(attr: &PerfEventAttr, pid: i32, cpu: i32) -> io::Result<OwnedFd> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `attr` is an initialized perf_event_attr ABI prefix and all
@@ -624,21 +912,11 @@ fn perf_event_attach(
         let raw_fd = RawFd::try_from(result)
             .map_err(|_| io::Error::other("perf_event_open returned an invalid descriptor"))?;
         // SAFETY: `perf_event_open` returned a new descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-        // SAFETY: These ioctl commands take an integer program descriptor and
-        // no argument, respectively, and `fd` is a perf-event descriptor.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_SET_BPF, program_fd) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: PERF_EVENT_IOC_ENABLE takes an ignored integer argument.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_ENABLE, 0) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(fd)
+        Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (attr, pid, cpu, program_fd);
+        let _ = (attr, pid, cpu);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "perf events are only supported on Linux",
@@ -688,6 +966,14 @@ fn pointer<T>(pointer: *const T) -> u64 {
     pointer as usize as u64
 }
 
+fn slice_pointer(bytes: &[u8]) -> u64 {
+    if bytes.is_empty() {
+        0
+    } else {
+        pointer(bytes.as_ptr())
+    }
+}
+
 fn mut_pointer<T>(pointer: *mut T) -> u64 {
     pointer as usize as u64
 }
@@ -699,7 +985,24 @@ fn command_fd<T>(command_number: u32, attr: &T) -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+fn command_fd_sized<T>(command_number: u32, attr: &T, attr_size: usize) -> io::Result<OwnedFd> {
+    if attr_size > mem::size_of::<T>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bpf attribute size exceeds its backing value",
+        ));
+    }
+    let fd = command_sized(command_number, attr, attr_size)?;
+    // SAFETY: A successful fd-producing bpf command returns a new descriptor
+    // owned by the caller.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 fn command<T>(command_number: u32, attr: &T) -> io::Result<RawFd> {
+    command_sized(command_number, attr, mem::size_of::<T>())
+}
+
+fn command_sized<T>(command_number: u32, attr: &T, attr_size: usize) -> io::Result<RawFd> {
     #[cfg(target_os = "linux")]
     {
         // SAFETY: `attr` points to an initialized repr(C) UAPI prefix for this
@@ -709,7 +1012,7 @@ fn command<T>(command_number: u32, attr: &T) -> io::Result<RawFd> {
                 libc::SYS_bpf,
                 libc::c_long::from(command_number),
                 ptr::from_ref(attr),
-                mem::size_of::<T>(),
+                attr_size,
             )
         };
         if result < 0 {
@@ -721,7 +1024,7 @@ fn command<T>(command_number: u32, attr: &T) -> io::Result<RawFd> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (command_number, attr);
+        let _ = (command_number, attr, attr_size);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "eBPF is only supported on Linux",
@@ -765,12 +1068,16 @@ mod tests {
 
     #[test]
     fn kernel_abi_layouts_match_linux_uapi() {
-        assert_eq!(mem::size_of::<MapCreateAttr>(), 72);
+        assert_eq!(mem::size_of::<MapCreateAttr>(), 96);
+        assert_eq!(MAP_CREATE_ATTR_SIZE, 92);
         assert_eq!(mem::size_of::<MapElementAttr>(), 32);
+        assert_eq!(mem::size_of::<MapBatchAttr>(), 56);
         assert_eq!(mem::size_of::<ProgramLoadAttr>(), 120);
         assert_eq!(mem::size_of::<BtfLoadAttr>(), 32);
         assert_eq!(mem::size_of::<ObjectPathAttr>(), 24);
+        assert_eq!(mem::size_of::<GetIdAttr>(), 12);
         assert_eq!(mem::size_of::<LinkCreateAttr>(), 32);
+        assert_eq!(mem::size_of::<NetfilterLinkCreateAttr>(), 32);
         // PERF_ATTR_SIZE_VER5. Newer fields are optional ABI suffixes.
         assert_eq!(mem::size_of::<PerfEventAttr>(), 112);
         assert_eq!(mem::size_of::<ProgramTestRunAttr>(), 80);

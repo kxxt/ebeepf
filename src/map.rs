@@ -429,6 +429,39 @@ pub struct MapInfo {
     pub map_extra: u64,
 }
 
+/// Opaque continuation state for map batch lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchCursor(Vec<u8>);
+
+/// A page returned by a map batch lookup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MapBatch {
+    entries: Vec<(Vec<u8>, Vec<u8>)>,
+    cursor: Option<BatchCursor>,
+}
+
+impl MapBatch {
+    /// Key/value pairs returned by the kernel.
+    pub fn entries(&self) -> &[(Vec<u8>, Vec<u8>)] {
+        &self.entries
+    }
+
+    /// Consumes the page and returns its entries.
+    pub fn into_entries(self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.entries
+    }
+
+    /// Cursor for the next page, or `None` when iteration is complete.
+    pub fn cursor(&self) -> Option<&BatchCursor> {
+        self.cursor.as_ref()
+    }
+
+    /// Whether this is the last page.
+    pub fn is_last(&self) -> bool {
+        self.cursor.is_none()
+    }
+}
+
 /// An owned reference to a map loaded in the kernel.
 #[derive(Clone)]
 pub struct Map {
@@ -462,8 +495,19 @@ impl Map {
             path: path.into(),
             source,
         })?;
+        Self::from_kernel_fd(fd)
+    }
+
+    /// Opens a map by its kernel ID.
+    pub fn from_id(id: u32) -> Result<Self> {
+        let fd = sys::object_get_fd_by_id(sys::ObjectKind::Map, id)
+            .map_err(|source| Error::system("open map by ID", source))?;
+        Self::from_kernel_fd(fd)
+    }
+
+    fn from_kernel_fd(fd: OwnedFd) -> Result<Self> {
         let raw = sys::map_info(fd.as_raw_fd())
-            .map_err(|source| Error::system("read pinned map metadata", source))?;
+            .map_err(|source| Error::system("read map metadata", source))?;
         let name = kernel_name(&raw.name);
         let mut spec = MapSpec::new(
             name,
@@ -511,11 +555,59 @@ impl Map {
             .map_err(|source| Error::system("update map element", source))
     }
 
+    /// Stores a file descriptor in a program, perf-event, cgroup, or map array.
+    pub fn update_fd(&self, key: &[u8], value: impl AsFd, mode: UpdateMode) -> Result<()> {
+        let descriptor = value.as_fd().as_raw_fd().to_ne_bytes();
+        self.update(key, &descriptor, mode)
+    }
+
     /// Deletes a key. Returns whether it existed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
         self.validate_key(key)?;
         sys::map_delete(self.fd.as_raw_fd(), key)
             .map_err(|source| Error::system("delete map element", source))
+    }
+
+    /// Looks up and atomically deletes a key.
+    pub fn lookup_and_delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.validate_key(key)?;
+        let mut value = vec![0; self.storage_value_size()?];
+        let found = sys::map_lookup_and_delete(self.fd.as_raw_fd(), key, &mut value)
+            .map_err(|source| Error::system("look up and delete map element", source))?;
+        Ok(found.then_some(value))
+    }
+
+    /// Pushes a value onto a queue or stack map.
+    pub fn push(&self, value: &[u8], mode: UpdateMode) -> Result<()> {
+        if !matches!(self.spec.map_type, MapType::Queue | MapType::Stack) {
+            return Err(Error::Unsupported(format!(
+                "map `{}` is not a queue or stack",
+                self.name()
+            )));
+        }
+        self.update(&[], value, mode)
+    }
+
+    /// Reads the next queue/stack value without removing it.
+    pub fn peek(&self) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.spec.map_type, MapType::Queue | MapType::Stack) {
+            return Err(Error::Unsupported(format!(
+                "map `{}` is not a queue or stack",
+                self.name()
+            )));
+        }
+        self.lookup(&[])
+    }
+
+    /// Removes and returns the next queue/stack value.
+    pub fn pop(&self) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.spec.map_type, MapType::Queue | MapType::Stack) {
+            return Err(Error::Unsupported(format!(
+                "map `{}` is not a queue or stack",
+                self.name()
+            )));
+        }
+        self.lookup_and_delete(&[])
     }
 
     /// Prevents further updates to this map.
@@ -562,6 +654,158 @@ impl Map {
             previous: None,
             finished: false,
         }
+    }
+
+    /// Looks up up to `maximum_count` entries in one syscall.
+    pub fn lookup_batch(
+        &self,
+        cursor: Option<&BatchCursor>,
+        maximum_count: u32,
+    ) -> Result<MapBatch> {
+        self.lookup_batch_impl(cursor, maximum_count, false)
+    }
+
+    /// Looks up and atomically deletes up to `maximum_count` entries.
+    pub fn lookup_and_delete_batch(
+        &self,
+        cursor: Option<&BatchCursor>,
+        maximum_count: u32,
+    ) -> Result<MapBatch> {
+        self.lookup_batch_impl(cursor, maximum_count, true)
+    }
+
+    /// Updates a group of entries in one syscall.
+    ///
+    /// Returns the number of entries processed by the kernel.
+    pub fn update_batch(&self, entries: &[(&[u8], &[u8])], mode: UpdateMode) -> Result<u32> {
+        let count = u32::try_from(entries.len()).map_err(|_| {
+            Error::InvalidObject("batch contains more than u32::MAX entries".into())
+        })?;
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let key_size = usize::try_from(self.spec.key_size)
+            .map_err(|_| Error::InvalidObject("map key size does not fit usize".into()))?;
+        if key_size == 0 {
+            return Err(Error::Unsupported(
+                "batch update is not defined for keyless maps".into(),
+            ));
+        }
+        let value_size = self.storage_value_size()?;
+        let mut keys = Vec::with_capacity(
+            key_size
+                .checked_mul(entries.len())
+                .ok_or_else(|| Error::InvalidObject("batch key size overflow".into()))?,
+        );
+        let mut values = Vec::with_capacity(
+            value_size
+                .checked_mul(entries.len())
+                .ok_or_else(|| Error::InvalidObject("batch value size overflow".into()))?,
+        );
+        for (key, value) in entries {
+            self.validate_key(key)?;
+            self.validate_value(value)?;
+            keys.extend_from_slice(key);
+            values.extend_from_slice(value);
+        }
+        sys::map_update_batch(self.fd.as_raw_fd(), &keys, &values, count, mode.as_raw())
+            .map_err(|source| Error::system("batch-update map elements", source))
+    }
+
+    /// Deletes a group of keys in one syscall.
+    ///
+    /// Returns the number of keys processed by the kernel.
+    pub fn delete_batch(&self, keys: &[&[u8]]) -> Result<u32> {
+        let count = u32::try_from(keys.len())
+            .map_err(|_| Error::InvalidObject("batch contains more than u32::MAX keys".into()))?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let key_size = usize::try_from(self.spec.key_size)
+            .map_err(|_| Error::InvalidObject("map key size does not fit usize".into()))?;
+        if key_size == 0 {
+            return Err(Error::Unsupported(
+                "batch delete is not defined for keyless maps".into(),
+            ));
+        }
+        let mut flattened = Vec::with_capacity(
+            key_size
+                .checked_mul(keys.len())
+                .ok_or_else(|| Error::InvalidObject("batch key size overflow".into()))?,
+        );
+        for key in keys {
+            self.validate_key(key)?;
+            flattened.extend_from_slice(key);
+        }
+        sys::map_delete_batch(self.fd.as_raw_fd(), &flattened, count)
+            .map_err(|source| Error::system("batch-delete map elements", source))
+    }
+
+    fn lookup_batch_impl(
+        &self,
+        cursor: Option<&BatchCursor>,
+        maximum_count: u32,
+        delete: bool,
+    ) -> Result<MapBatch> {
+        if maximum_count == 0 {
+            return Err(Error::InvalidObject(
+                "batch lookup count cannot be zero".into(),
+            ));
+        }
+        let count = maximum_count as usize;
+        let key_size = usize::try_from(self.spec.key_size)
+            .map_err(|_| Error::InvalidObject("map key size does not fit usize".into()))?;
+        if key_size == 0 {
+            return Err(Error::Unsupported(
+                "batch lookup is not defined for keyless maps".into(),
+            ));
+        }
+        if let Some(cursor) = cursor {
+            if cursor.0.len() != key_size {
+                return Err(Error::SizeMismatch {
+                    what: "batch cursor",
+                    expected: key_size,
+                    actual: cursor.0.len(),
+                });
+            }
+        }
+        let value_size = self.storage_value_size()?;
+        let mut next_cursor = vec![0; key_size];
+        let mut keys =
+            vec![
+                0;
+                key_size
+                    .checked_mul(count)
+                    .ok_or_else(|| Error::InvalidObject("batch key allocation overflow".into()))?
+            ];
+        let mut values = vec![
+            0;
+            value_size.checked_mul(count).ok_or_else(|| {
+                Error::InvalidObject("batch value allocation overflow".into())
+            })?
+        ];
+        let result = sys::map_lookup_batch(&mut sys::BatchLookup {
+            fd: self.fd.as_raw_fd(),
+            cursor: cursor.map(|cursor| cursor.0.as_slice()),
+            next_cursor: &mut next_cursor,
+            keys: &mut keys,
+            values: &mut values,
+            count: maximum_count,
+            delete,
+        })
+        .map_err(|source| Error::system("batch-lookup map elements", source))?;
+        let actual = result.count as usize;
+        keys.truncate(key_size * actual);
+        values.truncate(value_size * actual);
+        let entries = keys
+            .chunks_exact(key_size)
+            .zip(values.chunks_exact(value_size))
+            .map(|(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        Ok(MapBatch {
+            entries,
+            cursor: (!result.done).then_some(BatchCursor(next_cursor)),
+        })
     }
 
     fn validate_key(&self, key: &[u8]) -> Result<()> {
@@ -737,5 +981,15 @@ mod tests {
         assert_eq!(spec.max_entries(), 1024);
         assert!(spec.flags().contains(MapFlags::NUMA_NODE));
         assert_eq!(spec.pinning(), Pinning::ByName);
+    }
+
+    #[test]
+    fn map_batch_exposes_entries_and_completion() {
+        let batch = MapBatch {
+            entries: vec![(vec![1], vec![2])],
+            cursor: None,
+        };
+        assert!(batch.is_last());
+        assert_eq!(batch.entries(), [(vec![1], vec![2])]);
     }
 }

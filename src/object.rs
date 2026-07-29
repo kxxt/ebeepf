@@ -11,7 +11,7 @@ use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfType, Endian};
 use crate::map::{MapFlags, Pinning};
-use crate::program::{ProgramKind, VerifierLog};
+use crate::program::{program_flags_from_section, ProgramKind, VerifierLog};
 use crate::sys::{self, MapCreate};
 use crate::{
     Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType, Result,
@@ -146,7 +146,7 @@ impl Object {
                 kind,
                 instructions,
                 autoload: true,
-                flags: 0,
+                flags: program_flags_from_section(entry_name),
                 kernel_version,
                 attach_btf_id: 0,
                 func_info: Vec::new(),
@@ -300,6 +300,41 @@ impl Object {
         self
     }
 
+    /// Applies pending CO-RE relocations against an explicit target BTF.
+    ///
+    /// This is useful for inspecting or preparing an object for a kernel other
+    /// than the running one. [`Self::load`] performs this automatically against
+    /// `/sys/kernel/btf/vmlinux` when relocations remain.
+    pub fn relocate_for(&mut self, target_btf: &Btf) -> Result<&mut Self> {
+        if self.core_relocations.is_empty() {
+            return Ok(self);
+        }
+        apply_core_relocations(
+            self.btf
+                .as_ref()
+                .ok_or_else(|| Error::InvalidObject("CO-RE records require BTF".into()))?,
+            target_btf,
+            &mut self.programs,
+            &self.core_relocations,
+        )?;
+        self.core_relocations.clear();
+        Ok(self)
+    }
+
+    /// Applies pending CO-RE relocations for the running kernel.
+    pub fn relocate_for_running_kernel(&mut self) -> Result<&mut Self> {
+        if self.core_relocations.is_empty() {
+            return Ok(self);
+        }
+        let kernel_bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+            operation: "read kernel BTF for CO-RE",
+            path: "/sys/kernel/btf/vmlinux".into(),
+            source,
+        })?;
+        let target_btf = Btf::parse(&kernel_bytes)?;
+        self.relocate_for(&target_btf)
+    }
+
     /// Creates maps, applies relocations, and loads programs into the kernel.
     ///
     /// Loading is transactional with respect to process-owned resources: on
@@ -314,14 +349,9 @@ impl Object {
         }
 
         if !self.core_relocations.is_empty() {
-            apply_core_relocations(
-                self.btf
-                    .as_ref()
-                    .ok_or_else(|| Error::InvalidObject("CO-RE records require BTF".into()))?,
-                &mut self.programs,
-                &self.core_relocations,
-            )?;
+            self.relocate_for_running_kernel()?;
         }
+        resolve_attach_btf_ids(&mut self.programs)?;
 
         let btf_fd = self
             .btf
@@ -514,7 +544,17 @@ fn parse_btf(elf: &Elf<'_>, sections: &Sections<'_>) -> Result<Option<Btf>> {
         return Ok(None);
     };
     let data = relocated_metadata_section(elf, sections, index)?;
-    Btf::parse(&data).map(Some)
+    let mut btf = Btf::parse(&data)?;
+    for (section_index, header) in elf.section_headers.iter().enumerate() {
+        let name = sections.name(section_index)?;
+        let size = u32::try_from(header.sh_size).map_err(|_| {
+            Error::InvalidObject(format!(
+                "ELF section `{name}` is too large for a BTF data section"
+            ))
+        })?;
+        btf.set_data_section_size(name, size)?;
+    }
+    Ok(Some(btf))
 }
 
 fn relocated_metadata_section(
@@ -815,7 +855,7 @@ fn add_data_maps(
             continue;
         }
         let suffix = section_name.trim_start_matches('.');
-        let name = format!("{object_name}.{suffix}");
+        let name = format!("{}.{suffix}", sanitize_kernel_name(object_name));
         let mut spec = MapSpec::new(&name, MapType::Array, 4, data.len() as u32, 1);
         spec.flags = MapFlags::MMAPABLE;
         if section_name.starts_with(".rodata") || section_name == ".kconfig" {
@@ -1187,6 +1227,80 @@ fn ensure_map_compatible(spec: &MapSpec, map: &Map) -> Result<()> {
     Ok(())
 }
 
+fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Result<()> {
+    let needs_resolution = programs.values().any(|program| {
+        matches!(
+            program.kind(),
+            ProgramKind::Tracing {
+                attach_type,
+                target,
+            } if !target.is_empty()
+                && !matches!(
+                    attach_type,
+                    crate::AttachType::TraceFunctionEntryMulti
+                        | crate::AttachType::TraceFunctionExitMulti
+                        | crate::AttachType::TraceFunctionSessionMulti
+                )
+                && program.attach_btf_id == 0
+        )
+    });
+    if !needs_resolution {
+        return Ok(());
+    }
+    let bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+        operation: "read kernel BTF for program attachment",
+        path: "/sys/kernel/btf/vmlinux".into(),
+        source,
+    })?;
+    let kernel_btf = Btf::parse(&bytes)?;
+    for program in programs.values_mut() {
+        let ProgramKind::Tracing {
+            attach_type,
+            target,
+        } = program.kind()
+        else {
+            continue;
+        };
+        if target.is_empty()
+            || program.attach_btf_id != 0
+            || matches!(
+                attach_type,
+                crate::AttachType::TraceFunctionEntryMulti
+                    | crate::AttachType::TraceFunctionExitMulti
+                    | crate::AttachType::TraceFunctionSessionMulti
+            )
+        {
+            continue;
+        }
+        let target = if let Some(target) = target.strip_prefix("vmlinux:") {
+            target
+        } else if target.contains(':') {
+            return Err(Error::Unsupported(format!(
+                "module BTF attachment target `{target}` is not yet supported"
+            )));
+        } else {
+            target
+        };
+        let (prefix, kind) = match attach_type {
+            crate::AttachType::TraceRawTracepoint => ("btf_trace_", crate::BtfKind::Typedef),
+            crate::AttachType::LsmMac | crate::AttachType::LsmCgroup => {
+                ("bpf_lsm_", crate::BtfKind::Function)
+            }
+            crate::AttachType::TraceIterator => ("bpf_iter_", crate::BtfKind::Function),
+            _ => ("", crate::BtfKind::Function),
+        };
+        let name = format!("{prefix}{target}");
+        let (id, _) = kernel_btf.find(kind, &name).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "attachment target `{name}` for program `{}` is absent from kernel BTF",
+                program.name
+            ))
+        })?;
+        program.attach_btf_id = id.0;
+    }
+    Ok(())
+}
+
 fn program_symbol_name(elf: &Elf<'_>, section_index: usize) -> Option<String> {
     elf.syms
         .iter()
@@ -1210,6 +1324,18 @@ fn sanitize_name(section: &str) -> String {
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn sanitize_kernel_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '.') {
                 character
             } else {
                 '_'
@@ -1453,20 +1579,15 @@ fn append_core_relocations(
 
 fn apply_core_relocations(
     local_btf: &Btf,
+    target_btf: &Btf,
     programs: &mut BTreeMap<String, ProgramSpec>,
     relocations: &[CoreRelocation],
 ) -> Result<()> {
     if relocations.is_empty() {
         return Ok(());
     }
-    let kernel_bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
-        operation: "read kernel BTF for CO-RE",
-        path: "/sys/kernel/btf/vmlinux".into(),
-        source,
-    })?;
-    let target_btf = Btf::parse(&kernel_bytes)?;
     for relocation in relocations {
-        let value = evaluate_core_relocation(local_btf, &target_btf, relocation)?;
+        let value = evaluate_core_relocation(local_btf, target_btf, relocation)?;
         let program = programs.get_mut(&relocation.program).ok_or_else(|| {
             Error::InvalidObject(format!(
                 "CO-RE relocation references missing program `{}`",
@@ -2166,6 +2287,7 @@ mod tests {
         };
         let u32_name = add_string("u32");
         let u64_name = add_string("u64");
+        let map_definition_name = add_string("map_definition");
         let type_name = add_string("type");
         let max_entries_name = add_string("max_entries");
         let key_name = add_string("key");
@@ -2214,8 +2336,8 @@ mod tests {
         push_u32(&mut types, 0);
         push_u32(&mut types, 2 << 24);
         push_u32(&mut types, 7);
-        // 9: anonymous map definition struct.
-        push_u32(&mut types, 0);
+        // 9: named map definition struct.
+        push_u32(&mut types, map_definition_name);
         push_u32(&mut types, (4 << 24) | 4);
         push_u32(&mut types, 32);
         for (name, ty, offset) in [
@@ -2330,6 +2452,12 @@ mod tests {
     }
 
     #[test]
+    fn sanitizes_object_names_used_by_kernel_data_maps() {
+        assert_eq!(sanitize_kernel_name("my-probe"), "my_probe");
+        assert_eq!(sanitize_kernel_name("already.valid_1"), "already.valid_1");
+    }
+
+    #[test]
     fn nul_termination_is_idempotent() {
         assert_eq!(nul_terminated(b"GPL"), b"GPL\0");
         assert_eq!(nul_terminated(b"GPL\0"), b"GPL\0");
@@ -2381,5 +2509,54 @@ mod tests {
             u32::from_le_bytes(program.func_info[4..8].try_into().unwrap()),
             14
         );
+    }
+
+    #[test]
+    fn evaluates_field_core_relocations_by_member_name() {
+        let object = Object::parse(&btf_object_fixture()).unwrap();
+        let btf = object.btf().unwrap();
+        let relocation = |kind| CoreRelocation {
+            program: "entry".into(),
+            instruction_index: 0,
+            type_id: TypeId(9),
+            access: "0:2".into(),
+            kind,
+        };
+        assert_eq!(
+            evaluate_core_relocation(btf, btf, &relocation(0))
+                .unwrap()
+                .value,
+            16
+        );
+        assert_eq!(
+            evaluate_core_relocation(btf, btf, &relocation(1))
+                .unwrap()
+                .value,
+            8
+        );
+        assert_eq!(
+            evaluate_core_relocation(btf, btf, &relocation(2))
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
+    #[test]
+    fn patches_core_memory_offsets_and_widths() {
+        let mut instructions = [Instruction::new(0x79, 0, 1, 0, 0)];
+        patch_core_instruction(
+            &mut instructions,
+            0,
+            CoreValue {
+                value: 24,
+                local_size: Some(8),
+                target_size: Some(4),
+                poison: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(instructions[0].offset, 24);
+        assert_eq!(instructions[0].code, 0x61);
     }
 }
