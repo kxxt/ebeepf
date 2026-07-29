@@ -643,6 +643,38 @@ impl ProgramSpec {
         self.autoload
     }
 
+    /// BTF ID of the resolved attachment target.
+    ///
+    /// This is populated while loading for BTF tracing, LSM, and iterator
+    /// programs. It is zero before resolution or when the attachment kind does
+    /// not use a single BTF target.
+    pub const fn attach_btf_id(&self) -> u32 {
+        self.attach_btf_id
+    }
+
+    /// Whether [`Program::attach`] can attach this program without additional
+    /// runtime arguments.
+    pub fn auto_attachable(&self) -> bool {
+        match &self.kind {
+            ProgramKind::Kprobe { .. }
+            | ProgramKind::Tracepoint { .. }
+            | ProgramKind::RawTracepoint { .. } => true,
+            ProgramKind::Tracing {
+                attach_type,
+                target,
+            } => {
+                !target.is_empty()
+                    && !matches!(
+                        attach_type,
+                        AttachType::TraceFunctionEntryMulti
+                            | AttachType::TraceFunctionExitMulti
+                            | AttachType::TraceFunctionSessionMulti
+                    )
+            }
+            _ => false,
+        }
+    }
+
     /// Enables or disables automatic loading.
     pub fn set_autoload(&mut self, autoload: bool) -> &mut Self {
         self.autoload = autoload;
@@ -1150,6 +1182,15 @@ impl Program {
             } => self.attach_kprobe(function, 0, *return_probe),
             ProgramKind::Tracepoint { category, event } => self.attach_tracepoint(category, event),
             ProgramKind::RawTracepoint { name, .. } => self.attach_raw_tracepoint(name),
+            ProgramKind::Tracing { attach_type, .. } if self.spec.auto_attachable() => {
+                if self.spec.attach_btf_id == 0 {
+                    return Err(Error::InvalidObject(format!(
+                        "program `{}` has no resolved BTF attachment target",
+                        self.spec.name
+                    )));
+                }
+                self.attach_btf(*attach_type, self.spec.attach_btf_id)
+            }
             _ => Err(Error::Unsupported(format!(
                 "program section `{}` needs attachment arguments",
                 self.spec.section
@@ -1280,6 +1321,31 @@ mod tests {
             ProgramType::Tracing
         );
         assert!(ProgramKind::from_section("made_up/foo").is_err());
+    }
+
+    #[test]
+    fn auto_attachment_requires_no_runtime_target() {
+        let instructions = vec![Instruction::new(0x95, 0, 0, 0, 0)];
+        assert!(
+            ProgramSpec::new("entry", "fentry/do_unlinkat", instructions.clone())
+                .unwrap()
+                .auto_attachable()
+        );
+        assert!(
+            ProgramSpec::new("entry", "tracepoint/sched/sched_switch", instructions.clone())
+                .unwrap()
+                .auto_attachable()
+        );
+        assert!(
+            !ProgramSpec::new("entry", "fentry.multi/do_*", instructions.clone())
+                .unwrap()
+                .auto_attachable()
+        );
+        assert!(
+            !ProgramSpec::new("entry", "xdp", instructions)
+                .unwrap()
+                .auto_attachable()
+        );
     }
 
     #[test]

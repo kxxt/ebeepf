@@ -19,6 +19,7 @@ mod perfbuf;
 mod program;
 pub mod query;
 mod ringbuf;
+pub mod skel;
 mod sys;
 mod user_ringbuf;
 
@@ -37,4 +38,7 @@ pub use crate::program::{
     VerifierLog,
 };
 pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
+pub use crate::skel::{
+    DataSection, DataSectionMut, DataValue, OpenSkeleton, Skeleton, SkeletonBuilder,
+};
 pub use crate::user_ringbuf::{UserRingBuffer, UserRingReservation};

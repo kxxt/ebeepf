@@ -21,6 +21,40 @@ drop((events, link));
 # Ok::<(), ebeepf::Error>(())
 ```
 
+Rust-native skeletons provide named accessors and preserve the same ownership
+model. A build script can compile C and generate a skeleton without libbpf:
+
+```rust,no_run
+use ebeepf::SkeletonBuilder;
+
+SkeletonBuilder::new()
+    .source("src/bpf/tracer.bpf.c")
+    .build_and_generate(
+        std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap())
+            .join("tracer.skel.rs"),
+    )?;
+# Ok::<(), ebeepf::Error>(())
+```
+
+The generated API has explicit builder, open, and loaded stages. Open
+skeletons expose mutable map/program definitions and safe BTF-derived global
+data getters and setters. Loaded skeletons retain automatically created links
+and expose slots for attachments that need runtime arguments:
+
+```rust,ignore
+let mut open = TracerSkelBuilder::new().open()?;
+open.rodata_mut()?.set_target_pid(&std::process::id())?;
+open.programs_mut().optional_probe()?.set_autoload(false);
+
+let mut skel = open.load()?;
+skel.attach()?;
+let events = skel.maps().events()?;
+```
+
+Existing objects can be generated from the command line with
+`ebeepf-skel generate INPUT.bpf.o OUTPUT.rs`. Pass `--reference` to use
+`include_bytes!`; the default output is self-contained.
+
 Loading and attaching eBPF generally requires suitable capabilities. Parsing,
 inspection, and the unit test suite do not require privileges.
 
@@ -36,7 +70,10 @@ The crate currently provides:
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
   socket, perf-event, and BTF-based attachments with RAII link lifetimes;
 - ring-buffer, user-ring-buffer, and perf-buffer consumers/producers without
-  exposing C pointers in the public API.
+  exposing C pointers in the public API;
+- build-script and CLI skeleton generation with named open/loaded
+  map/program accessors, transactional auto-attach, retained links, and safe
+  typed global-data configuration.
 
 The ordinary suite is unprivileged:
 

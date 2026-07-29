@@ -351,6 +351,14 @@ impl MapSpec {
         self.initial_value.as_deref()
     }
 
+    /// Mutably borrows the value written to key zero while loading.
+    ///
+    /// This is primarily useful to configure fields in global data sections
+    /// without copying the entire section.
+    pub fn initial_value_mut(&mut self) -> Option<&mut [u8]> {
+        self.initial_value.as_deref_mut()
+    }
+
     /// Changes the maximum number of entries before loading.
     pub fn set_max_entries(&mut self, max_entries: u32) -> &mut Self {
         self.max_entries = max_entries;

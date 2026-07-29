@@ -89,6 +89,10 @@ pub enum Error {
     /// The requested operation is not supported by this crate or kernel.
     #[error("unsupported eBPF feature: {0}")]
     Unsupported(String),
+
+    /// Compiling an eBPF source or generating a Rust skeleton failed.
+    #[error("eBPF build or skeleton generation failed: {0}")]
+    Build(String),
 }
 
 impl Error {
