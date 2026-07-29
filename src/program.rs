@@ -13,7 +13,7 @@ use crate::link::{AttachType, Link};
 use crate::map::{kernel_name, Map};
 use crate::sys::{self, ProgramLoad};
 use crate::usdt::{UsdtManager, UsdtOptions};
-use crate::{BtfKind, BtfObject, Error, Instruction, Result, TypeId};
+use crate::{BpfToken, BtfKind, BtfObject, Error, Instruction, Result, TypeId};
 
 /// A kernel eBPF program type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -908,7 +908,10 @@ impl ProgramSpec {
                 program.name()
             )));
         }
-        let btf = BtfObject::from_id(btf_id)?;
+        let btf = match program.token.as_ref() {
+            Some(token) => BtfObject::from_id_with_token(btf_id, token)?,
+            None => BtfObject::from_id(btf_id)?,
+        };
         let (function_id, _) = btf.btf().find(BtfKind::Function, function).ok_or_else(|| {
             Error::InvalidObject(format!(
                 "target program `{}` has no BTF function `{function}`",
@@ -1267,6 +1270,7 @@ pub struct Program {
     pub(crate) fd: Arc<OwnedFd>,
     spec: ProgramSpec,
     usdt_manager: Option<Arc<UsdtManager>>,
+    token: Option<BpfToken>,
 }
 
 impl fmt::Debug for Program {
@@ -1276,6 +1280,7 @@ impl fmt::Debug for Program {
             .field("fd", &self.fd.as_raw_fd())
             .field("spec", &self.spec)
             .field("has_usdt_manager", &self.usdt_manager.is_some())
+            .field("has_token", &self.token.is_some())
             .finish()
     }
 }
@@ -1291,9 +1296,11 @@ impl Program {
         spec: ProgramSpec,
         license: &[u8],
         btf_fd: Option<BorrowedFd<'_>>,
+        token: Option<&BpfToken>,
     ) -> Result<Self> {
         spec.validate()?;
         let btf_fd = btf_fd.map(|fd| fd.as_raw_fd());
+        let token_fd = token.map(|token| token.as_fd().as_raw_fd());
         let attach_program_fd = spec
             .attach_program
             .as_ref()
@@ -1327,6 +1334,7 @@ impl Program {
             attach_program_fd,
             log_level: spec.verifier_log.level,
             log_size: spec.verifier_log.capacity,
+            token_fd,
         };
         let fd = sys::program_load(&options).map_err(|(source, log)| Error::Verifier {
             program: spec.name.clone(),
@@ -1337,6 +1345,7 @@ impl Program {
             fd: Arc::new(fd),
             spec,
             usdt_manager: None,
+            token: token.cloned(),
         })
     }
 
@@ -1389,6 +1398,7 @@ impl Program {
             fd: Arc::new(fd),
             spec,
             usdt_manager: None,
+            token: None,
         })
     }
 
@@ -1409,6 +1419,11 @@ impl Program {
     /// Borrows the kernel file descriptor.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// Token retained from this program's delegated load, when present.
+    pub fn token(&self) -> Option<&BpfToken> {
+        self.token.as_ref()
     }
 
     /// Reads current metadata from the kernel.
@@ -1457,6 +1472,32 @@ impl Program {
             path: path.into(),
             source,
         })
+    }
+
+    /// Binds a map to this program so the kernel retains the map lifetime.
+    pub fn bind_map(&self, map: &Map, flags: u32) -> Result<()> {
+        sys::program_bind_map(self.fd.as_raw_fd(), map.as_fd().as_raw_fd(), flags)
+            .map_err(|source| Error::system("bind map to eBPF program", source))
+    }
+
+    /// Associates a non-`struct_ops` program with a `struct_ops` map.
+    ///
+    /// This is used by programs which call struct-ops kfuncs without being a
+    /// callback stored directly in that map.
+    pub fn associate_struct_ops(&self, map: &Map, flags: u32) -> Result<()> {
+        if self.spec.program_type() == ProgramType::StructOps {
+            return Err(Error::InvalidObject(
+                "a struct_ops callback program cannot be separately associated".into(),
+            ));
+        }
+        if map.info()?.map_type != crate::MapType::StructOps {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a struct_ops map",
+                map.name()
+            )));
+        }
+        sys::program_associate_struct_ops(self.fd.as_raw_fd(), map.as_fd().as_raw_fd(), flags)
+            .map_err(|source| Error::system("associate program with struct_ops map", source))
     }
 
     /// Executes the program in the kernel without attaching it.

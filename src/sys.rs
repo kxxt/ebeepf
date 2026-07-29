@@ -51,6 +51,10 @@ const BPF_LINK_GET_FD_BY_ID: u32 = 30;
 const BPF_LINK_GET_NEXT_ID: u32 = 31;
 const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_DETACH: u32 = 34;
+const BPF_PROG_BIND_MAP: u32 = 35;
+const BPF_TOKEN_CREATE: u32 = 36;
+const BPF_PROG_ASSOC_STRUCT_OPS: u32 = 38;
+const BPF_F_TOKEN_FD: u32 = 1 << 16;
 
 const PERF_TYPE_TRACEPOINT: u32 = 2;
 const PERF_TYPE_SOFTWARE: u32 = 1;
@@ -75,6 +79,7 @@ pub(crate) struct MapCreate<'a> {
     pub btf_key_type_id: u32,
     pub btf_value_type_id: u32,
     pub map_extra: u64,
+    pub token_fd: Option<RawFd>,
 }
 
 #[derive(Debug)]
@@ -96,6 +101,7 @@ pub(crate) struct ProgramLoad<'a> {
     pub attach_program_fd: Option<RawFd>,
     pub log_level: u32,
     pub log_size: usize,
+    pub token_fd: Option<RawFd>,
 }
 
 #[repr(C)]
@@ -239,6 +245,15 @@ struct GetIdAttr {
 
 #[repr(C)]
 #[derive(Default)]
+struct GetIdWithTokenAttr {
+    start_id: u32,
+    next_id: u32,
+    open_flags: u32,
+    token_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
 struct BtfLoadAttr {
     btf: u64,
     btf_log_buf: u64,
@@ -246,6 +261,24 @@ struct BtfLoadAttr {
     btf_log_size: u32,
     btf_log_level: u32,
     btf_log_true_size: u32,
+    btf_flags: u32,
+    btf_token_fd: i32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct TokenCreateAttr {
+    flags: u32,
+    bpffs_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct TokenInfoRaw {
+    pub allowed_commands: u64,
+    pub allowed_map_types: u64,
+    pub allowed_program_types: u64,
+    pub allowed_attach_types: u64,
 }
 
 #[repr(C)]
@@ -277,6 +310,14 @@ struct LinkUpdateAttr {
     new_prog_fd: u32,
     flags: u32,
     old_prog_fd: u32,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct ProgramMapAttr {
+    first_fd: u32,
+    second_fd: u32,
+    flags: u32,
 }
 
 #[repr(C)]
@@ -490,18 +531,20 @@ pub(crate) struct BtfInfoRaw {
 }
 
 pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
+    let token_flag = u32::from(options.token_fd.is_some()) * BPF_F_TOKEN_FD;
     let mut attr = MapCreateAttr {
         map_type: options.map_type,
         key_size: options.key_size,
         value_size: options.value_size,
         max_entries: options.max_entries,
-        map_flags: options.flags,
+        map_flags: (options.flags & !BPF_F_TOKEN_FD) | token_flag,
         inner_map_fd: fd_u32(options.inner_map_fd)?,
         numa_node: options.numa_node.unwrap_or_default(),
         btf_fd: fd_u32(options.btf_fd)?,
         btf_key_type_id: options.btf_key_type_id,
         btf_value_type_id: options.btf_value_type_id,
         map_extra: options.map_extra,
+        map_token_fd: options.token_fd.unwrap_or_default(),
         ..Default::default()
     };
     set_object_name(&mut attr.map_name, options.name);
@@ -589,6 +632,7 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             btf_key_type_id: 0,
             btf_value_type_id: 0,
             map_extra: 0,
+            token_fd: None,
         }) {
             Ok(inner) => Some(inner),
             Err(_) => return Ok(false),
@@ -823,6 +867,14 @@ pub(crate) fn map_delete_batch(fd: RawFd, keys: &[u8], count: u32) -> io::Result
 }
 
 pub(crate) fn load_btf(bytes: &[u8], log_size: usize) -> Result<OwnedFd, (io::Error, String)> {
+    load_btf_with_token(bytes, log_size, None)
+}
+
+pub(crate) fn load_btf_with_token(
+    bytes: &[u8],
+    log_size: usize,
+    token_fd: Option<RawFd>,
+) -> Result<OwnedFd, (io::Error, String)> {
     let mut log = vec![0_u8; log_size];
     let attr = BtfLoadAttr {
         btf: pointer(bytes.as_ptr()),
@@ -838,6 +890,8 @@ pub(crate) fn load_btf(bytes: &[u8], log_size: usize) -> Result<OwnedFd, (io::Er
         },
         btf_log_size: u32::try_from(log.len()).unwrap_or(u32::MAX),
         btf_log_level: u32::from(!log.is_empty()),
+        btf_flags: u32::from(token_fd.is_some()) * BPF_F_TOKEN_FD,
+        btf_token_fd: token_fd.unwrap_or_default(),
         ..Default::default()
     };
     command_fd(BPF_BTF_LOAD, &attr).map_err(|error| (error, log_string(&log)))
@@ -854,7 +908,8 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         log_size: u32::try_from(log.len()).unwrap_or(u32::MAX),
         log_buf: mut_slice_pointer(&mut log),
         kern_version: options.kernel_version,
-        prog_flags: options.flags,
+        prog_flags: (options.flags & !BPF_F_TOKEN_FD)
+            | (u32::from(options.token_fd.is_some()) * BPF_F_TOKEN_FD),
         prog_ifindex: options.interface_index,
         expected_attach_type: options.expected_attach_type,
         prog_btf_fd: fd_u32(options.btf_fd).unwrap_or_default(),
@@ -866,6 +921,7 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         line_info_cnt: record_count(options.line_info, options.line_info_record_size),
         attach_btf_id: options.attach_btf_id,
         attach_prog_fd: fd_u32(options.attach_program_fd).unwrap_or_default(),
+        program_token_fd: options.token_fd.unwrap_or_default(),
         ..Default::default()
     };
     set_object_name(&mut attr.prog_name, options.name);
@@ -991,6 +1047,7 @@ fn probe_program_load(
         attach_program_fd: None,
         log_level: u32::from(log),
         log_size: if log { 4096 } else { 0 },
+        token_fd: None,
     })
 }
 
@@ -1054,6 +1111,7 @@ fn probe_bpf_cookie() -> bool {
         attach_program_fd: None,
         log_level: 0,
         log_size: 0,
+        token_fd: None,
     })
     .is_ok()
 }
@@ -1078,6 +1136,10 @@ pub(crate) fn object_get(path: &Path) -> io::Result<OwnedFd> {
 }
 
 pub(crate) fn map_info(fd: RawFd) -> io::Result<MapInfoRaw> {
+    object_info(fd)
+}
+
+pub(crate) fn token_info(fd: RawFd) -> io::Result<TokenInfoRaw> {
     object_info(fd)
 }
 
@@ -1223,6 +1285,17 @@ pub(crate) fn object_get_fd_by_id(kind: ObjectKind, id: u32) -> io::Result<Owned
         command_number,
         &GetIdAttr {
             start_id: id,
+            ..Default::default()
+        },
+    )
+}
+
+pub(crate) fn btf_get_fd_by_id_with_token(id: u32, token_fd: RawFd) -> io::Result<OwnedFd> {
+    command_fd(
+        BPF_BTF_GET_FD_BY_ID,
+        &GetIdWithTokenAttr {
+            start_id: id,
+            token_fd,
             ..Default::default()
         },
     )
@@ -1544,6 +1617,37 @@ pub(crate) fn program_detach(
         ..Default::default()
     };
     command(BPF_PROG_DETACH, &attr).map(drop)
+}
+
+pub(crate) fn program_bind_map(program_fd: RawFd, map_fd: RawFd, flags: u32) -> io::Result<()> {
+    let attr = ProgramMapAttr {
+        first_fd: raw_fd_u32(program_fd)?,
+        second_fd: raw_fd_u32(map_fd)?,
+        flags,
+    };
+    command(BPF_PROG_BIND_MAP, &attr).map(drop)
+}
+
+pub(crate) fn program_associate_struct_ops(
+    program_fd: RawFd,
+    map_fd: RawFd,
+    flags: u32,
+) -> io::Result<()> {
+    // BPF_PROG_ASSOC_STRUCT_OPS orders map_fd before prog_fd.
+    let attr = ProgramMapAttr {
+        first_fd: raw_fd_u32(map_fd)?,
+        second_fd: raw_fd_u32(program_fd)?,
+        flags,
+    };
+    command(BPF_PROG_ASSOC_STRUCT_OPS, &attr).map(drop)
+}
+
+pub(crate) fn token_create(bpffs_fd: RawFd, flags: u32) -> io::Result<OwnedFd> {
+    let attr = TokenCreateAttr {
+        flags,
+        bpffs_fd: raw_fd_u32(bpffs_fd)?,
+    };
+    command_fd(BPF_TOKEN_CREATE, &attr)
 }
 
 pub(crate) fn struct_ops_link_create(map_fd: RawFd) -> io::Result<OwnedFd> {
@@ -1907,9 +2011,12 @@ mod tests {
         assert_eq!(mem::size_of::<MapElementAttr>(), 32);
         assert_eq!(mem::size_of::<MapBatchAttr>(), 56);
         assert_eq!(mem::size_of::<ProgramLoadAttr>(), 168);
-        assert_eq!(mem::size_of::<BtfLoadAttr>(), 32);
+        assert_eq!(mem::size_of::<BtfLoadAttr>(), 40);
+        assert_eq!(mem::size_of::<TokenCreateAttr>(), 8);
+        assert_eq!(mem::size_of::<TokenInfoRaw>(), 32);
         assert_eq!(mem::size_of::<ObjectPathAttr>(), 24);
         assert_eq!(mem::size_of::<GetIdAttr>(), 12);
+        assert_eq!(mem::size_of::<GetIdWithTokenAttr>(), 16);
         assert_eq!(mem::size_of::<ProgramAttachAttr>(), 32);
         assert_eq!(mem::size_of::<ProgramQueryAttr>(), 64);
         assert_eq!(mem::size_of::<LinkCreateAttr>(), 32);
@@ -1917,6 +2024,7 @@ mod tests {
         assert_eq!(mem::size_of::<PerfEventLinkCreateAttr>(), 24);
         assert_eq!(mem::offset_of!(PerfEventLinkCreateAttr, cookie), 16);
         assert_eq!(mem::size_of::<LinkUpdateAttr>(), 16);
+        assert_eq!(mem::size_of::<ProgramMapAttr>(), 12);
         assert_eq!(mem::size_of::<KprobeMultiLinkCreateAttr>(), 48);
         assert_eq!(mem::size_of::<UprobeMultiLinkCreateAttr>(), 64);
         assert_eq!(mem::size_of::<IteratorLinkCreateAttr>(), 32);

@@ -6,7 +6,7 @@ use std::str;
 use std::sync::Arc;
 
 use crate::sys;
-use crate::{Error, Result};
+use crate::{BpfToken, Error, Result};
 
 const BTF_MAGIC: u16 = 0xeb9f;
 const BTF_VERSION: u8 = 1;
@@ -366,6 +366,27 @@ impl Btf {
     /// Reads BTF for the running kernel from sysfs.
     pub fn from_vmlinux() -> Result<Self> {
         Self::from_path("/sys/kernel/btf/vmlinux")
+    }
+
+    /// Loads this BTF table into the kernel.
+    pub fn load(&self) -> Result<BtfObject> {
+        self.load_with_token(None)
+    }
+
+    /// Loads this BTF table using an optional delegated BPF token.
+    pub fn load_with_token(&self, token: Option<&BpfToken>) -> Result<BtfObject> {
+        let token_fd = token.map(|token| token.as_fd().as_raw_fd());
+        let fd = sys::load_btf_with_token(self.as_bytes(), 256 * 1024, token_fd).map_err(
+            |(source, log)| {
+                let details = if log.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{log}")
+                };
+                Error::Btf(format!("kernel rejected BTF: {source}{details}"))
+            },
+        )?;
+        BtfObject::from_fd(fd)
     }
 
     /// Parses a `.BTF` section.
@@ -749,6 +770,13 @@ impl BtfObject {
         Self::from_fd(fd)
     }
 
+    /// Opens and parses a kernel BTF object by ID using a delegated token.
+    pub fn from_id_with_token(id: u32, token: &BpfToken) -> Result<Self> {
+        let fd = sys::btf_get_fd_by_id_with_token(id, token.as_fd().as_raw_fd())
+            .map_err(|source| Error::system("open BTF object by ID with BPF token", source))?;
+        Self::from_fd(fd)
+    }
+
     /// Opens the BTF associated with a loaded eBPF program ID.
     pub fn from_program_id(program_id: u32) -> Result<Self> {
         let program = crate::Program::from_id(program_id)?;
@@ -761,7 +789,7 @@ impl BtfObject {
         Self::from_id(btf_id)
     }
 
-    fn from_fd(fd: OwnedFd) -> Result<Self> {
+    pub(crate) fn from_fd(fd: OwnedFd) -> Result<Self> {
         let (raw, bytes, name) = sys::btf_info(fd.as_fd().as_raw_fd())
             .map_err(|source| Error::system("read BTF object metadata", source))?;
         let name_end = name

@@ -17,8 +17,8 @@ use crate::program::{
 use crate::sys::{self, MapCreate};
 use crate::usdt::UsdtManager;
 use crate::{
-    Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType, Result,
-    TypeId,
+    BpfToken, Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType,
+    Result, TypeId,
 };
 
 const R_BPF_64_64: u32 = 1;
@@ -107,6 +107,7 @@ pub struct Object {
     kfunc_relocations: Vec<KfuncRelocation>,
     pin_root: PathBuf,
     reused_maps: BTreeMap<String, Map>,
+    token: Option<BpfToken>,
 }
 
 impl Object {
@@ -303,6 +304,7 @@ impl Object {
             kfunc_relocations,
             pin_root: "/sys/fs/bpf".into(),
             reused_maps: BTreeMap::new(),
+            token: None,
         })
     }
 
@@ -380,6 +382,23 @@ impl Object {
         self
     }
 
+    /// Uses a delegated BPF token for kernel resource creation during load.
+    pub fn set_token(&mut self, token: &BpfToken) -> &mut Self {
+        self.token = Some(token.clone());
+        self
+    }
+
+    /// Removes the delegated BPF token configured for loading.
+    pub fn clear_token(&mut self) -> &mut Self {
+        self.token = None;
+        self
+    }
+
+    /// Token configured for loading, when present.
+    pub fn token(&self) -> Option<&BpfToken> {
+        self.token.as_ref()
+    }
+
     /// Reuses an already loaded kernel map for a named object definition.
     ///
     /// Compatibility is checked transactionally during [`Self::load`].
@@ -432,6 +451,8 @@ impl Object {
     /// error, all descriptors created so far are closed. Maps pinned by policy
     /// remain pinned, as requested by their definitions.
     pub fn load(mut self) -> Result<LoadedObject> {
+        let token = self.token.clone();
+        let token_fd = token.as_ref().map(|token| token.as_fd().as_raw_fd());
         for map in self.maps.values_mut() {
             if map.map_type == MapType::PerfEventArray && map.max_entries == 0 {
                 map.max_entries = u32::try_from(possible_cpu_count()?).map_err(|_| {
@@ -462,7 +483,7 @@ impl Object {
             })
             .transpose()?;
         let btf_fd = match kernel_btf.as_ref() {
-            Some(btf) => match sys::load_btf(btf.as_bytes(), 256 * 1024) {
+            Some(btf) => match sys::load_btf_with_token(btf.as_bytes(), 256 * 1024, token_fd) {
                 Ok(fd) => Some(fd),
                 Err(_) if !self.kfunc_relocations.is_empty() => None,
                 Err((source, log)) => {
@@ -479,6 +500,7 @@ impl Object {
             &self.reused_maps,
             btf_fd.as_ref(),
             &self.pin_root,
+            token_fd,
         )?;
         relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
         let usdt_manager = UsdtManager::from_maps(&maps, self.btf.as_ref())?;
@@ -488,8 +510,12 @@ impl Object {
             if !spec.autoload {
                 continue;
             }
-            let mut program =
-                Program::load(spec, &self.license, btf_fd.as_ref().map(OwnedFd::as_fd))?;
+            let mut program = Program::load(
+                spec,
+                &self.license,
+                btf_fd.as_ref().map(OwnedFd::as_fd),
+                token.as_ref(),
+            )?;
             program.set_usdt_manager(usdt_manager.clone());
             programs.insert(name, program);
         }
@@ -500,6 +526,7 @@ impl Object {
             btf_fd,
             maps,
             programs,
+            token,
         })
     }
 }
@@ -513,6 +540,7 @@ pub struct LoadedObject {
     btf_fd: Option<OwnedFd>,
     maps: BTreeMap<String, Map>,
     programs: BTreeMap<String, Program>,
+    token: Option<BpfToken>,
 }
 
 impl LoadedObject {
@@ -529,6 +557,11 @@ impl LoadedObject {
     /// Whether object BTF was loaded in the kernel.
     pub fn has_kernel_btf(&self) -> bool {
         self.btf_fd.is_some()
+    }
+
+    /// Token retained from this object's delegated load, when present.
+    pub fn token(&self) -> Option<&BpfToken> {
+        self.token.as_ref()
     }
 
     /// Iterates over loaded maps.
@@ -1614,6 +1647,7 @@ fn load_maps(
     reused: &BTreeMap<String, Map>,
     btf_fd: Option<&OwnedFd>,
     pin_root: &Path,
+    token_fd: Option<i32>,
 ) -> Result<BTreeMap<String, Map>> {
     let mut loaded = BTreeMap::new();
     let mut pending = specs.keys().cloned().collect::<HashSet<_>>();
@@ -1673,6 +1707,7 @@ fn load_maps(
                         btf_key_type_id: if with_btf { spec.btf_key_type.0 } else { 0 },
                         btf_value_type_id: if with_btf { spec.btf_value_type.0 } else { 0 },
                         map_extra: spec.map_extra,
+                        token_fd,
                     })
                 };
                 let with_btf = accepts_btf

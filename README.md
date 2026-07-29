@@ -58,6 +58,25 @@ Existing objects can be generated from the command line with
 Loading and attaching eBPF generally requires suitable capabilities. Parsing,
 inspection, and the unit test suite do not require privileges.
 
+On kernels with BPF token delegation, the same staged load works without
+process-wide BPF privileges:
+
+```rust,no_run
+use ebeepf::{BpfToken, Object};
+
+let token = BpfToken::create_from_bpffs("/run/ebeepf-delegation")?;
+let mut object = Object::open("tracer.bpf.o")?;
+object.set_token(&token);
+let loaded = object.load()?;
+assert!(loaded.token().is_some());
+# Ok::<(), ebeepf::Error>(())
+```
+
+The token applies to object BTF, map, and program creation and remains
+available to loaded programs for later token-authorized BTF target resolution.
+Standalone maps use `MapCreateOptions::token`, while
+`Btf::load_with_token` covers standalone BTF.
+
 ## Status
 
 The crate currently provides:
@@ -69,6 +88,8 @@ The crate currently provides:
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, type-accurate map/program/helper capability probes, map CRUD and
   batch operations, and per-CPU values;
+- delegated BPF tokens across BTF, map, and program loading, including token
+  capability metadata and retained authorization for later BTF lookup;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with

@@ -1,15 +1,25 @@
 //! Privileged end-to-end coverage for the loader's kernel UAPI boundary.
 
 use std::env;
+use std::ffi::CString;
+use std::fs;
+use std::io::{self, IoSlice, IoSliceMut};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::net::UnixDatagram;
 use std::path::Path;
 use std::process::{self, Command};
+use std::ptr;
 use std::time::Duration;
 
 use ebeepf::{
-    AttachType, BtfObject, HelperId, Instruction, LinkType, MapType, Object, ProgramType,
-    RingBuffer, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions,
-    Xdp, XdpAttachOptions, XdpFlags,
+    AttachType, BpfToken, Btf, BtfObject, HelperId, Instruction, LinkType, Map, MapCreateOptions,
+    MapSpec, MapType, Object, ProgramType, RingBuffer, TcAttachOptions, TcAttachPoint, TcHook,
+    TestRunOptions, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
 };
+use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg, FdFlag};
+use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags};
 use object::write::{Object as WriteObject, Symbol, SymbolSection};
 use object::{
     Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
@@ -24,6 +34,14 @@ fn instruction_bytes(instructions: &[Instruction]) -> Vec<u8> {
 }
 
 fn loadable_object() -> Vec<u8> {
+    make_loadable_object(false)
+}
+
+fn loadable_object_with_btf() -> Vec<u8> {
+    make_loadable_object(true)
+}
+
+fn make_loadable_object(include_btf: bool) -> Vec<u8> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
 
     let program = object.add_section(Vec::new(), b"socket".to_vec(), SectionKind::Text);
@@ -78,6 +96,11 @@ fn loadable_object() -> Vec<u8> {
         section: SymbolSection::Section(maps),
         flags: SymbolFlags::None,
     });
+
+    if include_btf {
+        let btf = object.add_section(Vec::new(), b".BTF".to_vec(), SectionKind::Debug);
+        object.append_section_data(btf, &minimal_btf(), 4);
+    }
 
     let license = object.add_section(Vec::new(), b"license".to_vec(), SectionKind::Data);
     object.append_section_data(license, b"GPL\0", 1);
@@ -165,6 +188,230 @@ fn compile_bpf(source: &Path, output: &Path) {
     );
 }
 
+fn minimal_btf() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend(0xeb9f_u16.to_le_bytes());
+    bytes.extend([1, 0]); // version, flags
+    bytes.extend(24_u32.to_le_bytes()); // header length
+    bytes.extend(0_u32.to_le_bytes()); // type offset
+    bytes.extend(16_u32.to_le_bytes()); // type length
+    bytes.extend(16_u32.to_le_bytes()); // string offset
+    bytes.extend(5_u32.to_le_bytes()); // string length
+    bytes.extend(1_u32.to_le_bytes()); // type name offset
+    bytes.extend((1_u32 << 24).to_le_bytes()); // BTF_KIND_INT
+    bytes.extend(4_u32.to_le_bytes()); // byte size
+    bytes.extend(32_u32.to_le_bytes()); // bit width
+    bytes.extend(b"\0int\0");
+    bytes
+}
+
+#[test]
+#[ignore = "requires root and a kernel with BPF token delegation"]
+fn creates_resources_with_a_delegated_bpf_token() {
+    const TOKEN_SOCKET: &str = "EBEEPF_TEST_TOKEN_SOCKET";
+    if let Ok(socket_fd) = env::var(TOKEN_SOCKET) {
+        delegated_token_child(socket_fd.parse().unwrap());
+        return;
+    }
+
+    let (parent_socket, child_socket) = UnixDatagram::pair().unwrap();
+    parent_socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    fcntl(child_socket.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+    let child_directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(child_directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let child_executable = child_directory.path().join("kernel-smoke");
+    fs::copy(env::current_exe().unwrap(), &child_executable).unwrap();
+    fs::set_permissions(&child_executable, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut child = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "--fork", "--"])
+        .arg(child_executable)
+        .args([
+            "--ignored",
+            "--exact",
+            "creates_resources_with_a_delegated_bpf_token",
+            "--nocapture",
+        ])
+        .env(TOKEN_SOCKET, child_socket.as_raw_fd().to_string())
+        .spawn()
+        .unwrap();
+    drop(child_socket);
+
+    let fs_context = receive_fd(&parent_socket).unwrap();
+    for (key, value) in [
+        ("delegate_cmds", "any"),
+        ("delegate_maps", "any"),
+        ("delegate_progs", "any"),
+        ("delegate_attachs", "any"),
+    ] {
+        configure_bpffs(&fs_context, key, value).unwrap();
+    }
+    create_bpffs(&fs_context).unwrap();
+    parent_socket.send(&[1]).unwrap();
+
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "unprivileged delegated-token child failed"
+    );
+}
+
+fn delegated_token_child(socket_fd: RawFd) {
+    // SAFETY: the parent deliberately preserved this Unix datagram descriptor
+    // across exec and transferred its sole ownership to this child process.
+    let socket = unsafe { UnixDatagram::from_raw_fd(socket_fd) };
+    let fs_context = fsopen_bpffs().unwrap();
+    send_fd(&socket, fs_context.as_raw_fd()).unwrap();
+    let mut ready = [0_u8; 1];
+    socket.recv(&mut ready).unwrap();
+
+    let mount = fsmount(&fs_context).unwrap();
+    let dot = CString::new(".").unwrap();
+    // SAFETY: `mount` is a live detached-mount descriptor and `dot` is a
+    // terminated path. On success, openat returns a newly owned descriptor.
+    let bpffs_fd = unsafe {
+        libc::openat(
+            mount.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    let bpffs = owned_syscall_fd(bpffs_fd.into()).unwrap();
+    let token = BpfToken::create(&bpffs).unwrap();
+    exercise_delegated_bpf_token(token);
+}
+
+fn exercise_delegated_bpf_token(token: BpfToken) {
+    let info = token.info().unwrap();
+    assert!(info.allows_map_type(MapType::Array));
+    assert!(info.allows_program_type(ProgramType::SocketFilter));
+
+    let map = Map::create_with_options(
+        MapSpec::new("token_map", MapType::Array, 4, 8, 1),
+        MapCreateOptions::default().token(&token),
+    )
+    .unwrap();
+    assert_eq!(map.info().unwrap().map_type, MapType::Array);
+
+    let btf = Btf::parse(&minimal_btf()).unwrap();
+    let kernel_btf = btf.load_with_token(Some(&token)).unwrap();
+    assert!(kernel_btf.info().id > 0);
+
+    let mut object = Object::parse_named("token-smoke", &loadable_object_with_btf()).unwrap();
+    object.set_token(&token);
+    let loaded = object.load().unwrap();
+    assert!(loaded.has_kernel_btf());
+    assert!(loaded.token().is_some());
+    assert!(loaded.program("drop_packet").unwrap().token().is_some());
+    assert_eq!(
+        loaded.program("drop_packet").unwrap().info().unwrap().name,
+        "drop_packet"
+    );
+}
+
+fn fsopen_bpffs() -> io::Result<OwnedFd> {
+    let filesystem = CString::new("bpf").unwrap();
+    // SAFETY: fsopen reads a terminated filesystem name and has no other
+    // pointer arguments.
+    let fd = unsafe { libc::syscall(libc::SYS_fsopen, filesystem.as_ptr(), 0) };
+    owned_syscall_fd(fd)
+}
+
+fn configure_bpffs(fs_context: &OwnedFd, key: &str, value: &str) -> io::Result<()> {
+    let key = CString::new(key).unwrap();
+    let value = CString::new(value).unwrap();
+    // SAFETY: both strings are terminated and remain live for the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fsconfig,
+            fs_context.as_raw_fd(),
+            1, // FSCONFIG_SET_STRING
+            key.as_ptr(),
+            value.as_ptr(),
+            0,
+        )
+    };
+    syscall_unit(result)
+}
+
+fn create_bpffs(fs_context: &OwnedFd) -> io::Result<()> {
+    // SAFETY: FSCONFIG_CMD_CREATE has no string arguments.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_fsconfig,
+            fs_context.as_raw_fd(),
+            6, // FSCONFIG_CMD_CREATE
+            ptr::null::<libc::c_char>(),
+            ptr::null::<libc::c_char>(),
+            0,
+        )
+    };
+    syscall_unit(result)
+}
+
+fn fsmount(fs_context: &OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: fsmount has only integer arguments.
+    let fd = unsafe { libc::syscall(libc::SYS_fsmount, fs_context.as_raw_fd(), 0, 0) };
+    owned_syscall_fd(fd)
+}
+
+fn owned_syscall_fd(fd: libc::c_long) -> io::Result<OwnedFd> {
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        let fd = i32::try_from(fd)
+            .map_err(|_| io::Error::other("kernel returned a descriptor larger than i32"))?;
+        // SAFETY: successful descriptor-returning syscalls transfer one live
+        // descriptor to the caller.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn syscall_unit(result: libc::c_long) -> io::Result<()> {
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn send_fd(socket: &UnixDatagram, fd: RawFd) -> nix::Result<()> {
+    let data = [0_u8];
+    let io = [IoSlice::new(&data)];
+    let descriptors = [fd];
+    sendmsg::<()>(
+        socket.as_raw_fd(),
+        &io,
+        &[ControlMessage::ScmRights(&descriptors)],
+        MsgFlags::empty(),
+        None,
+    )
+    .map(drop)
+}
+
+fn receive_fd(socket: &UnixDatagram) -> nix::Result<OwnedFd> {
+    let mut data = [0_u8];
+    let mut io = [IoSliceMut::new(&mut data)];
+    let mut control = nix::cmsg_space!([RawFd; 1]);
+    let message = recvmsg::<()>(
+        socket.as_raw_fd(),
+        &mut io,
+        Some(&mut control),
+        MsgFlags::empty(),
+    )?;
+    for control in message.cmsgs() {
+        if let ControlMessageOwned::ScmRights(descriptors) = control {
+            if let Some(fd) = descriptors.into_iter().next() {
+                // SAFETY: SCM_RIGHTS creates a new descriptor owned by the
+                // receiving process.
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+    Err(Errno::EBADMSG)
+}
+
 #[test]
 #[ignore = "requires root or CAP_BPF and a kernel with eBPF enabled"]
 fn loads_program_and_exercises_map_crud() {
@@ -199,10 +446,9 @@ fn loads_program_and_exercises_map_crud() {
     map.update(&key, &value, UpdateMode::Any).unwrap();
     assert_eq!(map.lookup(&key).unwrap().as_deref(), Some(value.as_slice()));
     assert_eq!(map.info().unwrap().value_size, 8);
-    assert_eq!(
-        loaded.program("drop_packet").unwrap().info().unwrap().name,
-        "drop_packet"
-    );
+    let drop_packet = loaded.program("drop_packet").unwrap();
+    assert_eq!(drop_packet.info().unwrap().name, "drop_packet");
+    drop_packet.bind_map(map, 0).unwrap();
     let link = loaded
         .program("track_switch")
         .unwrap()

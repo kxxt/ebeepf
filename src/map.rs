@@ -7,7 +7,7 @@ use std::sync::Arc;
 use bitflags::bitflags;
 
 use crate::sys;
-use crate::{Error, Link, Result, TypeId};
+use crate::{BpfToken, Error, Link, Result, TypeId};
 
 bitflags! {
     /// Flags controlling map creation and access.
@@ -585,6 +585,27 @@ pub struct MapBatch {
     cursor: Option<BatchCursor>,
 }
 
+/// Borrowed resources used while creating a standalone map.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MapCreateOptions<'a> {
+    inner_map: Option<&'a Map>,
+    token: Option<&'a BpfToken>,
+}
+
+impl<'a> MapCreateOptions<'a> {
+    /// Uses `map` as the kernel template for a map-in-map definition.
+    pub const fn inner_map(mut self, map: &'a Map) -> Self {
+        self.inner_map = Some(map);
+        self
+    }
+
+    /// Uses a delegated BPF token for map creation.
+    pub const fn token(mut self, token: &'a BpfToken) -> Self {
+        self.token = Some(token);
+        self
+    }
+}
+
 impl MapBatch {
     /// Key/value pairs returned by the kernel.
     pub fn entries(&self) -> &[(Vec<u8>, Vec<u8>)] {
@@ -642,7 +663,7 @@ impl Map {
     ///
     /// Map-in-map definitions must use [`Self::create_with_inner`].
     pub fn create(spec: MapSpec) -> Result<Self> {
-        Self::create_impl(spec, None)
+        Self::create_with_options(spec, MapCreateOptions::default())
     }
 
     /// Creates a standalone map-in-map using `inner` as its template.
@@ -650,10 +671,15 @@ impl Map {
         if spec.inner_map.is_none() {
             spec.inner_map = Some(inner.name().into());
         }
-        Self::create_impl(spec, Some(inner))
+        Self::create_with_options(spec, MapCreateOptions::default().inner_map(inner))
     }
 
-    fn create_impl(mut spec: MapSpec, inner: Option<&Self>) -> Result<Self> {
+    /// Creates a standalone map with borrowed creation resources.
+    ///
+    /// This combines an inner-map template and a delegated BPF token without
+    /// transferring ownership of either descriptor.
+    pub fn create_with_options(mut spec: MapSpec, options: MapCreateOptions<'_>) -> Result<Self> {
+        let inner = options.inner_map;
         if spec.map_type.is_map_of_maps() != inner.is_some() {
             return Err(Error::InvalidObject(format!(
                 "map `{}` {} an inner-map template",
@@ -688,6 +714,7 @@ impl Map {
             btf_key_type_id: 0,
             btf_value_type_id: 0,
             map_extra: spec.map_extra,
+            token_fd: options.token.map(|token| token.as_fd().as_raw_fd()),
         })
         .map_err(|source| Error::MapCreate {
             map: spec.name.clone(),
