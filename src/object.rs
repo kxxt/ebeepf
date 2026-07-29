@@ -2649,13 +2649,12 @@ fn apply_program_relocations(
 
                     let (map, value_offset) = if let Some(map) = data_sections.get(&target_section)
                     {
-                        let addend = relocation.r_addend.unwrap_or_default();
                         let embedded = instructions
-                            .get(instruction_index + 1)
+                            .get(instruction_index)
                             .map(|instruction| i64::from(instruction.immediate))
                             .unwrap_or_default();
-                        let offset =
-                            i128::from(symbol.st_value) + i128::from(addend) + i128::from(embedded);
+                        let addend = relocation.r_addend.unwrap_or(embedded);
+                        let offset = i128::from(symbol.st_value) + i128::from(addend);
                         let offset = u32::try_from(offset).map_err(|_| {
                             Error::InvalidObject("data relocation offset does not fit u32".into())
                         })?;
@@ -2663,14 +2662,12 @@ fn apply_program_relocations(
                     } else {
                         let name = symbol_name(elf, &symbol)?;
                         if let Some((map, base_offset)) = extern_data.get(name) {
-                            let addend = relocation.r_addend.unwrap_or_default();
                             let embedded = instructions
-                                .get(instruction_index + 1)
+                                .get(instruction_index)
                                 .map(|instruction| i64::from(instruction.immediate))
                                 .unwrap_or_default();
-                            let offset = i128::from(*base_offset)
-                                + i128::from(addend)
-                                + i128::from(embedded);
+                            let addend = relocation.r_addend.unwrap_or(embedded);
+                            let offset = i128::from(*base_offset) + i128::from(addend);
                             let offset = u32::try_from(offset).map_err(|_| {
                                 Error::InvalidObject(
                                     "extern data relocation offset does not fit u32".into(),
@@ -5328,6 +5325,22 @@ mod tests {
             ]
             .concat()
         );
+    }
+
+    #[test]
+    fn resolves_rel_data_section_addends_from_ldimm64() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/stream.bpf.o");
+        if !path.exists() {
+            return;
+        }
+        let object = Object::open(path).unwrap();
+        let offsets = object
+            .map_relocations
+            .iter()
+            .filter_map(|relocation| relocation.value_offset)
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [0, 7]);
     }
 
     #[test]

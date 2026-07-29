@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, IoSlice, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut, Read as _};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixDatagram;
@@ -369,6 +369,21 @@ fn creates_and_populates_llvm_instruction_arrays() {
 
     let output = program.test_run(TestRunOptions::new(&[0_u8; 64])).unwrap();
     assert_eq!(output.return_value, 55);
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF and a kernel with BPF program streams"]
+fn reads_program_output_streams() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/stream.bpf.o");
+    let loaded = Object::open(fixture).unwrap().load().unwrap();
+    let program = loaded.program("trigger_streams").unwrap();
+    program.test_run(TestRunOptions::new(&[])).unwrap();
+
+    let mut output = [0_u8; 64];
+    let count = program.stdout().read(&mut output).unwrap();
+    assert_eq!(&output[..count], b"stdout");
+    let count = program.stderr().read(&mut output).unwrap();
+    assert_eq!(&output[..count], b"stderr");
 }
 
 #[test]

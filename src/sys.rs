@@ -53,6 +53,7 @@ const BPF_ITER_CREATE: u32 = 33;
 const BPF_LINK_DETACH: u32 = 34;
 const BPF_PROG_BIND_MAP: u32 = 35;
 const BPF_TOKEN_CREATE: u32 = 36;
+const BPF_PROG_STREAM_READ_BY_FD: u32 = 37;
 const BPF_PROG_ASSOC_STRUCT_OPS: u32 = 38;
 const BPF_F_TOKEN_FD: u32 = 1 << 16;
 
@@ -323,6 +324,17 @@ struct ProgramMapAttr {
     second_fd: u32,
     flags: u32,
 }
+
+#[repr(C)]
+#[derive(Default)]
+struct ProgramStreamReadAttr {
+    buffer: u64,
+    buffer_length: u32,
+    stream_id: u32,
+    program_fd: u32,
+}
+
+const PROGRAM_STREAM_READ_ATTR_SIZE: usize = 20;
 
 #[repr(C)]
 #[derive(Default)]
@@ -1772,6 +1784,29 @@ pub(crate) fn program_associate_struct_ops(
     command(BPF_PROG_ASSOC_STRUCT_OPS, &attr).map(drop)
 }
 
+pub(crate) fn program_stream_read(
+    program_fd: RawFd,
+    stream_id: u32,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    if buffer.is_empty() {
+        return Ok(0);
+    }
+    let attr = ProgramStreamReadAttr {
+        buffer: mut_slice_pointer(buffer),
+        buffer_length: u32_len(buffer.len(), "program stream read buffer")?,
+        stream_id,
+        program_fd: raw_fd_u32(program_fd)?,
+    };
+    let read = command_sized(
+        BPF_PROG_STREAM_READ_BY_FD,
+        &attr,
+        PROGRAM_STREAM_READ_ATTR_SIZE,
+    )?;
+    usize::try_from(read)
+        .map_err(|_| io::Error::other("BPF program stream returned an invalid byte count"))
+}
+
 pub(crate) fn token_create(bpffs_fd: RawFd, flags: u32) -> io::Result<OwnedFd> {
     let attr = TokenCreateAttr {
         flags,
@@ -2179,6 +2214,8 @@ mod tests {
         assert_eq!(mem::offset_of!(PerfEventLinkCreateAttr, cookie), 16);
         assert_eq!(mem::size_of::<LinkUpdateAttr>(), 16);
         assert_eq!(mem::size_of::<ProgramMapAttr>(), 12);
+        assert_eq!(mem::size_of::<ProgramStreamReadAttr>(), 24);
+        assert_eq!(PROGRAM_STREAM_READ_ATTR_SIZE, 20);
         assert_eq!(mem::size_of::<KprobeMultiLinkCreateAttr>(), 48);
         assert_eq!(mem::size_of::<TracingMultiLinkCreateAttr>(), 40);
         assert_eq!(mem::size_of::<UprobeMultiLinkCreateAttr>(), 64);

@@ -1302,14 +1302,15 @@ impl<'data> TestRunOptions<'data> {
     /// Creates options with the supplied packet/input data.
     ///
     /// The default output capacity is the input length, and the program runs
-    /// once on an arbitrary CPU.
+    /// once on an arbitrary CPU. The kernel represents a single run as a zero
+    /// repeat count, which is also required by some program types.
     pub fn new(data: &'data [u8]) -> Self {
         Self {
             data,
             context: &[],
             data_output_size: data.len(),
             context_output_size: 0,
-            repeat: 1,
+            repeat: 0,
             cpu: None,
         }
     }
@@ -1327,9 +1328,11 @@ impl<'data> TestRunOptions<'data> {
         self
     }
 
-    /// Runs the program repeatedly; the kernel reports average duration.
+    /// Runs the program repeatedly; zero requests one run.
+    ///
+    /// The kernel reports average duration when this is greater than one.
     pub fn repeat(mut self, repeat: u32) -> Self {
-        self.repeat = repeat.max(1);
+        self.repeat = repeat;
         self
     }
 
@@ -1351,6 +1354,22 @@ pub struct TestRunOutput {
     pub data: Vec<u8>,
     /// Program-specific output context.
     pub context: Vec<u8>,
+}
+
+/// A readable character stream emitted by a loaded eBPF program.
+///
+/// This borrows the program descriptor and implements [`io::Read`], so it can
+/// be used with the standard buffered-I/O adapters.
+#[derive(Debug)]
+pub struct ProgramStream<'program> {
+    fd: BorrowedFd<'program>,
+    stream_id: u32,
+}
+
+impl io::Read for ProgramStream<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        sys::program_stream_read(self.fd.as_raw_fd(), self.stream_id, buffer)
+    }
 }
 
 /// An owned reference to a program loaded in the kernel.
@@ -1533,6 +1552,24 @@ impl Program {
     /// Token retained from this program's delegated load, when present.
     pub fn token(&self) -> Option<&BpfToken> {
         self.token.as_ref()
+    }
+
+    /// Borrows a numbered output stream from this program.
+    pub fn stream(&self, stream_id: u32) -> ProgramStream<'_> {
+        ProgramStream {
+            fd: self.as_fd(),
+            stream_id,
+        }
+    }
+
+    /// Borrows this program's standard-output stream.
+    pub fn stdout(&self) -> ProgramStream<'_> {
+        self.stream(1)
+    }
+
+    /// Borrows this program's standard-error stream.
+    pub fn stderr(&self) -> ProgramStream<'_> {
+        self.stream(2)
     }
 
     /// Reads current metadata from the kernel.
@@ -2506,7 +2543,7 @@ mod tests {
     }
 
     #[test]
-    fn test_run_options_are_fluent_and_never_repeat_zero_times() {
+    fn test_run_options_preserve_kernel_repeat_semantics() {
         let context = [1, 2, 3, 4];
         let options = TestRunOptions::new(&[5, 6])
             .with_output_size(32)
@@ -2515,7 +2552,7 @@ mod tests {
             .on_cpu(3);
         assert_eq!(options.data_output_size, 32);
         assert_eq!(options.context_output_size, 16);
-        assert_eq!(options.repeat, 1);
+        assert_eq!(options.repeat, 0);
         assert_eq!(options.cpu, Some(3));
     }
 
