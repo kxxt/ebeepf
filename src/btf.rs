@@ -898,6 +898,50 @@ impl BtfObject {
         }
     }
 
+    /// Opens every visible loaded kernel module split-BTF object.
+    ///
+    /// The returned objects own their kernel descriptors and are parsed
+    /// against the running kernel's vmlinux BTF.
+    pub fn kernel_modules() -> Result<Vec<Self>> {
+        Self::kernel_modules_with_optional_token(None)
+    }
+
+    /// Opens every visible module BTF object using a delegated BPF token.
+    pub fn kernel_modules_with_token(token: &BpfToken) -> Result<Vec<Self>> {
+        Self::kernel_modules_with_optional_token(Some(token))
+    }
+
+    fn kernel_modules_with_optional_token(token: Option<&BpfToken>) -> Result<Vec<Self>> {
+        let base = Btf::from_vmlinux()?;
+        let mut modules = Vec::new();
+        let mut id = 0;
+        loop {
+            let Some(next_id) = sys::next_id(sys::ObjectKind::Btf, id)
+                .map_err(|source| Error::system("enumerate kernel BTF objects", source))?
+            else {
+                return Ok(modules);
+            };
+            id = next_id;
+            let fd = match token {
+                Some(token) => sys::btf_get_fd_by_id_with_token(id, token.as_fd().as_raw_fd()),
+                None => sys::object_get_fd_by_id(sys::ObjectKind::Btf, id),
+            };
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(source) if source.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(source) => {
+                    return Err(Error::system("open kernel BTF object", source));
+                }
+            };
+            let (raw, encoded_name) = sys::btf_metadata(fd.as_raw_fd())
+                .map_err(|source| Error::system("read kernel BTF metadata", source))?;
+            let name = kernel_btf_name(&encoded_name);
+            if raw.kernel_btf != 0 && !name.is_empty() && name != "vmlinux" {
+                modules.push(Self::from_split_fd(fd, &base)?);
+            }
+        }
+    }
+
     /// Opens the BTF associated with a loaded eBPF program ID.
     pub fn from_program_id(program_id: u32) -> Result<Self> {
         let program = crate::Program::from_id(program_id)?;

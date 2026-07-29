@@ -102,6 +102,7 @@ pub(crate) struct ProgramLoad<'a> {
     pub attach_btf_id: u32,
     pub attach_program_fd: Option<RawFd>,
     pub attach_btf_object_fd: Option<RawFd>,
+    pub fd_array: &'a [RawFd],
     pub log_level: u32,
     pub log_size: usize,
     pub token_fd: Option<RawFd>,
@@ -930,6 +931,15 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
             String::new(),
         ));
     }
+    if options.fd_array.iter().any(|fd| *fd < 0) {
+        return Err((
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program FD array contains a negative descriptor",
+            ),
+            String::new(),
+        ));
+    }
     let mut log = vec![0_u8; options.log_size];
     let mut attr = ProgramLoadAttr {
         prog_type: options.program_type,
@@ -954,7 +964,12 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         attach_btf_id: options.attach_btf_id,
         attach_prog_fd: fd_u32(options.attach_program_fd.or(options.attach_btf_object_fd))
             .unwrap_or_default(),
+        fd_array: slice_pointer(options.fd_array),
         program_token_fd: options.token_fd.unwrap_or_default(),
+        // The kfunc array is sparse because index zero denotes vmlinux and is
+        // not a descriptor. A nonzero count asks the kernel to bind every
+        // element and would therefore reject that reserved zero slot.
+        fd_array_count: 0,
         ..Default::default()
     };
     set_object_name(&mut attr.prog_name, options.name);
@@ -1079,6 +1094,7 @@ fn probe_program_load(
         attach_btf_id: config.attach_btf_id,
         attach_program_fd: None,
         attach_btf_object_fd: None,
+        fd_array: &[],
         log_level: u32::from(log),
         log_size: if log { 4096 } else { 0 },
         token_fd: None,
@@ -1144,6 +1160,7 @@ fn probe_bpf_cookie() -> bool {
         attach_btf_id: 0,
         attach_program_fd: None,
         attach_btf_object_fd: None,
+        fd_array: &[],
         log_level: 0,
         log_size: 0,
         token_fd: None,

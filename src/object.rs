@@ -18,8 +18,8 @@ use crate::program::{
 use crate::sys::{self, MapCreate};
 use crate::usdt::UsdtManager;
 use crate::{
-    BpfToken, Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType,
-    Result, TypeId,
+    BpfToken, Btf, BtfObject, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec,
+    ProgramType, Result, TypeId,
 };
 
 const R_BPF_64_64: u32 = 1;
@@ -260,6 +260,7 @@ impl Object {
                 attach_btf_id: 0,
                 attach_program: None,
                 attach_btf_object: None,
+                kfunc_btf_objects: Vec::new(),
                 func_info: Vec::new(),
                 func_info_record_size: 0,
                 line_info: Vec::new(),
@@ -503,7 +504,7 @@ impl Object {
             &mut self.programs,
             &mut self.struct_ops,
         )?;
-        resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations)?;
+        resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations, token.as_ref())?;
         resolve_attach_btf_ids(&mut self.programs, token.as_ref())?;
 
         let kernel_btf = self
@@ -2521,6 +2522,7 @@ fn resolve_attach_btf_ids(
 fn resolve_kfunc_relocations(
     programs: &mut BTreeMap<String, ProgramSpec>,
     relocations: &[KfuncRelocation],
+    token: Option<&BpfToken>,
 ) -> Result<()> {
     if relocations.is_empty() {
         return Ok(());
@@ -2531,23 +2533,66 @@ fn resolve_kfunc_relocations(
         source,
     })?;
     let kernel_btf = Btf::parse(&bytes)?;
+    let mut module_btfs: Option<Vec<BtfObject>> = None;
     for (index, relocation) in relocations.iter().enumerate() {
+        let target = match find_kfunc(&kernel_btf, false, &relocation.name) {
+            Some(type_id) => Some((type_id, None)),
+            None => {
+                if module_btfs.is_none() {
+                    module_btfs = Some(match token {
+                        Some(token) => crate::BtfObject::kernel_modules_with_token(token)?,
+                        None => crate::BtfObject::kernel_modules()?,
+                    });
+                }
+                module_btfs.as_ref().and_then(|modules| {
+                    modules.iter().find_map(|module| {
+                        find_kfunc(module.btf(), true, &relocation.name)
+                            .map(|type_id| (type_id, Some(module.clone())))
+                    })
+                })
+            }
+        };
         let program = programs.get_mut(&relocation.program).ok_or_else(|| {
             Error::InvalidObject(format!(
                 "kfunc relocation references missing program `{}`",
                 relocation.program
             ))
         })?;
-        let instruction = program
-            .instructions
-            .get_mut(relocation.instruction_index)
-            .ok_or_else(|| Error::InvalidObject("kfunc relocation is outside program".into()))?;
-        if let Some((type_id, _)) = kernel_btf.find(crate::BtfKind::Function, &relocation.name) {
+        if relocation.instruction_index >= program.instructions.len() {
+            return Err(Error::InvalidObject(
+                "kfunc relocation is outside program".into(),
+            ));
+        }
+        if let Some((type_id, module)) = target {
+            let btf_fd_index = match module {
+                Some(module) => {
+                    let index = match program
+                        .kfunc_btf_objects
+                        .iter()
+                        .position(|candidate| candidate.info().id == module.info().id)
+                    {
+                        Some(index) => index + 1,
+                        None => {
+                            program.kfunc_btf_objects.push(module);
+                            program.kfunc_btf_objects.len()
+                        }
+                    };
+                    i16::try_from(index).map_err(|_| {
+                        Error::InvalidObject(format!(
+                            "program `{}` references too many module BTF objects",
+                            program.name
+                        ))
+                    })?
+                }
+                None => 0,
+            };
+            let instruction = &mut program.instructions[relocation.instruction_index];
             instruction.set_source(BPF_PSEUDO_KFUNC_CALL)?;
-            instruction.offset = 0;
+            instruction.offset = btf_fd_index;
             instruction.immediate = i32::try_from(type_id.0)
                 .map_err(|_| Error::Btf("kfunc BTF ID does not fit i32".into()))?;
         } else if relocation.weak {
+            let instruction = &mut program.instructions[relocation.instruction_index];
             instruction.set_source(0)?;
             instruction.offset = 0;
             instruction.immediate = 2_002_000_000_i32
@@ -2561,6 +2606,18 @@ fn resolve_kfunc_relocations(
         }
     }
     Ok(())
+}
+
+fn find_kfunc(btf: &Btf, local_only: bool, name: &str) -> Option<TypeId> {
+    let find = |name| {
+        if local_only {
+            btf.find_local(crate::BtfKind::Function, name)
+        } else {
+            btf.find(crate::BtfKind::Function, name)
+        }
+        .map(|(id, _)| id)
+    };
+    find(name).or_else(|| name.split_once("___").and_then(|(name, _)| find(name)))
 }
 
 fn symbol_name<'a>(elf: &'a Elf<'_>, symbol: &Sym) -> Result<&'a str> {
@@ -4025,5 +4082,35 @@ mod tests {
         .unwrap();
         assert_eq!(instructions[0].offset, 24);
         assert_eq!(instructions[0].code, 0x61);
+    }
+
+    #[test]
+    fn kfunc_lookup_accepts_btf_flavored_extern_names() {
+        let strings = b"\0target\0";
+        let mut types = Vec::new();
+        types.extend(0_u32.to_le_bytes());
+        types.extend((13_u32 << 24).to_le_bytes());
+        types.extend(0_u32.to_le_bytes());
+        types.extend(1_u32.to_le_bytes());
+        types.extend(((12_u32 << 24) | 1).to_le_bytes());
+        types.extend(1_u32.to_le_bytes());
+
+        let mut bytes = Vec::new();
+        bytes.extend(0xeb9f_u16.to_le_bytes());
+        bytes.extend([1, 0]);
+        bytes.extend(24_u32.to_le_bytes());
+        bytes.extend(0_u32.to_le_bytes());
+        bytes.extend((types.len() as u32).to_le_bytes());
+        bytes.extend((types.len() as u32).to_le_bytes());
+        bytes.extend((strings.len() as u32).to_le_bytes());
+        bytes.extend(types);
+        bytes.extend(strings);
+
+        let btf = Btf::parse(&bytes).unwrap();
+        assert_eq!(find_kfunc(&btf, false, "target"), Some(TypeId(2)));
+        assert_eq!(
+            find_kfunc(&btf, false, "target___versioned"),
+            Some(TypeId(2))
+        );
     }
 }

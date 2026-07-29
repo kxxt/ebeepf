@@ -266,6 +266,29 @@ fn loads_and_attaches_kernel_module_fentry_multi() {
 }
 
 #[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and nf_conntrack module kfuncs"]
+fn loads_program_calling_kernel_module_kfuncs() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-kfunc.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("module-kfunc.bpf.o");
+    compile_bpf(&source, &object);
+
+    let loaded = Object::open(&object).unwrap().load().unwrap();
+    let program = loaded.program("call_module_kfunc").unwrap();
+    let dependencies = program.spec().kfunc_btf_objects().collect::<Vec<_>>();
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies[0].info().name, "nf_conntrack");
+    let calls = program
+        .spec()
+        .instructions()
+        .iter()
+        .filter(|instruction| instruction.code == 0x85 && instruction.source() == 2)
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 2);
+    assert!(calls.iter().all(|instruction| instruction.offset == 1));
+}
+
+#[test]
 #[ignore = "requires root and a kernel with BPF token delegation"]
 fn creates_resources_with_a_delegated_bpf_token() {
     const TOKEN_SOCKET: &str = "EBEEPF_TEST_TOKEN_SOCKET";
