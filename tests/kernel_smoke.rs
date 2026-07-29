@@ -222,6 +222,39 @@ fn opens_kernel_module_split_btf() {
 }
 
 #[test]
+#[ignore = "requires root or CAP_BPF, clang with arena address-space support, and an arena-capable kernel"]
+fn loads_and_mutates_arena_backed_globals() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/arena.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("arena.bpf.o");
+    compile_bpf(&source, &object_path);
+
+    let mut builder = SkeletonBuilder::new();
+    builder.object(&object_path).format(false);
+    let skeleton = builder.render().unwrap();
+    assert!(skeleton.contains("pub fn addr_space_1("));
+    assert!(skeleton.contains("initial_value_offset()"));
+
+    let object = Object::open(&object_path).unwrap();
+    let arena = object.map("arena").unwrap();
+    assert_eq!(arena.map_type(), MapType::Arena);
+    assert_eq!(arena.map_extra(), 1_u64 << 44);
+    assert_eq!(arena.initial_value(), Some(41_u32.to_ne_bytes().as_slice()));
+
+    let loaded = object.load().unwrap();
+    let arena = loaded.map("arena").unwrap();
+    let offset = arena.spec().initial_value_offset() as usize;
+    let program = loaded.program("read_arena_global").unwrap();
+    let input = TestRunOptions::new(&[0_u8; 64]);
+    assert_eq!(program.test_run(input).unwrap().return_value, 41);
+
+    let mut memory = arena.mmap_mut().unwrap();
+    assert!(offset < memory.len());
+    memory.write(offset, &73_u32.to_ne_bytes()).unwrap();
+    assert_eq!(program.test_run(input).unwrap().return_value, 73);
+}
+
+#[test]
 #[ignore = "requires root or CAP_BPF, clang with CO-RE support, and the zram module with BTF"]
 fn relocates_core_against_kernel_module_btf() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-core.bpf.c");

@@ -109,6 +109,7 @@ impl<'data> DataSectionMut<'data> {
 #[derive(Debug)]
 pub struct MappedDataSection<'data> {
     memory: MappedMemory<'data>,
+    base_offset: usize,
 }
 
 #[derive(Debug)]
@@ -122,6 +123,15 @@ impl<'data> MappedDataSection<'data> {
     pub const fn new(memory: &'data MapMemory) -> Self {
         Self {
             memory: MappedMemory::ReadOnly(memory),
+            base_offset: 0,
+        }
+    }
+
+    /// Wraps an immutable map memory view whose section starts at `offset`.
+    pub const fn new_at(memory: &'data MapMemory, offset: usize) -> Self {
+        Self {
+            memory: MappedMemory::ReadOnly(memory),
+            base_offset: offset,
         }
     }
 
@@ -129,6 +139,16 @@ impl<'data> MappedDataSection<'data> {
     pub const fn from_mutable(memory: &'data MapMemoryMut) -> Self {
         Self {
             memory: MappedMemory::Mutable(memory),
+            base_offset: 0,
+        }
+    }
+
+    /// Wraps a mutable map memory view whose shared section starts at
+    /// `offset`.
+    pub const fn from_mutable_at(memory: &'data MapMemoryMut, offset: usize) -> Self {
+        Self {
+            memory: MappedMemory::Mutable(memory),
+            base_offset: offset,
         }
     }
 
@@ -143,6 +163,10 @@ impl<'data> MappedDataSection<'data> {
     }
 
     fn read_vec(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        let offset = self
+            .base_offset
+            .checked_add(offset)
+            .ok_or_else(|| Error::InvalidObject("mapped data-section offset overflow".into()))?;
         match self.memory {
             MappedMemory::ReadOnly(memory) => memory.read_vec(offset, length),
             MappedMemory::Mutable(memory) => memory.read_vec(offset, length),
@@ -154,34 +178,55 @@ impl<'data> MappedDataSection<'data> {
 #[derive(Debug)]
 pub struct MappedDataSectionMut<'data> {
     memory: &'data mut MapMemoryMut,
+    base_offset: usize,
 }
 
 impl<'data> MappedDataSectionMut<'data> {
     /// Wraps a mutable map memory view.
     pub fn new(memory: &'data mut MapMemoryMut) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            base_offset: 0,
+        }
+    }
+
+    /// Wraps a mutable map memory view whose section starts at `offset`.
+    pub fn new_at(memory: &'data mut MapMemoryMut, offset: usize) -> Self {
+        Self {
+            memory,
+            base_offset: offset,
+        }
     }
 
     /// Decodes a copied value starting at `offset`.
     pub fn read<T: DataValue>(&self, offset: usize) -> Result<T> {
+        let offset = self.absolute_offset(offset)?;
         T::decode(&self.memory.read_vec(offset, T::SIZE)?)
     }
 
     /// Copies a byte range from live map memory.
     pub fn bytes(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
-        self.memory.read_vec(offset, length)
+        self.memory.read_vec(self.absolute_offset(offset)?, length)
     }
 
     /// Encodes a value into live map memory at `offset`.
     pub fn write<T: DataValue>(&mut self, offset: usize, value: &T) -> Result<()> {
         let mut bytes = vec![0; T::SIZE];
         value.encode(&mut bytes)?;
+        let offset = self.absolute_offset(offset)?;
         self.memory.write(offset, &bytes)
     }
 
     /// Copies bytes into live map memory at `offset`.
     pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        let offset = self.absolute_offset(offset)?;
         self.memory.write(offset, bytes)
+    }
+
+    fn absolute_offset(&self, offset: usize) -> Result<usize> {
+        self.base_offset
+            .checked_add(offset)
+            .ok_or_else(|| Error::InvalidObject("mapped data-section offset overflow".into()))
     }
 }
 
@@ -1411,21 +1456,23 @@ fn render_loaded_data_accessors(
     writeln!(output, "impl {loaded_skeleton} {{").expect("String write");
     for section in sections {
         let constructor = if section.read_only {
-            "new"
+            "new_at"
         } else {
-            "from_mutable"
+            "from_mutable_at"
         };
         writeln!(
             output,
             "    /// Borrows live typed values in the `{}` data section.\n\
              pub fn {}(&self) -> {crate_path}::Result<{}<'_>> {{\n\
+                 let offset = self.object.map({:?})?.spec().initial_value_offset() as usize;\n\
                  Ok({} {{\n\
-                     data: {crate_path}::MappedDataSection::{}(&self.{}_memory),\n\
+                     data: {crate_path}::MappedDataSection::{}(&self.{}_memory, offset),\n\
                  }})\n\
              }}",
             doc_text(&section.source),
             section.method,
             section.loaded_shared_type,
+            section.map,
             section.loaded_shared_type,
             constructor,
             section.method,
@@ -1437,13 +1484,15 @@ fn render_loaded_data_accessors(
                 "\n\
                  /// Mutably borrows live typed values in the `{}` data section.\n\
                  pub fn {}_mut(&mut self) -> {crate_path}::Result<{}<'_>> {{\n\
+                     let offset = self.object.map({:?})?.spec().initial_value_offset() as usize;\n\
                      Ok({} {{\n\
-                         data: {crate_path}::MappedDataSectionMut::new(&mut self.{}_memory),\n\
+                         data: {crate_path}::MappedDataSectionMut::new_at(&mut self.{}_memory, offset),\n\
                      }})\n\
                  }}",
                 doc_text(&section.source),
                 section.method,
                 section.loaded_mutable_type,
+                section.map,
                 section.loaded_mutable_type,
                 section.method,
             )

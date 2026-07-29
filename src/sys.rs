@@ -689,6 +689,67 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
     }
 }
 
+pub(crate) fn supports_full_range_map_value_offset(token_fd: Option<RawFd>) -> io::Result<bool> {
+    let map = map_create(&MapCreate {
+        map_type: 2, // BPF_MAP_TYPE_ARRAY
+        name: "offset_probe",
+        key_size: 4,
+        value_size: 1,
+        max_entries: 1,
+        flags: 0,
+        inner_map_fd: None,
+        numa_node: None,
+        btf_fd: None,
+        btf_key_type_id: 0,
+        btf_value_type_id: 0,
+        btf_vmlinux_value_type_id: 0,
+        value_type_btf_obj_fd: None,
+        map_extra: 0,
+        token_fd,
+    })?;
+    let instructions = [
+        Instruction::new(
+            0x18, // BPF_LD | BPF_DW | BPF_IMM
+            1,
+            2, // BPF_PSEUDO_MAP_VALUE
+            0,
+            map.as_raw_fd(),
+        ),
+        Instruction::new(0, 0, 0, 0, 1 << 30),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    match program_load(&ProgramLoad {
+        program_type: 1, // BPF_PROG_TYPE_SOCKET_FILTER
+        expected_attach_type: 0,
+        name: "offset_probe",
+        instructions: &instructions,
+        license: b"GPL\0",
+        kernel_version: 0,
+        flags: 0,
+        interface_index: 0,
+        btf_fd: None,
+        func_info: &[],
+        func_info_record_size: 0,
+        line_info: &[],
+        line_info_record_size: 0,
+        attach_btf_id: 0,
+        attach_program_fd: None,
+        attach_btf_object_fd: None,
+        fd_array: &[],
+        log_level: 1,
+        log_size: 4096,
+        token_fd,
+    }) {
+        Err((_, log)) if log.contains("direct value offset of") => Ok(false),
+        Err((_, log)) if log.contains("invalid access to map value pointer") => Ok(true),
+        Err((source, _)) => Err(source),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "full-range map-offset probe unexpectedly loaded",
+        )),
+    }
+}
+
 fn load_local_storage_probe_btf() -> io::Result<OwnedFd> {
     const STRINGS: &[u8] = b"\0bpf_spin_lock\0val\0cnt\0l\0";
     const TYPES: &[u32] = &[

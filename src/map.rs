@@ -294,6 +294,7 @@ pub struct MapSpec {
     pub(crate) autocreate: bool,
     pub(crate) auto_attach: bool,
     pub(crate) initial_value: Option<Vec<u8>>,
+    pub(crate) initial_value_offset: u32,
     pub(crate) freeze_after_init: bool,
     pub(crate) section_index: Option<usize>,
     pub(crate) section_offset: u64,
@@ -324,6 +325,7 @@ impl MapSpec {
             autocreate: true,
             auto_attach: false,
             initial_value: None,
+            initial_value_offset: 0,
             freeze_after_init: false,
             section_index: None,
             section_offset: 0,
@@ -417,6 +419,15 @@ impl MapSpec {
         self.initial_value.as_deref_mut()
     }
 
+    /// Byte offset of [`Self::initial_value`] in a memory-mapped allocation.
+    ///
+    /// This is zero for ordinary global-data maps. Arena-backed globals can
+    /// live near the end of the arena so that dynamic allocations grow from
+    /// the other side.
+    pub const fn initial_value_offset(&self) -> u32 {
+        self.initial_value_offset
+    }
+
     /// Changes the kernel map type before loading.
     pub fn set_map_type(&mut self, map_type: MapType) -> &mut Self {
         self.map_type = map_type;
@@ -501,7 +512,9 @@ impl MapSpec {
     /// `.kconfig` maps before [`crate::Object::load`].
     pub fn set_initial_value(&mut self, value: impl Into<Vec<u8>>) -> Result<&mut Self> {
         let value = value.into();
-        validate_size("initial map value", self.value_size, value.len())?;
+        if self.map_type != MapType::Arena {
+            validate_size("initial map value", self.value_size, value.len())?;
+        }
         self.initial_value = Some(value);
         Ok(self)
     }
@@ -539,8 +552,10 @@ impl MapSpec {
                 self.name
             )));
         }
-        if let Some(value) = &self.initial_value {
-            validate_size("initial map value", self.value_size, value.len())?;
+        if self.map_type != MapType::Arena {
+            if let Some(value) = &self.initial_value {
+                validate_size("initial map value", self.value_size, value.len())?;
+            }
         }
         Ok(())
     }
@@ -830,7 +845,7 @@ impl Map {
         self.fd.as_fd()
     }
 
-    /// Creates an immutable shared-memory view of an mmapable array map.
+    /// Creates an immutable shared-memory view of an mmapable array or arena.
     ///
     /// Only one memory view may exist for a map (including its clones) at a
     /// time. The returned mapping covers the kernel's page-rounded allocation;
@@ -839,7 +854,7 @@ impl Map {
         self.mmap_impl(false).map(MapMemory)
     }
 
-    /// Creates a mutable shared-memory view of an mmapable array map.
+    /// Creates a mutable shared-memory view of an mmapable array or arena.
     ///
     /// Program-read-only maps such as `.rodata` cannot be mapped mutably after
     /// loading. Mutation is immediately visible to eBPF programs and other map
@@ -855,38 +870,67 @@ impl Map {
     }
 
     fn mmap_impl(&self, writable: bool) -> Result<MapMapping> {
-        if self.spec.map_type != MapType::Array || !self.spec.flags.contains(MapFlags::MMAPABLE) {
+        if !matches!(self.spec.map_type, MapType::Array | MapType::Arena)
+            || !self.spec.flags.contains(MapFlags::MMAPABLE)
+        {
             return Err(Error::Unsupported(format!(
-                "map `{}` is not an mmapable array",
+                "map `{}` is not an mmapable array or arena",
                 self.name()
             )));
         }
+        let page_size = page_size()?;
         self.mapping
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .map_err(|_| {
                 Error::InvalidObject(format!("map `{}` already has a memory view", self.name()))
             })?;
-        let length =
-            match array_mmap_size(self.spec.value_size, self.spec.max_entries, page_size()?) {
+        let length = match self.spec.map_type {
+            MapType::Array => {
+                match array_mmap_size(self.spec.value_size, self.spec.max_entries, page_size) {
+                    Ok(length) => length,
+                    Err(error) => {
+                        self.mapping.store(false, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+            }
+            MapType::Arena => match arena_mmap_size(self.spec.max_entries, page_size) {
                 Ok(length) => length,
                 Err(error) => {
                     self.mapping.store(false, Ordering::Release);
                     return Err(error);
                 }
-            };
-        let protection = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
-        // SAFETY: the descriptor and length are valid, offset zero is
-        // page-aligned, and successful mappings are owned by `MapMapping`.
-        let pointer = unsafe {
-            libc::mmap(
-                ptr::null_mut(),
-                length,
-                protection,
-                libc::MAP_SHARED,
-                self.fd.as_raw_fd(),
-                0,
-            )
+            },
+            _ => unreachable!("map type was checked above"),
         };
+        let protection = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+        let (address, flags) = if self.spec.map_type == MapType::Arena && self.spec.map_extra != 0 {
+            let address = usize::try_from(self.spec.map_extra).map_err(|_| {
+                self.mapping.store(false, Ordering::Release);
+                Error::InvalidObject(format!(
+                    "arena map `{}` address does not fit this process",
+                    self.name()
+                ))
+            })?;
+            if address % page_size != 0 {
+                self.mapping.store(false, Ordering::Release);
+                return Err(Error::InvalidObject(format!(
+                    "arena map `{}` address 0x{address:x} is not page-aligned",
+                    self.name()
+                )));
+            }
+            (
+                address as *mut libc::c_void,
+                libc::MAP_SHARED | libc::MAP_FIXED_NOREPLACE,
+            )
+        } else {
+            (ptr::null_mut(), libc::MAP_SHARED)
+        };
+        // SAFETY: the descriptor and length are valid, offset zero is
+        // page-aligned, and `MAP_FIXED_NOREPLACE` cannot replace a preexisting
+        // process mapping. Successful mappings are owned by `MapMapping`.
+        let pointer =
+            unsafe { libc::mmap(address, length, protection, flags, self.fd.as_raw_fd(), 0) };
         if pointer == libc::MAP_FAILED {
             self.mapping.store(false, Ordering::Release);
             return Err(Error::system(
@@ -1319,7 +1363,7 @@ impl Drop for MapMapping {
     }
 }
 
-/// An immutable, page-rounded shared-memory view of a BPF array map.
+/// An immutable shared-memory view of a BPF array or arena map.
 ///
 /// Reads copy through volatile accesses instead of exposing slices: eBPF
 /// programs and other descriptors can change the shared allocation
@@ -1351,7 +1395,7 @@ impl MapMemory {
     }
 }
 
-/// A mutable, page-rounded shared-memory view of a BPF array map.
+/// A mutable shared-memory view of a BPF array or arena map.
 ///
 /// Reads and writes use volatile byte copies and never expose references into
 /// memory which the kernel can modify concurrently.
@@ -1450,7 +1494,7 @@ pub(crate) fn possible_cpu_count() -> Result<usize> {
     parse_cpu_list(text.trim())
 }
 
-fn page_size() -> Result<usize> {
+pub(crate) fn page_size() -> Result<usize> {
     // SAFETY: `sysconf` has no pointer arguments.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(value)
@@ -1481,6 +1525,18 @@ fn array_mmap_size(value_size: u32, maximum_entries: u32, page_size: usize) -> R
         .map(|size| size & !(page_size - 1))
         .filter(|size| *size > 0)
         .ok_or_else(|| Error::InvalidObject("mmapable map allocation size overflow".into()))
+}
+
+pub(crate) fn arena_mmap_size(maximum_entries: u32, page_size: usize) -> Result<usize> {
+    if !page_size.is_power_of_two() {
+        return Err(Error::InvalidObject(format!(
+            "system page size {page_size} is not a power of two"
+        )));
+    }
+    usize::try_from(maximum_entries)
+        .map_err(|_| Error::InvalidObject("arena capacity does not fit usize".into()))?
+        .checked_mul(page_size)
+        .ok_or_else(|| Error::InvalidObject("arena mapping size overflow".into()))
 }
 
 fn parse_cpu_list(list: &str) -> Result<usize> {
@@ -1606,5 +1662,7 @@ mod tests {
         assert_eq!(array_mmap_size(9, 257, 4096).unwrap(), 8192);
         assert!(array_mmap_size(0, 1, 4096).is_err());
         assert!(array_mmap_size(8, 1, 3000).is_err());
+        assert_eq!(arena_mmap_size(8, 4096).unwrap(), 32_768);
+        assert!(arena_mmap_size(1, 3000).is_err());
     }
 }

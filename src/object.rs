@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::{self, ErrorKind, Read};
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -15,7 +15,7 @@ use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT, STV_HIDDEN};
 use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfType, Endian};
-use crate::map::{possible_cpu_count, MapFlags, Pinning};
+use crate::map::{arena_mmap_size, page_size, possible_cpu_count, MapFlags, Pinning};
 use crate::program::{
     kind_supports_auto_attach, program_flags_from_section, ProgramKind, VerifierLog,
 };
@@ -222,7 +222,8 @@ impl Object {
             .unwrap_or_else(running_kernel_version);
 
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
-        let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
+        let mut data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
+        add_arena_data(&sections, btf.as_ref(), &mut maps, &mut data_sections)?;
         let ksym_kinds = collect_ksym_kinds(btf.as_ref())?;
         let extern_data = add_kconfig_map(&name, &elf, btf.as_mut(), &mut maps)?;
         let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
@@ -535,6 +536,7 @@ impl Object {
                 })?;
             }
         }
+        prepare_arena_data_layout(&mut self.maps, token_fd)?;
         for map in self.maps.values() {
             map.validate()?;
         }
@@ -911,13 +913,11 @@ fn parse_maps(
                     .get("numa_node")
                     .map(|id| btf_uint(btf, *id))
                     .transpose()?;
-                spec.map_extra = u64::from(
-                    values
-                        .get("map_extra")
-                        .map(|id| btf_uint(btf, *id))
-                        .transpose()?
-                        .unwrap_or_default(),
-                );
+                spec.map_extra = values
+                    .get("map_extra")
+                    .map(|id| btf_ulong(btf, *id))
+                    .transpose()?
+                    .unwrap_or_default();
                 spec.pinning = match values
                     .get("pinning")
                     .map(|id| btf_uint(btf, *id))
@@ -1021,6 +1021,24 @@ fn btf_uint(btf: &Btf, id: TypeId) -> Result<u32> {
     Ok(*count)
 }
 
+fn btf_ulong(btf: &Btf, id: TypeId) -> Result<u64> {
+    let id = btf.resolve_type(id)?;
+    match btf
+        .type_by_id(id)
+        .ok_or_else(|| Error::Btf(format!("type ID {} is missing", id.0)))?
+    {
+        BtfType::Pointer { .. } => Ok(u64::from(btf_uint(btf, id)?)),
+        BtfType::Enum { values, .. } | BtfType::Enum64 { values, .. } if values.len() == 1 => {
+            Ok(values[0].value as u64)
+        }
+        ty => Err(Error::InvalidObject(format!(
+            "map 64-bit integer encoding type {} is {:?}, expected a pointer or one-value enum",
+            id.0,
+            ty.kind()
+        ))),
+    }
+}
+
 fn btf_pointee(btf: &Btf, id: TypeId) -> Result<TypeId> {
     let id = btf.resolve_type(id)?;
     let BtfType::Pointer { ty } = btf
@@ -1117,6 +1135,50 @@ fn add_data_maps(
         result.insert(index, name);
     }
     Ok(result)
+}
+
+fn add_arena_data(
+    sections: &Sections<'_>,
+    btf: Option<&Btf>,
+    maps: &mut BTreeMap<String, MapSpec>,
+    data_sections: &mut HashMap<usize, String>,
+) -> Result<()> {
+    let arena_names = maps
+        .values()
+        .filter(|map| map.map_type == MapType::Arena)
+        .map(|map| map.name.clone())
+        .collect::<Vec<_>>();
+    if arena_names.len() > 1 {
+        return Err(Error::Unsupported(format!(
+            "an object can define only one arena map, found: {}",
+            arena_names.join(", ")
+        )));
+    }
+    let Some((section_index, _)) = sections.by_name(".addr_space.1") else {
+        return Ok(());
+    };
+    let arena_name = arena_names.first().ok_or_else(|| {
+        Error::InvalidObject(
+            "the `.addr_space.1` section contains arena globals but no arena map is defined".into(),
+        )
+    })?;
+    let initial = sections.owned_data(section_index)?;
+    u32::try_from(initial.len())
+        .map_err(|_| Error::InvalidObject("arena global data is larger than u32::MAX".into()))?;
+    let map = maps
+        .get_mut(arena_name)
+        .expect("the arena name was collected from this map table");
+    map.initial_value = Some(initial);
+    if let Some(btf) = btf {
+        if let Some((id, _)) = btf.find(crate::BtfKind::DataSection, ".addr_space.1") {
+            // Arena maps don't pass this type ID to BPF_MAP_CREATE, but
+            // retaining the relationship lets Rust skeletons generate typed
+            // global views.
+            map.btf_value_type = id;
+        }
+    }
+    data_sections.insert(section_index, arena_name.clone());
+    Ok(())
 }
 
 fn add_struct_ops_maps(
@@ -1943,6 +2005,58 @@ fn is_data_section(name: &str, header: &SectionHeader) -> bool {
     conventional && header.sh_size > 0
 }
 
+fn prepare_arena_data_layout(
+    maps: &mut BTreeMap<String, MapSpec>,
+    token_fd: Option<i32>,
+) -> Result<()> {
+    let has_initial_data = maps
+        .values()
+        .any(|map| map.map_type == MapType::Arena && map.initial_value.is_some());
+    if !has_initial_data {
+        return Ok(());
+    }
+    let place_at_end = sys::supports_full_range_map_value_offset(token_fd)
+        .map_err(|source| Error::system("probe arena global-data placement", source))?;
+    let page_size = page_size()?;
+    for map in maps
+        .values_mut()
+        .filter(|map| map.map_type == MapType::Arena)
+    {
+        let Some(initial) = map.initial_value.as_ref() else {
+            continue;
+        };
+        if !map.flags.contains(MapFlags::MMAPABLE) {
+            return Err(Error::InvalidObject(format!(
+                "arena map `{}` contains globals but is not mmapable",
+                map.name
+            )));
+        }
+        let allocation = arena_mmap_size(map.max_entries, page_size)?;
+        let reserved = initial
+            .len()
+            .checked_add(page_size - 1)
+            .map(|size| size & !(page_size - 1))
+            .ok_or_else(|| Error::InvalidObject("arena global-data size overflow".into()))?;
+        if reserved > allocation {
+            return Err(Error::InvalidObject(format!(
+                "arena map `{}` has {allocation} bytes but its globals require {reserved}",
+                map.name
+            )));
+        }
+        let offset = if place_at_end {
+            allocation - reserved
+        } else {
+            0
+        };
+        map.initial_value_offset = u32::try_from(offset).map_err(|_| {
+            Error::Unsupported(format!(
+                "arena global-data offset {offset} does not fit the eBPF immediate encoding"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 fn resolve_inner_maps(
     elf: &Elf<'_>,
     sections: &Sections<'_>,
@@ -2455,7 +2569,18 @@ fn relocate_maps(
             .instructions
             .get_mut(relocation.instruction_index + 1)
             .ok_or_else(|| Error::InvalidObject("map ldimm64 has no second instruction".into()))?;
-        second.immediate = relocation.value_offset.unwrap_or_default() as i32;
+        let value_offset = relocation
+            .value_offset
+            .map(|offset| {
+                offset
+                    .checked_add(map.spec().initial_value_offset())
+                    .ok_or_else(|| {
+                        Error::InvalidObject("map value relocation offset overflow".into())
+                    })
+            })
+            .transpose()?
+            .unwrap_or_default();
+        second.immediate = value_offset as i32;
     }
     Ok(())
 }
@@ -2871,8 +2996,11 @@ fn load_maps(
                     }
                 };
                 let map = Map::from_fd(fd, spec.clone());
-                if spec.map_type != MapType::StructOps {
-                    if let Some(initial) = &spec.initial_value {
+                if let Some(initial) = &spec.initial_value {
+                    if spec.map_type == MapType::Arena {
+                        let mut memory = map.mmap_mut()?;
+                        memory.write(spec.initial_value_offset as usize, initial)?;
+                    } else if spec.map_type != MapType::StructOps {
                         sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
                             .map_err(|source| Error::system("initialize data map", source))?;
                     }
@@ -3710,7 +3838,7 @@ fn apply_core_relocations_for_running_kernel(
     };
     let mut paths = directory
         .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<std::io::Result<Vec<_>>>()
+        .collect::<io::Result<Vec<_>>>()
         .map_err(|source| Error::File {
             operation: "enumerate kernel module BTF",
             path: "/sys/kernel/btf".into(),

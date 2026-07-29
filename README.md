@@ -83,7 +83,8 @@ The crate currently provides:
 
 - owned ELF and BTF parsing, BTF-defined and legacy maps, global data and
   kconfig maps populated from real and virtual kernel configuration, subprogram
-  linking, BTF.ext metadata, and every standard CO-RE relocation kind;
+  linking, arena-backed globals with full-width map offsets, BTF.ext metadata,
+  and every standard CO-RE relocation kind;
 - direct `bpf(2)` loading, standalone and reused maps, pinning, rich
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, type-accurate map/program/helper capability probes, map CRUD and
@@ -98,9 +99,10 @@ The crate currently provides:
   callback relocations, kernel-BTF wrapper layout translation, vmlinux value
   type metadata, modern link and legacy registration lifetimes, and
   transactional skeleton auto-attachment;
-- safe mmapable array-map views using volatile snapshots/writes instead of
-  aliasable shared-memory slices; generated skeletons retain these mappings
-  and expose live typed `.bss`, `.data`, and read-only `.rodata` accessors;
+- safe mmapable array and arena views using volatile snapshots/writes instead
+  of aliasable shared-memory slices and non-replacing fixed mappings; generated
+  skeletons retain these mappings and expose live typed `.bss`, `.data`,
+  `.rodata`, and address-space global accessors;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, multi-function
   BTF tracing, USDT,
