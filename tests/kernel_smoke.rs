@@ -6,8 +6,9 @@ use std::process::{self, Command};
 use std::time::Duration;
 
 use ebeepf::{
-    BtfObject, Instruction, LinkType, Object, RingBuffer, TcAttachOptions, TcAttachPoint, TcHook,
-    UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
+    BtfObject, HelperId, Instruction, LinkType, MapType, Object, ProgramType, RingBuffer,
+    TcAttachOptions, TcAttachPoint, TcHook, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions,
+    XdpFlags,
 };
 use object::write::{Object as WriteObject, Symbol, SymbolSection};
 use object::{
@@ -135,6 +136,28 @@ impl Drop for TemporaryInterface {
 #[test]
 #[ignore = "requires root or CAP_BPF and a kernel with eBPF enabled"]
 fn loads_program_and_exercises_map_crud() {
+    for map_type in [
+        MapType::Array,
+        MapType::LpmTrie,
+        MapType::ArrayOfMaps,
+        MapType::SocketStorage,
+        MapType::RingBuffer,
+        MapType::StructOps,
+        MapType::UserRingBuffer,
+        MapType::Arena,
+        MapType::InstructionArray,
+    ] {
+        let supported = map_type
+            .is_supported()
+            .unwrap_or_else(|error| panic!("{map_type:?} probe failed: {error}"));
+        assert!(supported, "{map_type:?} was not detected");
+    }
+    assert!(!MapType::Other(u32::MAX).is_supported().unwrap());
+    assert!(ProgramType::SocketFilter.is_supported().unwrap());
+    assert!(ProgramType::SocketFilter
+        .is_helper_supported(HelperId::MAP_LOOKUP_ELEMENT)
+        .unwrap());
+
     let object = Object::parse_named("kernel-smoke", &loadable_object()).unwrap();
     let loaded = object.load().unwrap();
     let map = loaded.map("values").unwrap();

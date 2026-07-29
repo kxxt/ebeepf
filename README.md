@@ -67,7 +67,8 @@ The crate currently provides:
   relocations;
 - direct `bpf(2)` loading, standalone and reused maps, pinning, rich
   map/program/link/BTF metadata, attachment queries, verifier logs, program
-  test runs, map CRUD and batch operations, and per-CPU values;
+  test runs, type-accurate map/program/helper capability probes, map CRUD and
+  batch operations, and per-CPU values;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
   `struct_ops`, legacy program, and iterator attachments with RAII link

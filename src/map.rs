@@ -39,6 +39,20 @@ bitflags! {
         const PRESERVE_ELEMENTS = 1 << 11;
         /// This map is an inner-map template with dynamic capacity.
         const INNER_MAP = 1 << 12;
+        /// Register or unregister the map through a backing BPF link.
+        const LINK = 1 << 13;
+        /// Interpret pin/get paths relative to a supplied directory descriptor.
+        const PATH_FD = 1 << 14;
+        /// A value-type BTF object descriptor is present.
+        const VALUE_TYPE_BTF_OBJECT_FD = 1 << 15;
+        /// A BPF token descriptor is present.
+        const TOKEN_FD = 1 << 16;
+        /// Deliver `SIGSEGV` instead of faulting new arena pages in.
+        const SEGMENTATION_FAULT_ON_ARENA_PAGE_FAULT = 1 << 17;
+        /// Do not translate kernel arena pointers to userspace pointers.
+        const NO_ARENA_USER_POINTER_CONVERSION = 1 << 18;
+        /// Allow ring-buffer overwrite mode.
+        const RING_BUFFER_OVERWRITE = 1 << 19;
     }
 }
 
@@ -216,6 +230,16 @@ impl MapType {
     /// Whether map values are file descriptors for other maps.
     pub const fn is_map_of_maps(self) -> bool {
         matches!(self, Self::ArrayOfMaps | Self::HashOfMaps)
+    }
+
+    /// Probes whether the running kernel can create this map type.
+    ///
+    /// The probe supplies type-specific sizes, flags, inner maps, and BTF
+    /// metadata so that an `EINVAL` result is not confused with an invalid
+    /// generic map definition.
+    pub fn is_supported(self) -> Result<bool> {
+        sys::probe_map_type(self.as_raw())
+            .map_err(|source| Error::system("probe eBPF map type", source))
     }
 
     pub(crate) const fn accepts_btf_types(self) -> bool {

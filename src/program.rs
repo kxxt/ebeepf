@@ -169,6 +169,91 @@ impl ProgramType {
             Self::Other(value) => value,
         }
     }
+
+    /// Probes whether the running kernel can load this program type.
+    ///
+    /// A `false` result also covers kernels on which eBPF loading is disabled
+    /// for the current process, matching the kernel's observable behavior.
+    pub fn is_supported(self) -> Result<bool> {
+        sys::probe_program_type(self.as_raw())
+            .map_err(|source| Error::system("probe eBPF program type", source))
+    }
+
+    /// Probes whether one helper is recognized for this program type.
+    ///
+    /// Tracing, extension, LSM, and `struct_ops` programs cannot be probed
+    /// reliably without a real BTF attachment target and return
+    /// [`Error::Unsupported`].
+    pub fn is_helper_supported(self, helper: HelperId) -> Result<bool> {
+        sys::probe_program_helper(self.as_raw(), helper.as_raw()).map_err(|source| {
+            if source.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                Error::Unsupported(format!(
+                    "helper probing is not reliable for {self:?} programs"
+                ))
+            } else {
+                Error::system("probe eBPF helper", source)
+            }
+        })
+    }
+}
+
+/// A future-proof kernel eBPF helper function ID.
+///
+/// Associated constants cover common helpers; [`Self::from_raw`] allows
+/// probing helpers introduced by newer kernels without waiting for a crate
+/// release.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HelperId(u32);
+
+impl HelperId {
+    /// No helper.
+    pub const UNSPECIFIED: Self = Self(0);
+    /// `bpf_map_lookup_elem`.
+    pub const MAP_LOOKUP_ELEMENT: Self = Self(1);
+    /// `bpf_map_update_elem`.
+    pub const MAP_UPDATE_ELEMENT: Self = Self(2);
+    /// `bpf_map_delete_elem`.
+    pub const MAP_DELETE_ELEMENT: Self = Self(3);
+    /// `bpf_probe_read`.
+    pub const PROBE_READ: Self = Self(4);
+    /// `bpf_ktime_get_ns`.
+    pub const KERNEL_TIME_NANOSECONDS: Self = Self(5);
+    /// `bpf_trace_printk`.
+    pub const TRACE_PRINTK: Self = Self(6);
+    /// `bpf_get_prandom_u32`.
+    pub const RANDOM_U32: Self = Self(7);
+    /// `bpf_get_smp_processor_id`.
+    pub const PROCESSOR_ID: Self = Self(8);
+    /// `bpf_tail_call`.
+    pub const TAIL_CALL: Self = Self(12);
+    /// `bpf_perf_event_output`.
+    pub const PERF_EVENT_OUTPUT: Self = Self(25);
+    /// `bpf_ringbuf_output`.
+    pub const RING_BUFFER_OUTPUT: Self = Self(130);
+    /// `bpf_ringbuf_reserve`.
+    pub const RING_BUFFER_RESERVE: Self = Self(131);
+    /// `bpf_ringbuf_submit`.
+    pub const RING_BUFFER_SUBMIT: Self = Self(132);
+    /// `bpf_ringbuf_discard`.
+    pub const RING_BUFFER_DISCARD: Self = Self(133);
+    /// `bpf_get_attach_cookie`.
+    pub const ATTACH_COOKIE: Self = Self(174);
+
+    /// Wraps a Linux UAPI helper ID.
+    pub const fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the Linux UAPI helper ID.
+    pub const fn as_raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for HelperId {
+    fn from(value: u32) -> Self {
+        Self::from_raw(value)
+    }
 }
 
 /// Attachment information inferred from an ELF section name.
@@ -1793,6 +1878,13 @@ mod tests {
         for raw in 0..40 {
             assert_eq!(ProgramType::from_raw(raw).as_raw(), raw);
         }
+    }
+
+    #[test]
+    fn helper_ids_are_future_proof() {
+        assert_eq!(HelperId::MAP_LOOKUP_ELEMENT.as_raw(), 1);
+        assert_eq!(HelperId::from_raw(u32::MAX).as_raw(), u32::MAX);
+        assert_eq!(HelperId::from(174), HelperId::ATTACH_COOKIE);
     }
 
     #[test]

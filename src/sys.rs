@@ -5,6 +5,7 @@
 //! and independent of generated C bindings.
 
 use std::ffi::{CString, OsStr};
+use std::fs;
 use std::io;
 use std::mem::{self, MaybeUninit};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -498,6 +499,167 @@ pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
     command_fd_sized(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE)
 }
 
+pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
+    let mut key_size = 4;
+    let mut value_size = 4;
+    let mut max_entries = 1;
+    let mut map_flags = 0;
+    let mut btf = None;
+    let mut btf_key_type_id = 0;
+    let mut btf_value_type_id = 0;
+    let mut btf_vmlinux_value_type_id = 0;
+    let mut value_type_btf_obj_fd = 0;
+
+    match map_type {
+        0 => return Ok(false),
+        1..=6 | 8..=10 | 14..=18 | 20 | 25 => {}
+        7 => value_size = 8,
+        11 => {
+            key_size = 8;
+            value_size = 8;
+            map_flags = 1; // BPF_F_NO_PREALLOC
+        }
+        12 | 13 => {}
+        19 | 21 => {
+            key_size = 16; // struct bpf_cgroup_storage_key
+            value_size = 8;
+            max_entries = 0;
+        }
+        22 | 23 => key_size = 0,
+        24 | 28 | 29 | 32 => {
+            let loaded = match load_local_storage_probe_btf() {
+                Ok(loaded) => loaded,
+                Err(_) => return Ok(false),
+            };
+            btf_key_type_id = 1;
+            btf_value_type_id = 3;
+            value_size = 8;
+            max_entries = 0;
+            map_flags = 1; // BPF_F_NO_PREALLOC
+            btf = Some(loaded);
+        }
+        26 => {
+            btf_vmlinux_value_type_id = 1;
+            value_type_btf_obj_fd = -1;
+        }
+        27 | 31 => {
+            key_size = 0;
+            value_size = 0;
+            // SAFETY: `sysconf` has no pointer arguments.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            max_entries = u32::try_from(page_size).unwrap_or(4096);
+        }
+        30 => {
+            key_size = 0;
+            max_entries = 1;
+        }
+        33 => {
+            key_size = 0;
+            value_size = 0;
+            max_entries = 1;
+            map_flags = 1 << 10; // BPF_F_MMAPABLE
+        }
+        34 => value_size = 16, // struct bpf_insn_array_value
+        _ => return Ok(false),
+    }
+
+    let inner = if matches!(map_type, 12 | 13) {
+        match map_create(&MapCreate {
+            map_type: 1,
+            name: "",
+            key_size: 4,
+            value_size: 4,
+            max_entries: 1,
+            flags: 0,
+            inner_map_fd: None,
+            numa_node: None,
+            btf_fd: None,
+            btf_key_type_id: 0,
+            btf_value_type_id: 0,
+            map_extra: 0,
+        }) {
+            Ok(inner) => Some(inner),
+            Err(_) => return Ok(false),
+        }
+    } else {
+        None
+    };
+    let attr = MapCreateAttr {
+        map_type,
+        key_size,
+        value_size,
+        max_entries,
+        map_flags,
+        inner_map_fd: inner
+            .as_ref()
+            .map_or(0, |fd| u32::try_from(fd.as_raw_fd()).unwrap_or_default()),
+        btf_fd: btf
+            .as_ref()
+            .map_or(0, |fd| u32::try_from(fd.as_raw_fd()).unwrap_or_default()),
+        btf_key_type_id,
+        btf_value_type_id,
+        btf_vmlinux_value_type_id,
+        value_type_btf_obj_fd,
+        ..Default::default()
+    };
+    match command_fd_sized(BPF_MAP_CREATE, &attr, MAP_CREATE_ATTR_SIZE) {
+        Ok(_) => Ok(true),
+        Err(error) if map_type == 26 && error.raw_os_error() == Some(524) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+fn load_local_storage_probe_btf() -> io::Result<OwnedFd> {
+    const STRINGS: &[u8] = b"\0bpf_spin_lock\0val\0cnt\0l\0";
+    const TYPES: &[u32] = &[
+        // int
+        0,
+        1 << 24,
+        4,
+        (1 << 24) | 32,
+        // struct bpf_spin_lock { int val; }
+        1,
+        (4 << 24) | 1,
+        4,
+        15,
+        1,
+        0,
+        // struct val { int cnt; struct bpf_spin_lock l; }
+        15,
+        (4 << 24) | 2,
+        8,
+        19,
+        1,
+        0,
+        23,
+        2,
+        32,
+    ];
+    let type_length = u32::try_from(mem::size_of_val(TYPES))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "probe BTF is too large"))?;
+    let string_length = u32::try_from(STRINGS.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "probe BTF is too large"))?;
+    let mut bytes = Vec::with_capacity(24 + type_length as usize + STRINGS.len());
+    bytes.extend_from_slice(&0xeb9f_u16.to_ne_bytes());
+    bytes.push(1);
+    bytes.push(0);
+    bytes.extend_from_slice(&24_u32.to_ne_bytes());
+    bytes.extend_from_slice(&0_u32.to_ne_bytes());
+    bytes.extend_from_slice(&type_length.to_ne_bytes());
+    bytes.extend_from_slice(&type_length.to_ne_bytes());
+    bytes.extend_from_slice(&string_length.to_ne_bytes());
+    for word in TYPES {
+        bytes.extend_from_slice(&word.to_ne_bytes());
+    }
+    bytes.extend_from_slice(STRINGS);
+    load_btf(&bytes, 4096).map_err(|(error, log)| {
+        io::Error::new(
+            error.kind(),
+            format!("failed to load probe BTF: {error}: {log}"),
+        )
+    })
+}
+
 pub(crate) fn map_lookup(fd: RawFd, key: &[u8], value: &mut [u8], flags: u64) -> io::Result<bool> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
@@ -695,6 +857,157 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
     };
     set_object_name(&mut attr.prog_name, options.name);
     command_fd(BPF_PROG_LOAD, &attr).map_err(|error| (error, log_string(&log)))
+}
+
+pub(crate) fn probe_program_type(program_type: u32) -> io::Result<bool> {
+    let Some(config) = probe_program_config(program_type) else {
+        return Ok(false);
+    };
+    let instructions = [
+        Instruction::new(0xb7, 0, 0, 0, 0),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    let result = probe_program_load(program_type, &instructions, config, false);
+    Ok(match (result, config.expected_failure) {
+        (Ok(_), None) => true,
+        (Ok(_), Some(_)) => false,
+        (Err((error, log)), Some((expected_errno, expected_message))) => {
+            error.raw_os_error() == Some(expected_errno)
+                && expected_message.is_none_or(|message| log.contains(message))
+        }
+        (Err(_), None) => false,
+    })
+}
+
+pub(crate) fn probe_program_helper(program_type: u32, helper_id: u32) -> io::Result<bool> {
+    if matches!(program_type, 26..=29) {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    let Some(config) = probe_program_config(program_type) else {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    };
+    let instructions = [
+        Instruction::new(0x85, 0, 0, 0, helper_id as i32),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    match probe_program_load(program_type, &instructions, config, true) {
+        Ok(_) => Ok(true),
+        Err((_, log))
+            if log.contains("invalid func ")
+                || log.contains("unknown func ")
+                || log.contains("program of this type cannot use helper ") =>
+        {
+            Ok(false)
+        }
+        Err(_) => Ok(true),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProbeProgramConfig {
+    expected_attach_type: u32,
+    kernel_version: u32,
+    flags: u32,
+    attach_btf_id: u32,
+    expected_failure: Option<(i32, Option<&'static str>)>,
+}
+
+fn probe_program_config(program_type: u32) -> Option<ProbeProgramConfig> {
+    if program_type > 32 {
+        return None;
+    }
+    let mut config = ProbeProgramConfig {
+        expected_attach_type: 0,
+        kernel_version: 0,
+        flags: 0,
+        attach_btf_id: 0,
+        expected_failure: None,
+    };
+    match program_type {
+        2 => config.kernel_version = running_kernel_version(),
+        18 => config.expected_attach_type = 10, // BPF_CGROUP_INET4_CONNECT
+        20 => config.expected_attach_type = 16, // BPF_LIRC_MODE2
+        25 => config.expected_attach_type = 21, // BPF_CGROUP_GETSOCKOPT
+        26 => {
+            config.expected_attach_type = 24; // BPF_TRACE_FENTRY
+            config.attach_btf_id = 1;
+            config.expected_failure =
+                Some((libc::EINVAL, Some("attach_btf_id 1 is not a function")));
+        }
+        27 => config.expected_failure = Some((524, None)), // ENOTSUPP
+        28 => {
+            config.attach_btf_id = 1;
+            config.expected_failure = Some((libc::EINVAL, Some("Cannot replace kernel functions")));
+        }
+        29 => {
+            config.expected_attach_type = 26; // BPF_MODIFY_RETURN
+            config.attach_btf_id = 1;
+            config.expected_failure =
+                Some((libc::EINVAL, Some("attach_btf_id 1 is not a function")));
+        }
+        30 => config.expected_attach_type = 36, // BPF_SK_LOOKUP
+        31 => config.flags = 1 << 4,            // BPF_F_SLEEPABLE
+        32 => config.expected_attach_type = 45, // BPF_NETFILTER
+        _ => {}
+    }
+    Some(config)
+}
+
+fn probe_program_load(
+    program_type: u32,
+    instructions: &[Instruction],
+    config: ProbeProgramConfig,
+    always_log: bool,
+) -> Result<OwnedFd, (io::Error, String)> {
+    let log = always_log || config.expected_failure.is_some();
+    program_load(&ProgramLoad {
+        program_type,
+        expected_attach_type: config.expected_attach_type,
+        name: "",
+        instructions,
+        license: b"GPL\0",
+        kernel_version: config.kernel_version,
+        flags: config.flags,
+        btf_fd: None,
+        func_info: &[],
+        func_info_record_size: 0,
+        line_info: &[],
+        line_info_record_size: 0,
+        attach_btf_id: config.attach_btf_id,
+        attach_program_fd: None,
+        log_level: u32::from(log),
+        log_size: if log { 4096 } else { 0 },
+    })
+}
+
+fn running_kernel_version() -> u32 {
+    let Ok(release) = fs::read_to_string("/proc/sys/kernel/osrelease") else {
+        return 0;
+    };
+    let mut components = release.trim().split('.');
+    let Some(major) = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return 0;
+    };
+    let Some(minor) = components
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return 0;
+    };
+    let Some(patch) = components.next().and_then(|value| {
+        value
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse::<u32>()
+            .ok()
+    }) else {
+        return 0;
+    };
+    (major << 16) | (minor.min(255) << 8) | patch.min(255)
 }
 
 pub(crate) fn supports_bpf_cookie() -> bool {
