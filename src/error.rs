@@ -21,6 +21,16 @@ pub enum Error {
         source: io::Error,
     },
 
+    /// Creating a named kernel map failed.
+    #[error("failed to create eBPF map `{map}`: {source}")]
+    MapCreate {
+        /// Map requested by the object.
+        map: String,
+        /// Error returned by `BPF_MAP_CREATE`.
+        #[source]
+        source: io::Error,
+    },
+
     /// Reading or writing a path failed.
     #[error("failed to {operation} `{path}`: {source}")]
     File {

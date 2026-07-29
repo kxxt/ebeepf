@@ -6,11 +6,11 @@ use std::str;
 
 use goblin::elf::header::{EI_CLASS, ELFCLASS64, EM_BPF, ET_REL};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
-use goblin::elf::sym::{STB_GLOBAL, STT_FUNC, STT_OBJECT};
+use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT};
 use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfType, Endian};
-use crate::map::{MapFlags, Pinning};
+use crate::map::{possible_cpu_count, MapFlags, Pinning};
 use crate::program::{program_flags_from_section, ProgramKind, VerifierLog};
 use crate::sys::{self, MapCreate};
 use crate::{
@@ -26,6 +26,7 @@ const BPF_LD_IMM_DW: u8 = 0x18;
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 const BPF_PSEUDO_CALL: u8 = 1;
+const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 const BPF_PSEUDO_FUNC: u8 = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,6 +46,51 @@ struct CoreRelocation {
     kind: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KfuncRelocation {
+    program: String,
+    instruction_index: usize,
+    name: String,
+    weak: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Placement {
+    source_start: usize,
+    destination_start: usize,
+    instruction_count: usize,
+}
+
+type Placements = HashMap<usize, Vec<Placement>>;
+
+fn translate_placement(
+    placements: &Placements,
+    section_index: usize,
+    source_index: usize,
+) -> Option<usize> {
+    placements
+        .get(&section_index)?
+        .iter()
+        .find_map(|placement| placement.translate(source_index))
+}
+
+impl Placement {
+    fn translate(self, source_index: usize) -> Option<usize> {
+        let local = source_index.checked_sub(self.source_start)?;
+        (local < self.instruction_count)
+            .then(|| self.destination_start.checked_add(local))
+            .flatten()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EntryPoint {
+    section_index: usize,
+    name: String,
+    byte_offset: usize,
+    byte_size: usize,
+}
+
 /// A parsed, configurable eBPF object that has not created kernel resources.
 #[derive(Clone, Debug)]
 pub struct Object {
@@ -55,6 +101,7 @@ pub struct Object {
     programs: BTreeMap<String, ProgramSpec>,
     map_relocations: Vec<MapRelocation>,
     core_relocations: Vec<CoreRelocation>,
+    kfunc_relocations: Vec<KfuncRelocation>,
     pin_root: PathBuf,
 }
 
@@ -86,7 +133,7 @@ impl Object {
         validate_elf(&elf)?;
 
         let sections = Sections::new(&elf, bytes)?;
-        let btf = parse_btf(&elf, &sections)?;
+        let mut btf = parse_btf(&elf, &sections)?;
         let btf_ext = match (btf.as_ref(), sections.by_name(".BTF.ext")) {
             (Some(btf), Some((index, _))) => {
                 let data = relocated_metadata_section(&elf, &sections, index)?;
@@ -112,30 +159,57 @@ impl Object {
 
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
+        let extern_data = add_kconfig_map(&name, btf.as_mut(), &mut maps)?;
         resolve_inner_maps(&elf, &sections, &mut maps)?;
 
         let mut programs = BTreeMap::new();
         let mut map_relocations = Vec::new();
         let mut core_relocations = Vec::new();
-        let text = sections.by_name(".text").map(|(index, _)| index);
-
-        for entry_index in executable_entry_sections(&elf, &sections) {
+        let mut kfunc_relocations = Vec::new();
+        for entry in executable_entries(&elf, &sections)? {
+            let entry_index = entry.section_index;
             let entry_name = sections.name(entry_index)?;
             let entry_data = sections.data(entry_index)?;
-            let mut instructions = Instruction::decode(entry_data)?;
+            let entry_end = entry
+                .byte_offset
+                .checked_add(entry.byte_size)
+                .ok_or_else(|| Error::InvalidObject("program range overflow".into()))?;
+            let entry_bytes = entry_data
+                .get(entry.byte_offset..entry_end)
+                .ok_or_else(|| Error::InvalidObject("program lies outside its section".into()))?;
+            let mut instructions = Instruction::decode(entry_bytes)?;
             let entry_instruction_count = instructions.len();
-            let mut placements = HashMap::from([(entry_index, 0_usize)]);
+            let mut placements = HashMap::from([(
+                entry_index,
+                vec![Placement {
+                    source_start: entry.byte_offset / Instruction::SIZE,
+                    destination_start: 0,
+                    instruction_count: entry_instruction_count,
+                }],
+            )]);
 
-            if let Some(text_index) = text {
-                let text_data = sections.data(text_index)?;
-                if !text_data.is_empty() {
-                    placements.insert(text_index, instructions.len());
-                    instructions.extend(Instruction::decode(text_data)?);
-                }
+            for linked in linked_subprograms(&elf, &sections, &entry)? {
+                let section_data = sections.data(linked.section_index)?;
+                let end = linked
+                    .byte_offset
+                    .checked_add(linked.byte_size)
+                    .ok_or_else(|| Error::InvalidObject("subprogram range overflow".into()))?;
+                let bytes = section_data.get(linked.byte_offset..end).ok_or_else(|| {
+                    Error::InvalidObject("subprogram lies outside section".into())
+                })?;
+                let subprogram_instructions = Instruction::decode(bytes)?;
+                placements
+                    .entry(linked.section_index)
+                    .or_default()
+                    .push(Placement {
+                        source_start: linked.byte_offset / Instruction::SIZE,
+                        destination_start: instructions.len(),
+                        instruction_count: subprogram_instructions.len(),
+                    });
+                instructions.extend(subprogram_instructions);
             }
 
-            let program_name =
-                program_symbol_name(&elf, entry_index).unwrap_or_else(|| sanitize_name(entry_name));
+            let program_name = entry.name;
             let kind = ProgramKind::from_section(entry_name).unwrap_or(ProgramKind::Other {
                 program_type: ProgramType::Unspecified,
                 attach_type: None,
@@ -155,17 +229,19 @@ impl Object {
                 line_info_record_size: 0,
                 verifier_log: VerifierLog::default(),
                 section_index: entry_index,
-                section_offset: 0,
+                section_offset: entry.byte_offset as u64,
             };
 
             apply_program_relocations(
                 &elf,
                 &placements,
                 &data_sections,
+                &extern_data,
                 &maps,
                 &program_name,
                 &mut spec.instructions,
                 &mut map_relocations,
+                &mut kfunc_relocations,
             )?;
 
             if let Some(ext) = &btf_ext {
@@ -197,21 +273,12 @@ impl Object {
 
             // The entry section is always first; this field is useful to
             // consumers inspecting the unrelocated ELF relationship.
-            debug_assert_eq!(
-                entry_instruction_count,
-                entry_data.len() / Instruction::SIZE
-            );
+            debug_assert_eq!(entry_instruction_count, entry.byte_size / Instruction::SIZE);
             if programs.insert(program_name.clone(), spec).is_some() {
                 return Err(Error::InvalidObject(format!(
                     "duplicate program name `{program_name}`"
                 )));
             }
-        }
-
-        if programs.is_empty() {
-            return Err(Error::InvalidObject(
-                "ELF object contains no executable eBPF program sections".into(),
-            ));
         }
 
         Ok(Self {
@@ -222,6 +289,7 @@ impl Object {
             programs,
             map_relocations,
             core_relocations,
+            kfunc_relocations,
             pin_root: "/sys/fs/bpf".into(),
         })
     }
@@ -341,6 +409,13 @@ impl Object {
     /// error, all descriptors created so far are closed. Maps pinned by policy
     /// remain pinned, as requested by their definitions.
     pub fn load(mut self) -> Result<LoadedObject> {
+        for map in self.maps.values_mut() {
+            if map.map_type == MapType::PerfEventArray && map.max_entries == 0 {
+                map.max_entries = u32::try_from(possible_cpu_count()?).map_err(|_| {
+                    Error::InvalidObject("possible CPU count does not fit u32".into())
+                })?;
+            }
+        }
         for map in self.maps.values() {
             map.validate()?;
         }
@@ -351,17 +426,30 @@ impl Object {
         if !self.core_relocations.is_empty() {
             self.relocate_for_running_kernel()?;
         }
+        resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations)?;
         resolve_attach_btf_ids(&mut self.programs)?;
 
-        let btf_fd = self
+        let kernel_btf = self
             .btf
             .as_ref()
             .map(|btf| {
-                sys::load_btf(btf.as_bytes(), 256 * 1024).map_err(|(source, log)| {
-                    Error::InvalidObject(format!("kernel rejected object BTF: {source}\n{log}"))
-                })
+                let mut btf = btf.clone();
+                btf.sanitize_extern_linkage_for_kernel()?;
+                Ok::<_, Error>(btf)
             })
             .transpose()?;
+        let btf_fd = match kernel_btf.as_ref() {
+            Some(btf) => match sys::load_btf(btf.as_bytes(), 256 * 1024) {
+                Ok(fd) => Some(fd),
+                Err(_) if !self.kfunc_relocations.is_empty() => None,
+                Err((source, log)) => {
+                    return Err(Error::InvalidObject(format!(
+                        "kernel rejected object BTF: {source}\n{log}"
+                    )));
+                }
+            },
+            None => None,
+        };
 
         let maps = load_maps(&self.maps, btf_fd.as_ref(), &self.pin_root)?;
         relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
@@ -879,6 +967,68 @@ fn add_data_maps(
     Ok(result)
 }
 
+fn add_kconfig_map(
+    object_name: &str,
+    btf: Option<&mut Btf>,
+    maps: &mut BTreeMap<String, MapSpec>,
+) -> Result<HashMap<String, (String, u32)>> {
+    let Some(btf) = btf else {
+        return Ok(HashMap::new());
+    };
+    let Some((data_section_id, BtfType::DataSection { variables, .. })) =
+        btf.find(crate::BtfKind::DataSection, ".kconfig")
+    else {
+        return Ok(HashMap::new());
+    };
+    let variables = variables.clone();
+    let size = variables.iter().try_fold(0_u32, |size, variable| {
+        variable
+            .offset
+            .checked_add(variable.size)
+            .map(|end| size.max(end))
+            .ok_or_else(|| Error::InvalidObject(".kconfig data size overflow".into()))
+    })?;
+    if size == 0 {
+        return Ok(HashMap::new());
+    }
+
+    let name = format!("{}.kconfig", sanitize_kernel_name(object_name));
+    let mut symbols = HashMap::new();
+    for variable in &variables {
+        let BtfType::Variable {
+            name: variable_name,
+            ..
+        } = btf.type_by_id(variable.ty).ok_or_else(|| {
+            Error::Btf(format!(
+                ".kconfig references missing variable type {}",
+                variable.ty.0
+            ))
+        })?
+        else {
+            return Err(Error::Btf(format!(
+                ".kconfig type {} is not a variable",
+                variable.ty.0
+            )));
+        };
+        symbols.insert(variable_name.clone(), (name.clone(), variable.offset));
+    }
+
+    // Virtual and CONFIG_ externs default conservatively to zero, keeping
+    // optional feature paths disabled instead of guessing kernel state.
+    let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
+    spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
+    spec.initial_value = Some(vec![0; size as usize]);
+    spec.freeze_after_init = true;
+    spec.btf_value_type = data_section_id;
+    btf.set_data_section_size(".kconfig", size)?;
+    if maps.insert(name.clone(), spec).is_some() {
+        return Err(Error::InvalidObject(format!(
+            "kconfig map name `{name}` conflicts with a declared map"
+        )));
+    }
+    Ok(symbols)
+}
+
 fn is_data_section(name: &str, header: &SectionHeader) -> bool {
     let conventional = name == ".data"
         || name.starts_with(".data.")
@@ -930,34 +1080,220 @@ fn resolve_inner_maps(
     Ok(())
 }
 
-fn executable_entry_sections(elf: &Elf<'_>, sections: &Sections<'_>) -> Vec<usize> {
-    elf.section_headers
+fn executable_entries(elf: &Elf<'_>, sections: &Sections<'_>) -> Result<Vec<EntryPoint>> {
+    let mut entries = Vec::new();
+    for (section_index, header) in
+        elf.section_headers
+            .iter()
+            .enumerate()
+            .filter(|(index, header)| {
+                header.sh_flags & u64::from(SHF_EXECINSTR) != 0
+                    && header.sh_size > 0
+                    && !sections.names[*index].starts_with(".text")
+            })
+    {
+        let section_size = usize::try_from(header.sh_size)
+            .map_err(|_| Error::InvalidObject("executable section is too large".into()))?;
+        let mut symbols = elf
+            .syms
+            .iter()
+            .filter(|symbol| {
+                symbol.st_shndx == section_index
+                    && symbol.st_type() == STT_FUNC
+                    && symbol.st_bind() == STB_GLOBAL
+            })
+            .map(|symbol| {
+                Ok((
+                    usize::try_from(symbol.st_value).map_err(|_| {
+                        Error::InvalidObject("program symbol offset is too large".into())
+                    })?,
+                    usize::try_from(symbol.st_size).map_err(|_| {
+                        Error::InvalidObject("program symbol size is too large".into())
+                    })?,
+                    symbol_name(elf, &symbol)?.to_owned(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        symbols.sort_by_key(|(offset, _, _)| *offset);
+
+        if symbols.is_empty() {
+            entries.push(EntryPoint {
+                section_index,
+                name: sanitize_name(sections.name(section_index)?),
+                byte_offset: 0,
+                byte_size: section_size,
+            });
+            continue;
+        }
+
+        for (position, (offset, declared_size, name)) in symbols.iter().enumerate() {
+            let next_offset = symbols
+                .get(position + 1)
+                .map_or(section_size, |(offset, _, _)| *offset);
+            let size = if *declared_size == 0 {
+                next_offset.checked_sub(*offset).ok_or_else(|| {
+                    Error::InvalidObject(format!("program `{name}` symbols overlap"))
+                })?
+            } else {
+                *declared_size
+            };
+            let end = offset
+                .checked_add(size)
+                .ok_or_else(|| Error::InvalidObject(format!("program `{name}` range overflow")))?;
+            if *offset % Instruction::SIZE != 0
+                || size == 0
+                || size % Instruction::SIZE != 0
+                || end > section_size
+                || end > next_offset
+            {
+                return Err(Error::InvalidObject(format!(
+                    "program `{name}` has invalid section range {offset}..{end}"
+                )));
+            }
+            entries.push(EntryPoint {
+                section_index,
+                name: name.clone(),
+                byte_offset: *offset,
+                byte_size: size,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn linked_subprograms(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    entry: &EntryPoint,
+) -> Result<Vec<EntryPoint>> {
+    let mut linked = Vec::new();
+    let mut seen = HashSet::new();
+    let mut queue = vec![entry.clone()];
+    let mut position = 0;
+    while let Some(source) = queue.get(position).cloned() {
+        position += 1;
+        let source_end = source
+            .byte_offset
+            .checked_add(source.byte_size)
+            .ok_or_else(|| Error::InvalidObject("subprogram range overflow".into()))?;
+        for (relocation_index, relocations) in &elf.shdr_relocs {
+            if elf.section_headers[*relocation_index].sh_info as usize != source.section_index {
+                continue;
+            }
+            for relocation in relocations {
+                let offset = usize::try_from(relocation.r_offset).map_err(|_| {
+                    Error::InvalidObject("subprogram relocation offset is too large".into())
+                })?;
+                if offset < source.byte_offset
+                    || offset >= source_end
+                    || !matches!(relocation.r_type, R_BPF_64_32 | R_BPF_64_64)
+                {
+                    continue;
+                }
+                let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
+                    Error::Elf(format!(
+                        "subprogram relocation references missing symbol {}",
+                        relocation.r_sym
+                    ))
+                })?;
+                let target_section = symbol.st_shndx;
+                if target_section == 0 || !sections.name(target_section)?.starts_with(".text") {
+                    continue;
+                }
+                let target_symbol = if symbol.st_type() == STT_FUNC {
+                    symbol
+                } else {
+                    let target_offset =
+                        i128::from(symbol.st_value) + i128::from(relocation.r_addend.unwrap_or(0));
+                    elf.syms
+                        .iter()
+                        .find(|candidate| {
+                            candidate.st_shndx == target_section
+                                && candidate.st_type() == STT_FUNC
+                                && i128::from(candidate.st_value) == target_offset
+                        })
+                        .ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "function-address relocation in `{}` has no target symbol",
+                                source.name
+                            ))
+                        })?
+                };
+                let target = function_entry(elf, target_section, &target_symbol)?;
+                if seen.insert((target.section_index, target.byte_offset)) {
+                    queue.push(target.clone());
+                    linked.push(target);
+                }
+            }
+        }
+    }
+    Ok(linked)
+}
+
+fn function_entry(elf: &Elf<'_>, section_index: usize, symbol: &Sym) -> Result<EntryPoint> {
+    let section_size = usize::try_from(elf.section_headers[section_index].sh_size)
+        .map_err(|_| Error::InvalidObject("function section is too large".into()))?;
+    let byte_offset = usize::try_from(symbol.st_value)
+        .map_err(|_| Error::InvalidObject("function offset is too large".into()))?;
+    let next_offset = elf
+        .syms
         .iter()
-        .enumerate()
-        .filter(|(index, header)| {
-            header.sh_flags & u64::from(SHF_EXECINSTR) != 0
-                && header.sh_size > 0
-                && sections.names[*index] != ".text"
+        .filter(|candidate| {
+            candidate.st_shndx == section_index
+                && candidate.st_type() == STT_FUNC
+                && candidate.st_value > symbol.st_value
         })
-        .map(|(index, _)| index)
-        .collect()
+        .filter_map(|candidate| usize::try_from(candidate.st_value).ok())
+        .min()
+        .unwrap_or(section_size);
+    let declared_size = usize::try_from(symbol.st_size)
+        .map_err(|_| Error::InvalidObject("function size is too large".into()))?;
+    let byte_size = if declared_size == 0 {
+        next_offset
+            .checked_sub(byte_offset)
+            .ok_or_else(|| Error::InvalidObject("function symbols overlap".into()))?
+    } else {
+        declared_size
+    };
+    let end = byte_offset
+        .checked_add(byte_size)
+        .ok_or_else(|| Error::InvalidObject("function range overflow".into()))?;
+    let name = symbol_name(elf, symbol)?.to_owned();
+    if byte_offset % Instruction::SIZE != 0
+        || byte_size == 0
+        || byte_size % Instruction::SIZE != 0
+        || end > section_size
+        || end > next_offset
+    {
+        return Err(Error::InvalidObject(format!(
+            "function `{name}` has invalid section range {byte_offset}..{end}"
+        )));
+    }
+    Ok(EntryPoint {
+        section_index,
+        name,
+        byte_offset,
+        byte_size,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn apply_program_relocations(
     elf: &Elf<'_>,
-    placements: &HashMap<usize, usize>,
+    placements: &Placements,
     data_sections: &HashMap<usize, String>,
+    extern_data: &HashMap<String, (String, u32)>,
     maps: &BTreeMap<String, MapSpec>,
     program_name: &str,
     instructions: &mut [Instruction],
     map_relocations: &mut Vec<MapRelocation>,
+    kfunc_relocations: &mut Vec<KfuncRelocation>,
 ) -> Result<()> {
     for (relocation_index, relocations) in &elf.shdr_relocs {
         let source_section = elf.section_headers[*relocation_index].sh_info as usize;
-        let Some(source_base) = placements.get(&source_section).copied() else {
+        if !placements.contains_key(&source_section) {
             continue;
-        };
+        }
         for relocation in relocations {
             if relocation.r_offset % Instruction::SIZE as u64 != 0 {
                 return Err(Error::InvalidObject(format!(
@@ -967,9 +1303,11 @@ fn apply_program_relocations(
             }
             let local_index = usize::try_from(relocation.r_offset / Instruction::SIZE as u64)
                 .map_err(|_| Error::InvalidObject("relocation offset is too large".into()))?;
-            let instruction_index = source_base
-                .checked_add(local_index)
-                .ok_or_else(|| Error::InvalidObject("relocation index overflow".into()))?;
+            let Some(instruction_index) =
+                translate_placement(placements, source_section, local_index)
+            else {
+                continue;
+            };
             let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
                 Error::Elf(format!(
                     "program relocation references missing symbol {}",
@@ -980,17 +1318,37 @@ fn apply_program_relocations(
 
             match relocation.r_type {
                 R_BPF_64_32 => {
-                    let target_base = placements.get(&target_section).ok_or_else(|| {
-                        Error::Unsupported(format!(
+                    if target_section == 0 {
+                        let name = symbol_name(elf, &symbol)?.to_owned();
+                        let instruction =
+                            instructions.get_mut(instruction_index).ok_or_else(|| {
+                                Error::InvalidObject("kfunc relocation is outside program".into())
+                            })?;
+                        instruction.set_source(BPF_PSEUDO_KFUNC_CALL)?;
+                        instruction.immediate = 0;
+                        kfunc_relocations.push(KfuncRelocation {
+                            program: program_name.into(),
+                            instruction_index,
+                            name,
+                            weak: symbol.st_bind() == STB_WEAK,
+                        });
+                        continue;
+                    }
+                    if !placements.contains_key(&target_section) {
+                        return Err(Error::Unsupported(format!(
                             "program `{program_name}` calls `{}` in a section that is not linked",
                             symbol_name(elf, &symbol).unwrap_or("<unnamed>")
-                        ))
-                    })?;
+                        )));
+                    }
                     let target_local = usize::try_from(symbol.st_value / Instruction::SIZE as u64)
                         .map_err(|_| Error::InvalidObject("call target is too large".into()))?;
-                    let target = target_base
-                        .checked_add(target_local)
-                        .ok_or_else(|| Error::InvalidObject("call target index overflow".into()))?;
+                    let target = translate_placement(placements, target_section, target_local)
+                        .ok_or_else(|| {
+                            Error::Unsupported(format!(
+                                "program `{program_name}` calls `{}` outside its linked instruction set",
+                                symbol_name(elf, &symbol).unwrap_or("<unnamed>")
+                            ))
+                        })?;
                     let delta = i64::try_from(target)
                         .and_then(|target| {
                             i64::try_from(instruction_index).map(|source| target - source - 1)
@@ -1008,10 +1366,18 @@ fn apply_program_relocations(
                 }
                 R_BPF_64_64 => {
                     if placements.contains_key(&target_section) {
-                        let target = placements[&target_section]
-                            + usize::try_from(symbol.st_value / Instruction::SIZE as u64).map_err(
-                                |_| Error::InvalidObject("function target too large".into()),
-                            )?;
+                        let target_local = usize::try_from(
+                            symbol.st_value / Instruction::SIZE as u64,
+                        )
+                        .map_err(|_| Error::InvalidObject("function target too large".into()))?;
+                        let target =
+                            translate_placement(placements, target_section, target_local)
+                                .ok_or_else(|| {
+                                    Error::Unsupported(format!(
+                                        "program `{program_name}` references function `{}` outside its linked instruction set",
+                                        symbol_name(elf, &symbol).unwrap_or("<unnamed>")
+                                    ))
+                                })?;
                         let delta = i64::try_from(target)
                             .and_then(|target| {
                                 i64::try_from(instruction_index).map(|source| target - source - 1)
@@ -1047,7 +1413,22 @@ fn apply_program_relocations(
                         (map.clone(), Some(offset))
                     } else {
                         let name = symbol_name(elf, &symbol)?;
-                        if maps.contains_key(name) {
+                        if let Some((map, base_offset)) = extern_data.get(name) {
+                            let addend = relocation.r_addend.unwrap_or_default();
+                            let embedded = instructions
+                                .get(instruction_index + 1)
+                                .map(|instruction| i64::from(instruction.immediate))
+                                .unwrap_or_default();
+                            let offset = i128::from(*base_offset)
+                                + i128::from(addend)
+                                + i128::from(embedded);
+                            let offset = u32::try_from(offset).map_err(|_| {
+                                Error::InvalidObject(
+                                    "extern data relocation offset does not fit u32".into(),
+                                )
+                            })?;
+                            (map.clone(), Some(offset))
+                        } else if maps.contains_key(name) {
                             (name.into(), None)
                         } else {
                             let absolute = symbol.st_value.saturating_add(
@@ -1169,21 +1550,39 @@ fn load_maps(
                     .as_ref()
                     .and_then(|inner| loaded.get(inner))
                     .map(|map: &Map| map.fd.as_raw_fd());
-                let fd = sys::map_create(&MapCreate {
-                    map_type: spec.map_type.as_raw(),
-                    name: &spec.name,
-                    key_size: spec.key_size,
-                    value_size: spec.value_size,
-                    max_entries: spec.max_entries,
-                    flags: spec.flags.bits(),
-                    inner_map_fd: inner_fd,
-                    numa_node: spec.numa_node,
-                    btf_fd: btf_fd.map(AsRawFd::as_raw_fd),
-                    btf_key_type_id: spec.btf_key_type.0,
-                    btf_value_type_id: spec.btf_value_type.0,
-                    map_extra: spec.map_extra,
-                })
-                .map_err(|source| Error::system("create eBPF map", source))?;
+                let accepts_btf = spec.map_type.accepts_btf_types();
+                let create = |with_btf: bool| {
+                    sys::map_create(&MapCreate {
+                        map_type: spec.map_type.as_raw(),
+                        name: &spec.name,
+                        key_size: spec.key_size,
+                        value_size: spec.value_size,
+                        max_entries: spec.max_entries,
+                        flags: spec.flags.bits(),
+                        inner_map_fd: inner_fd,
+                        numa_node: spec.numa_node,
+                        btf_fd: with_btf.then_some(btf_fd).flatten().map(AsRawFd::as_raw_fd),
+                        btf_key_type_id: if with_btf { spec.btf_key_type.0 } else { 0 },
+                        btf_value_type_id: if with_btf { spec.btf_value_type.0 } else { 0 },
+                        map_extra: spec.map_extra,
+                    })
+                };
+                let with_btf = accepts_btf
+                    && btf_fd.is_some()
+                    && (spec.btf_key_type != TypeId::VOID || spec.btf_value_type != TypeId::VOID);
+                let fd = match create(with_btf) {
+                    Ok(fd) => fd,
+                    Err(_) if with_btf => create(false).map_err(|source| Error::MapCreate {
+                        map: name.clone(),
+                        source,
+                    })?,
+                    Err(source) => {
+                        return Err(Error::MapCreate {
+                            map: name.clone(),
+                            source,
+                        });
+                    }
+                };
                 let map = Map::from_fd(fd, spec.clone());
                 if let Some(initial) = &spec.initial_value {
                     sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
@@ -1301,16 +1700,49 @@ fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Resul
     Ok(())
 }
 
-fn program_symbol_name(elf: &Elf<'_>, section_index: usize) -> Option<String> {
-    elf.syms
-        .iter()
-        .filter(|symbol| {
-            symbol.st_shndx == section_index
-                && symbol.st_type() == STT_FUNC
-                && symbol.st_bind() == STB_GLOBAL
-                && symbol.st_value == 0
-        })
-        .find_map(|symbol| symbol_name(elf, &symbol).ok().map(str::to_owned))
+fn resolve_kfunc_relocations(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[KfuncRelocation],
+) -> Result<()> {
+    if relocations.is_empty() {
+        return Ok(());
+    }
+    let bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+        operation: "read kernel BTF for kfunc relocation",
+        path: "/sys/kernel/btf/vmlinux".into(),
+        source,
+    })?;
+    let kernel_btf = Btf::parse(&bytes)?;
+    for (index, relocation) in relocations.iter().enumerate() {
+        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "kfunc relocation references missing program `{}`",
+                relocation.program
+            ))
+        })?;
+        let instruction = program
+            .instructions
+            .get_mut(relocation.instruction_index)
+            .ok_or_else(|| Error::InvalidObject("kfunc relocation is outside program".into()))?;
+        if let Some((type_id, _)) = kernel_btf.find(crate::BtfKind::Function, &relocation.name) {
+            instruction.set_source(BPF_PSEUDO_KFUNC_CALL)?;
+            instruction.offset = 0;
+            instruction.immediate = i32::try_from(type_id.0)
+                .map_err(|_| Error::Btf("kfunc BTF ID does not fit i32".into()))?;
+        } else if relocation.weak {
+            instruction.set_source(0)?;
+            instruction.offset = 0;
+            instruction.immediate = 2_002_000_000_i32
+                .checked_add(i32::try_from(index).unwrap_or(i32::MAX))
+                .unwrap_or(i32::MAX);
+        } else {
+            return Err(Error::Unsupported(format!(
+                "kernel BTF does not define kfunc `{}`",
+                relocation.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn symbol_name<'a>(elf: &'a Elf<'_>, symbol: &Sym) -> Result<&'a str> {
@@ -1491,16 +1923,23 @@ fn append_ext_info(
     output: &mut Vec<u8>,
     output_record_size: &mut u32,
     segment: &ExtSegment,
-    placements: &HashMap<usize, usize>,
+    placements: &Placements,
     sections: &Sections<'_>,
     endian: Endian,
 ) -> Result<()> {
     if segment.record_size == 0 {
         return Ok(());
     }
-    let mut ordered = placements.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|(_, base)| **base);
-    for (section_index, base) in ordered {
+    let mut ordered = placements
+        .iter()
+        .flat_map(|(section_index, placements)| {
+            placements
+                .iter()
+                .map(move |placement| (section_index, placement))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, placement)| placement.destination_start);
+    for (section_index, placement) in ordered {
         let section_name = sections.name(*section_index)?;
         let Some(records) = segment.sections.get(section_name) else {
             continue;
@@ -1513,10 +1952,13 @@ fn append_ext_info(
                     ".BTF.ext record for `{section_name}` is not instruction-aligned"
                 )));
             }
-            let instruction_offset = u32::try_from(*base)
-                .ok()
-                .and_then(|base| base.checked_add(byte_offset / Instruction::SIZE as u32))
-                .ok_or_else(|| Error::Btf(".BTF.ext instruction offset overflow".into()))?;
+            let source_index = usize::try_from(byte_offset / Instruction::SIZE as u32)
+                .map_err(|_| Error::Btf(".BTF.ext instruction offset is too large".into()))?;
+            let Some(destination_index) = placement.translate(source_index) else {
+                continue;
+            };
+            let instruction_offset = u32::try_from(destination_index)
+                .map_err(|_| Error::Btf(".BTF.ext instruction offset overflow".into()))?;
             write_ext_u32(&mut record, 0, instruction_offset, endian)?;
             output.extend(record);
         }
@@ -1530,7 +1972,7 @@ fn append_ext_info(
 fn append_core_relocations(
     program_name: &str,
     segment: &ExtSegment,
-    placements: &HashMap<usize, usize>,
+    placements: &Placements,
     output: &mut Vec<CoreRelocation>,
     btf: &Btf,
     sections: &Sections<'_>,
@@ -1544,34 +1986,36 @@ fn append_core_relocations(
             segment.record_size
         )));
     }
-    for (section_index, base) in placements {
-        let section_name = sections.name(*section_index)?;
-        let Some(records) = segment.sections.get(section_name) else {
-            continue;
-        };
-        for record in records {
-            let byte_offset = read_ext_u32(record, 0, btf.endian())?;
-            if byte_offset % Instruction::SIZE as u32 != 0 {
-                return Err(Error::Btf(format!(
-                    "CO-RE relocation for `{section_name}` is not instruction-aligned"
-                )));
+    for (section_index, section_placements) in placements {
+        for placement in section_placements {
+            let section_name = sections.name(*section_index)?;
+            let Some(records) = segment.sections.get(section_name) else {
+                continue;
+            };
+            for record in records {
+                let byte_offset = read_ext_u32(record, 0, btf.endian())?;
+                if byte_offset % Instruction::SIZE as u32 != 0 {
+                    return Err(Error::Btf(format!(
+                        "CO-RE relocation for `{section_name}` is not instruction-aligned"
+                    )));
+                }
+                let local_index = usize::try_from(byte_offset / Instruction::SIZE as u32)
+                    .map_err(|_| Error::Btf("CO-RE instruction offset is too large".into()))?;
+                let Some(instruction_index) = placement.translate(local_index) else {
+                    continue;
+                };
+                let type_id = TypeId(read_ext_u32(record, 4, btf.endian())?);
+                let access_offset = read_ext_u32(record, 8, btf.endian())?;
+                let access = btf.string_at(access_offset)?.to_owned();
+                let kind = read_ext_u32(record, 12, btf.endian())?;
+                output.push(CoreRelocation {
+                    program: program_name.into(),
+                    instruction_index,
+                    type_id,
+                    access,
+                    kind,
+                });
             }
-            let local_index = usize::try_from(byte_offset / Instruction::SIZE as u32)
-                .map_err(|_| Error::Btf("CO-RE instruction offset is too large".into()))?;
-            let instruction_index = base
-                .checked_add(local_index)
-                .ok_or_else(|| Error::Btf("CO-RE instruction offset overflow".into()))?;
-            let type_id = TypeId(read_ext_u32(record, 4, btf.endian())?);
-            let access_offset = read_ext_u32(record, 8, btf.endian())?;
-            let access = btf.string_at(access_offset)?.to_owned();
-            let kind = read_ext_u32(record, 12, btf.endian())?;
-            output.push(CoreRelocation {
-                program: program_name.into(),
-                instruction_index,
-                type_id,
-                access,
-                kind,
-            });
         }
     }
     Ok(())
@@ -2273,6 +2717,134 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn shared_program_section_fixture() -> Vec<u8> {
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let section = object.add_section(
+            Vec::new(),
+            b"raw_tracepoint/sys_enter".to_vec(),
+            SectionKind::Text,
+        );
+        object.append_section_data(
+            section,
+            &instruction_bytes(&[
+                Instruction::new(0xb7, 0, 0, 0, 1),
+                Instruction::new(0x95, 0, 0, 0, 0),
+                Instruction::new(0xb7, 0, 0, 0, 2),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ]),
+            8,
+        );
+        for (name, value) in [(b"first".as_slice(), 0), (b"second".as_slice(), 16)] {
+            object.add_symbol(Symbol {
+                name: name.to_vec(),
+                value,
+                size: 16,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Linkage,
+                weak: false,
+                section: SymbolSection::Section(section),
+                flags: SymbolFlags::None,
+            });
+        }
+        object.write().unwrap()
+    }
+
+    fn selective_subprogram_fixture() -> Vec<u8> {
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let entry = object.add_section(
+            Vec::new(),
+            b"raw_tracepoint/sys_enter".to_vec(),
+            SectionKind::Text,
+        );
+        object.append_section_data(
+            entry,
+            &instruction_bytes(&[
+                Instruction::new(0x85, 0, 0, 0, 0),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ]),
+            8,
+        );
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 16,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(entry),
+            flags: SymbolFlags::None,
+        });
+
+        let text = object.section_id(StandardSection::Text);
+        object.append_section_data(
+            text,
+            &instruction_bytes(&[
+                Instruction::new(0xb7, 0, 0, 0, 1),
+                Instruction::new(0x95, 0, 0, 0, 0),
+                Instruction::new(0xb7, 0, 0, 0, 2),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ]),
+            8,
+        );
+        object.add_symbol(Symbol {
+            name: b"unused".to_vec(),
+            value: 0,
+            size: 16,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        let used = object.add_symbol(Symbol {
+            name: b"used".to_vec(),
+            value: 16,
+            size: 16,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        object
+            .add_relocation(
+                entry,
+                Relocation {
+                    offset: 0,
+                    symbol: used,
+                    addend: 0,
+                    flags: RelocationFlags::Elf {
+                        r_type: R_BPF_64_32,
+                    },
+                },
+            )
+            .unwrap();
+        object.write().unwrap()
+    }
+
+    fn map_only_fixture() -> Vec<u8> {
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let maps = object.add_section(Vec::new(), b".maps".to_vec(), SectionKind::Data);
+        let mut definition = Vec::new();
+        definition.extend(2_u32.to_le_bytes());
+        definition.extend(4_u32.to_le_bytes());
+        definition.extend(8_u32.to_le_bytes());
+        definition.extend(1_u32.to_le_bytes());
+        definition.extend(0_u32.to_le_bytes());
+        object.append_section_data(maps, &definition, 8);
+        object.add_symbol(Symbol {
+            name: b"only_map".to_vec(),
+            value: 0,
+            size: definition.len() as u64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(maps),
+            flags: SymbolFlags::None,
+        });
+        object.write().unwrap()
+    }
+
     fn push_u32(bytes: &mut Vec<u8>, value: u32) {
         bytes.extend(value.to_le_bytes());
     }
@@ -2490,6 +3062,38 @@ mod tests {
         assert_eq!(instructions[0].source(), BPF_PSEUDO_CALL);
         assert_eq!(instructions[0].immediate, 1);
         assert_eq!(instructions[2].immediate, 7);
+    }
+
+    #[test]
+    fn splits_multiple_entry_programs_sharing_one_section() {
+        let object = Object::parse(&shared_program_section_fixture()).unwrap();
+        assert_eq!(object.programs().len(), 2);
+        let first = object.program("first").unwrap();
+        let second = object.program("second").unwrap();
+        assert_eq!(first.instructions().len(), 2);
+        assert_eq!(second.instructions().len(), 2);
+        assert_eq!(first.instructions()[0].immediate, 1);
+        assert_eq!(second.instructions()[0].immediate, 2);
+        assert_eq!(first.section_offset, 0);
+        assert_eq!(second.section_offset, 16);
+    }
+
+    #[test]
+    fn links_only_reachable_subprogram_functions() {
+        let object = Object::parse(&selective_subprogram_fixture()).unwrap();
+        let instructions = object.program("entry").unwrap().instructions();
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].source(), BPF_PSEUDO_CALL);
+        assert_eq!(instructions[0].immediate, 1);
+        assert_eq!(instructions[2].immediate, 2);
+    }
+
+    #[test]
+    fn accepts_objects_containing_only_maps() {
+        let object = Object::parse(&map_only_fixture()).unwrap();
+        assert_eq!(object.maps().len(), 1);
+        assert_eq!(object.programs().len(), 0);
+        assert_eq!(object.map("only_map").unwrap().map_type(), MapType::Array);
     }
 
     #[test]

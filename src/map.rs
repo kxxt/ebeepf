@@ -217,6 +217,26 @@ impl MapType {
     pub const fn is_map_of_maps(self) -> bool {
         matches!(self, Self::ArrayOfMaps | Self::HashOfMaps)
     }
+
+    pub(crate) const fn accepts_btf_types(self) -> bool {
+        !matches!(
+            self,
+            Self::PerfEventArray
+                | Self::CgroupArray
+                | Self::StackTrace
+                | Self::ArrayOfMaps
+                | Self::HashOfMaps
+                | Self::DeviceMap
+                | Self::DeviceMapHash
+                | Self::CpuMap
+                | Self::XskMap
+                | Self::SocketMap
+                | Self::SocketHash
+                | Self::Queue
+                | Self::Stack
+                | Self::Arena
+        )
+    }
 }
 
 /// Pinning policy encoded in a BTF map definition.
@@ -324,6 +344,13 @@ impl MapSpec {
         self.pinning
     }
 
+    /// Initial value written to key zero while loading, when configured.
+    ///
+    /// ELF global-data and kconfig maps have an initial value by default.
+    pub fn initial_value(&self) -> Option<&[u8]> {
+        self.initial_value.as_deref()
+    }
+
     /// Changes the maximum number of entries before loading.
     pub fn set_max_entries(&mut self, max_entries: u32) -> &mut Self {
         self.max_entries = max_entries;
@@ -355,6 +382,17 @@ impl MapSpec {
         self
     }
 
+    /// Replaces the value written to key zero while loading.
+    ///
+    /// This is useful for configuring `.data`, `.rodata`, `.bss`, and
+    /// `.kconfig` maps before [`crate::Object::load`].
+    pub fn set_initial_value(&mut self, value: impl Into<Vec<u8>>) -> Result<&mut Self> {
+        let value = value.into();
+        validate_size("initial map value", self.value_size, value.len())?;
+        self.initial_value = Some(value);
+        Ok(self)
+    }
+
     pub(crate) fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(Error::InvalidObject("map name cannot be empty".into()));
@@ -362,7 +400,13 @@ impl MapSpec {
         if self.max_entries == 0
             && !matches!(
                 self.map_type,
-                MapType::StructOps | MapType::RingBuffer | MapType::UserRingBuffer
+                MapType::CgroupStorage
+                    | MapType::PerCpuCgroupStorage
+                    | MapType::SocketStorage
+                    | MapType::StructOps
+                    | MapType::InodeStorage
+                    | MapType::TaskStorage
+                    | MapType::CgroupLocalStorage
             )
         {
             return Err(Error::InvalidObject(format!(
@@ -375,6 +419,9 @@ impl MapSpec {
                 "map-of-maps `{}` has no inner-map template",
                 self.name
             )));
+        }
+        if let Some(value) = &self.initial_value {
+            validate_size("initial map value", self.value_size, value.len())?;
         }
         Ok(())
     }
@@ -970,6 +1017,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("template"));
+        assert!(MapSpec::new("events", MapType::RingBuffer, 0, 0, 0)
+            .validate()
+            .is_err());
+        assert!(MapSpec::new("storage", MapType::TaskStorage, 4, 8, 0)
+            .validate()
+            .is_ok());
     }
 
     #[test]
@@ -978,9 +1031,12 @@ mod tests {
         spec.set_numa_node(Some(2))
             .set_max_entries(1024)
             .set_pinning(Pinning::ByName);
+        spec.set_initial_value(7_u64.to_ne_bytes()).unwrap();
         assert_eq!(spec.max_entries(), 1024);
         assert!(spec.flags().contains(MapFlags::NUMA_NODE));
         assert_eq!(spec.pinning(), Pinning::ByName);
+        assert_eq!(spec.initial_value(), Some(7_u64.to_ne_bytes().as_slice()));
+        assert!(spec.set_initial_value([0; 4]).is_err());
     }
 
     #[test]

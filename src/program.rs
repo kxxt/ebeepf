@@ -794,6 +794,18 @@ impl Program {
         btf_fd: Option<BorrowedFd<'_>>,
     ) -> Result<Self> {
         spec.validate()?;
+        let btf_fd = btf_fd.map(|fd| fd.as_raw_fd());
+        let (func_info, func_info_record_size, line_info, line_info_record_size) =
+            if btf_fd.is_some() {
+                (
+                    spec.func_info.as_slice(),
+                    spec.func_info_record_size,
+                    spec.line_info.as_slice(),
+                    spec.line_info_record_size,
+                )
+            } else {
+                (&[][..], 0, &[][..], 0)
+            };
         let options = ProgramLoad {
             program_type: spec.program_type().as_raw(),
             expected_attach_type: spec.kind.attach_type().map_or(0, AttachType::as_raw),
@@ -802,11 +814,11 @@ impl Program {
             license,
             kernel_version: spec.kernel_version,
             flags: spec.flags,
-            btf_fd: btf_fd.map(|fd| fd.as_raw_fd()),
-            func_info: &spec.func_info,
-            func_info_record_size: spec.func_info_record_size,
-            line_info: &spec.line_info,
-            line_info_record_size: spec.line_info_record_size,
+            btf_fd,
+            func_info,
+            func_info_record_size,
+            line_info,
+            line_info_record_size,
             attach_btf_id: spec.attach_btf_id,
             attach_program_fd: None,
             log_level: spec.verifier_log.level,
@@ -1232,7 +1244,7 @@ pub(crate) fn program_flags_from_section(section: &str) -> u32 {
         .split_once('/')
         .map_or(section, |(prefix, _)| prefix);
     let mut flags = 0;
-    if prefix.ends_with(".s") {
+    if prefix.ends_with(".s") || prefix == "syscall" {
         flags |= BPF_F_SLEEPABLE;
     }
     if prefix == "xdp.frags" {
@@ -1307,6 +1319,7 @@ mod tests {
     #[test]
     fn section_suffixes_enable_kernel_program_flags() {
         assert_eq!(program_flags_from_section("fentry.s/do_open"), 1 << 4);
+        assert_eq!(program_flags_from_section("syscall"), 1 << 4);
         assert_eq!(program_flags_from_section("xdp.frags/devmap"), 1 << 5);
         assert_eq!(program_flags_from_section("xdp"), 0);
     }

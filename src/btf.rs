@@ -606,6 +606,56 @@ impl Btf {
         target.copy_from_slice(&encoded);
         Ok(true)
     }
+
+    pub(crate) fn sanitize_extern_linkage_for_kernel(&mut self) -> Result<()> {
+        for (index, ty) in self.types.iter_mut().enumerate() {
+            let record_offset = self
+                .type_section_offset
+                .checked_add(self.type_offsets[index])
+                .ok_or_else(|| Error::Btf("type record offset overflow".into()))?;
+            match ty {
+                BtfType::Function { linkage, .. } if *linkage == 2 => {
+                    *linkage = 1;
+                    let info_offset = record_offset
+                        .checked_add(4)
+                        .ok_or_else(|| Error::Btf("function info offset overflow".into()))?;
+                    let target = self
+                        .raw
+                        .get_mut(info_offset..info_offset.saturating_add(4))
+                        .ok_or_else(|| Error::Btf("function info lies outside raw BTF".into()))?;
+                    let mut info = match self.endian {
+                        Endian::Little => u32::from_le_bytes(target.try_into().unwrap()),
+                        Endian::Big => u32::from_be_bytes(target.try_into().unwrap()),
+                    };
+                    info = (info & !0xffff) | 1;
+                    let encoded = match self.endian {
+                        Endian::Little => info.to_le_bytes(),
+                        Endian::Big => info.to_be_bytes(),
+                    };
+                    target.copy_from_slice(&encoded);
+                }
+                BtfType::Variable { linkage, .. } if *linkage == 2 => {
+                    *linkage = 1;
+                    let linkage_offset = record_offset
+                        .checked_add(12)
+                        .ok_or_else(|| Error::Btf("variable linkage offset overflow".into()))?;
+                    let target = self
+                        .raw
+                        .get_mut(linkage_offset..linkage_offset.saturating_add(4))
+                        .ok_or_else(|| {
+                            Error::Btf("variable linkage lies outside raw BTF".into())
+                        })?;
+                    let encoded = match self.endian {
+                        Endian::Little => 1_u32.to_le_bytes(),
+                        Endian::Big => 1_u32.to_be_bytes(),
+                    };
+                    target.copy_from_slice(&encoded);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_type(reader: &mut Reader<'_>, strings: &[u8]) -> Result<BtfType> {
@@ -1017,5 +1067,42 @@ mod tests {
             &btf.as_bytes()[BTF_HEADER_LEN + 8..BTF_HEADER_LEN + 12],
             &64_u32.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn sanitizes_extern_function_linkage_for_kernel_loading() {
+        let strings = b"\0external\0";
+        let mut types = Vec::new();
+        types.extend(u32_bytes(0));
+        types.extend(u32_bytes(13 << 24));
+        types.extend(u32_bytes(0));
+        types.extend(u32_bytes(1));
+        types.extend(u32_bytes((12 << 24) | 2));
+        types.extend(u32_bytes(1));
+
+        let mut bytes = Vec::new();
+        bytes.extend(BTF_MAGIC.to_le_bytes());
+        bytes.push(BTF_VERSION);
+        bytes.push(0);
+        bytes.extend(u32_bytes(BTF_HEADER_LEN as u32));
+        bytes.extend(u32_bytes(0));
+        bytes.extend(u32_bytes(types.len() as u32));
+        bytes.extend(u32_bytes(types.len() as u32));
+        bytes.extend(u32_bytes(strings.len() as u32));
+        bytes.extend(types);
+        bytes.extend(strings);
+
+        let mut btf = Btf::parse(&bytes).unwrap();
+        btf.sanitize_extern_linkage_for_kernel().unwrap();
+        assert!(matches!(
+            btf.type_by_id(TypeId(2)),
+            Some(BtfType::Function { linkage: 1, .. })
+        ));
+        let info = u32::from_le_bytes(
+            btf.as_bytes()[BTF_HEADER_LEN + 12 + 4..BTF_HEADER_LEN + 12 + 8]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(info & 0xffff, 1);
     }
 }

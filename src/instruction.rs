@@ -54,6 +54,22 @@ impl Instruction {
         Ok(())
     }
 
+    /// Encodes this instruction in the kernel's native-endian layout.
+    pub fn to_bytes(self) -> [u8; Self::SIZE] {
+        let offset = self.offset.to_ne_bytes();
+        let immediate = self.immediate.to_ne_bytes();
+        [
+            self.code,
+            self.registers,
+            offset[0],
+            offset[1],
+            immediate[0],
+            immediate[1],
+            immediate[2],
+            immediate[3],
+        ]
+    }
+
     /// Decodes a sequence of native-endian instruction bytes.
     pub fn decode(bytes: &[u8]) -> Result<Vec<Self>> {
         if bytes.len() % Self::SIZE != 0 {
@@ -120,5 +136,6 @@ mod tests {
             instructions,
             [Instruction::new(0xb7, 1, 0, -2, 0x1234_5678)]
         );
+        assert_eq!(instructions[0].to_bytes(), bytes);
     }
 }
