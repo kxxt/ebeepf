@@ -14,7 +14,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{Btf, BtfType, Error, LoadedObject, Object, Result, TypeId};
+use crate::{
+    Btf, BtfType, Error, LoadedObject, MapFlags, MapMemory, MapMemoryMut, Object, Result, TypeId,
+};
 
 /// A value that can be decoded from and encoded into an eBPF data section.
 ///
@@ -100,6 +102,86 @@ impl<'data> DataSectionMut<'data> {
     /// Mutably borrows an exact byte range.
     pub fn bytes_mut(&mut self, offset: usize, length: usize) -> Result<&mut [u8]> {
         section_range_mut(self.bytes, offset, length)
+    }
+}
+
+/// Safe typed snapshot access to a live mmapable global-data map.
+#[derive(Debug)]
+pub struct MappedDataSection<'data> {
+    memory: MappedMemory<'data>,
+}
+
+#[derive(Debug)]
+enum MappedMemory<'data> {
+    ReadOnly(&'data MapMemory),
+    Mutable(&'data MapMemoryMut),
+}
+
+impl<'data> MappedDataSection<'data> {
+    /// Wraps an immutable map memory view.
+    pub const fn new(memory: &'data MapMemory) -> Self {
+        Self {
+            memory: MappedMemory::ReadOnly(memory),
+        }
+    }
+
+    /// Wraps the shared side of a mutable map memory view.
+    pub const fn from_mutable(memory: &'data MapMemoryMut) -> Self {
+        Self {
+            memory: MappedMemory::Mutable(memory),
+        }
+    }
+
+    /// Decodes a copied value starting at `offset`.
+    pub fn read<T: DataValue>(&self, offset: usize) -> Result<T> {
+        T::decode(&self.read_vec(offset, T::SIZE)?)
+    }
+
+    /// Copies a byte range from live map memory.
+    pub fn bytes(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        self.read_vec(offset, length)
+    }
+
+    fn read_vec(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        match self.memory {
+            MappedMemory::ReadOnly(memory) => memory.read_vec(offset, length),
+            MappedMemory::Mutable(memory) => memory.read_vec(offset, length),
+        }
+    }
+}
+
+/// Safe typed read-write access to a live mmapable global-data map.
+#[derive(Debug)]
+pub struct MappedDataSectionMut<'data> {
+    memory: &'data mut MapMemoryMut,
+}
+
+impl<'data> MappedDataSectionMut<'data> {
+    /// Wraps a mutable map memory view.
+    pub fn new(memory: &'data mut MapMemoryMut) -> Self {
+        Self { memory }
+    }
+
+    /// Decodes a copied value starting at `offset`.
+    pub fn read<T: DataValue>(&self, offset: usize) -> Result<T> {
+        T::decode(&self.memory.read_vec(offset, T::SIZE)?)
+    }
+
+    /// Copies a byte range from live map memory.
+    pub fn bytes(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        self.memory.read_vec(offset, length)
+    }
+
+    /// Encodes a value into live map memory at `offset`.
+    pub fn write<T: DataValue>(&mut self, offset: usize, value: &T) -> Result<()> {
+        let mut bytes = vec![0; T::SIZE];
+        value.encode(&mut bytes)?;
+        self.memory.write(offset, &bytes)
+    }
+
+    /// Copies bytes into live map memory at `offset`.
+    pub fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.memory.write(offset, bytes)
     }
 }
 
@@ -592,6 +674,9 @@ struct DataSectionItem {
     method: String,
     shared_type: String,
     mutable_type: String,
+    loaded_shared_type: String,
+    loaded_mutable_type: String,
+    read_only: bool,
     variables: Vec<DataVariable>,
 }
 
@@ -633,6 +718,39 @@ fn render_skeleton(
         })
         .collect::<Vec<_>>();
     let (data_sections, data_types) = collect_data_sections(object, &type_name, crate_path)?;
+    let mut loaded_data_fields = String::new();
+    let mut loaded_data_setup = String::new();
+    let mut loaded_data_initializers = String::new();
+    for section in &data_sections {
+        let memory_type = if section.read_only {
+            "MapMemory"
+        } else {
+            "MapMemoryMut"
+        };
+        let mapping_method = if section.read_only {
+            "mmap"
+        } else {
+            "mmap_mut"
+        };
+        writeln!(
+            loaded_data_fields,
+            "    {}_memory: {crate_path}::{memory_type},",
+            section.method
+        )
+        .expect("String write");
+        writeln!(
+            loaded_data_setup,
+            "        let {}_memory = object.map({:?})?.{}()?;",
+            section.method, section.map, mapping_method
+        )
+        .expect("String write");
+        writeln!(
+            loaded_data_initializers,
+            "            {}_memory,",
+            section.method
+        )
+        .expect("String write");
+    }
 
     let mut output = String::new();
     writeln!(
@@ -674,6 +792,7 @@ fn render_skeleton(
          #[derive(Clone, Debug, Default)]\n\
          pub struct {builder_name} {{\n\
              pin_root: Option<std::path::PathBuf>,\n\
+             token: Option<{crate_path}::BpfToken>,\n\
          }}\n\
          \n\
          impl {builder_name} {{\n\
@@ -686,11 +805,20 @@ fn render_skeleton(
                  self\n\
              }}\n\
              \n\
+             /// Uses a delegated BPF token while loading the skeleton.\n\
+             pub fn token(mut self, token: &{crate_path}::BpfToken) -> Self {{\n\
+                 self.token = Some(token.clone());\n\
+                 self\n\
+             }}\n\
+             \n\
              /// Parses the embedded object and enters the configurable stage.\n\
              pub fn open(self) -> {crate_path}::Result<{open_name}> {{\n\
                  let mut object = {crate_path}::Object::parse_named({name:?}, OBJECT_BYTES)?;\n\
                  if let Some(pin_root) = self.pin_root {{\n\
                      object.set_pin_root(pin_root);\n\
+                 }}\n\
+                 if let Some(token) = self.token.as_ref() {{\n\
+                     object.set_token(token);\n\
                  }}\n\
                  Ok({open_name} {{ object }})\n\
              }}\n\
@@ -727,7 +855,11 @@ fn render_skeleton(
              \n\
              /// Loads all enabled maps and programs into the kernel.\n\
              pub fn load(self) -> {crate_path}::Result<{loaded_name}> {{\n\
-                 Ok({loaded_name} {{ object: self.object.load()?, links: {links_name}::default() }})\n\
+                 let object = self.object.load()?;\n\
+{loaded_data_setup}                 Ok({loaded_name} {{\n\
+                     object,\n\
+                     links: {links_name}::default(),\n\
+{loaded_data_initializers}                 }})\n\
              }}\n\
          }}\n\
          \n\
@@ -772,6 +904,7 @@ fn render_skeleton(
          pub struct {loaded_name} {{\n\
              object: {crate_path}::LoadedObject,\n\
              links: {links_name},\n\
+{loaded_data_fields}\
          }}\n\
          \n\
          impl {loaded_name} {{\n\
@@ -834,6 +967,7 @@ fn render_skeleton(
          }}\n"
     )
     .expect("String write");
+    render_loaded_data_accessors(&mut output, &data_sections, &loaded_name, crate_path);
     let output = output
         .replace(
             "const OBJECT_BYTES:",
@@ -928,6 +1062,9 @@ fn collect_data_sections(
             method,
             shared_type: format!("Open{section_type}"),
             mutable_type: format!("Open{section_type}Mut"),
+            loaded_shared_type: format!("Loaded{section_type}"),
+            loaded_mutable_type: format!("Loaded{section_type}Mut"),
+            read_only: map.flags().contains(MapFlags::PROGRAM_READ_ONLY),
             variables: data_variables,
         });
     }
@@ -1231,6 +1368,132 @@ fn render_data_accessors(
             .expect("String write");
         }
         writeln!(output, "}}\n").expect("String write");
+    }
+}
+
+fn render_loaded_data_accessors(
+    output: &mut String,
+    sections: &[DataSectionItem],
+    loaded_skeleton: &str,
+    crate_path: &str,
+) {
+    if sections.is_empty() {
+        return;
+    }
+    writeln!(output, "impl {loaded_skeleton} {{").expect("String write");
+    for section in sections {
+        let constructor = if section.read_only {
+            "new"
+        } else {
+            "from_mutable"
+        };
+        writeln!(
+            output,
+            "    /// Borrows live typed values in the `{}` data section.\n\
+             pub fn {}(&self) -> {crate_path}::Result<{}<'_>> {{\n\
+                 Ok({} {{\n\
+                     data: {crate_path}::MappedDataSection::{}(&self.{}_memory),\n\
+                 }})\n\
+             }}",
+            doc_text(&section.source),
+            section.method,
+            section.loaded_shared_type,
+            section.loaded_shared_type,
+            constructor,
+            section.method,
+        )
+        .expect("String write");
+        if !section.read_only {
+            writeln!(
+                output,
+                "\n\
+                 /// Mutably borrows live typed values in the `{}` data section.\n\
+                 pub fn {}_mut(&mut self) -> {crate_path}::Result<{}<'_>> {{\n\
+                     Ok({} {{\n\
+                         data: {crate_path}::MappedDataSectionMut::new(&mut self.{}_memory),\n\
+                     }})\n\
+                 }}",
+                doc_text(&section.source),
+                section.method,
+                section.loaded_mutable_type,
+                section.loaded_mutable_type,
+                section.method,
+            )
+            .expect("String write");
+        }
+    }
+    writeln!(output, "}}\n").expect("String write");
+
+    for section in sections {
+        writeln!(
+            output,
+            "/// Typed live view of the `{}` global data section.\n\
+             #[derive(Debug)]\n\
+             pub struct {}<'data> {{ data: {crate_path}::MappedDataSection<'data> }}\n\
+             \n\
+             impl<'data> {}<'data> {{",
+            doc_text(&section.source),
+            section.loaded_shared_type,
+            section.loaded_shared_type,
+        )
+        .expect("String write");
+        for variable in &section.variables {
+            writeln!(
+                output,
+                "    /// Decodes a snapshot of global `{}`.\n\
+                 pub fn {}(&self) -> {crate_path}::Result<{}> {{\n\
+                     self.data.read::<{}>({})\n\
+                 }}",
+                doc_text(&variable.source),
+                variable.method,
+                variable.rust_type,
+                variable.rust_type,
+                variable.offset,
+            )
+            .expect("String write");
+        }
+        writeln!(output, "}}\n").expect("String write");
+
+        if !section.read_only {
+            writeln!(
+                output,
+                "/// Typed mutable live view of the `{}` global data section.\n\
+                 #[derive(Debug)]\n\
+                 pub struct {}<'data> {{ data: {crate_path}::MappedDataSectionMut<'data> }}\n\
+                 \n\
+                 impl<'data> {}<'data> {{",
+                doc_text(&section.source),
+                section.loaded_mutable_type,
+                section.loaded_mutable_type,
+            )
+            .expect("String write");
+            for variable in &section.variables {
+                writeln!(
+                    output,
+                    "    /// Decodes a snapshot of global `{}`.\n\
+                     pub fn {}(&self) -> {crate_path}::Result<{}> {{\n\
+                         self.data.read::<{}>({})\n\
+                     }}\n\
+                     \n\
+                     /// Encodes global `{}` into live map memory.\n\
+                     pub fn set_{}(&mut self, value: &{}) -> {crate_path}::Result<&mut Self> {{\n\
+                         self.data.write({}, value)?;\n\
+                         Ok(self)\n\
+                     }}",
+                    doc_text(&variable.source),
+                    variable.method,
+                    variable.rust_type,
+                    variable.rust_type,
+                    variable.offset,
+                    doc_text(&variable.source),
+                    variable.method,
+                    variable.rust_type,
+                    variable.offset,
+                )
+                .expect("String write");
+            }
+            writeln!(output, "}}\n").expect("String write");
+        }
     }
 }
 
@@ -1677,6 +1940,8 @@ mod tests {
 
         let rodata = object.add_section(Vec::new(), b".rodata".to_vec(), SectionKind::ReadOnlyData);
         object.append_section_data(rodata, &7_u32.to_le_bytes(), 4);
+        let data = object.add_section(Vec::new(), b".data".to_vec(), SectionKind::Data);
+        object.append_section_data(data, &9_u32.to_le_bytes(), 4);
         let btf = object.add_section(Vec::new(), b".BTF".to_vec(), SectionKind::ReadOnlyData);
         object.append_section_data(btf, &data_btf(), 4);
 
@@ -1686,22 +1951,39 @@ mod tests {
     }
 
     fn data_btf() -> Vec<u8> {
-        let strings = b"\0u32\0setting\0.rodata\0";
+        let strings = b"\0u32\0setting\0.rodata\0counter\0.data\0";
         let mut types = Vec::new();
+        // Type 1: u32.
         types.extend(1_u32.to_le_bytes());
         types.extend((1_u32 << 24).to_le_bytes());
         types.extend(4_u32.to_le_bytes());
         types.extend(32_u32.to_le_bytes());
 
+        // Type 2: setting variable.
         types.extend(5_u32.to_le_bytes());
         types.extend((14_u32 << 24).to_le_bytes());
         types.extend(1_u32.to_le_bytes());
         types.extend(1_u32.to_le_bytes());
 
+        // Type 3: .rodata data section.
         types.extend(13_u32.to_le_bytes());
         types.extend(((15_u32 << 24) | 1).to_le_bytes());
-        types.extend(0_u32.to_le_bytes());
+        types.extend(4_u32.to_le_bytes());
         types.extend(2_u32.to_le_bytes());
+        types.extend(0_u32.to_le_bytes());
+        types.extend(4_u32.to_le_bytes());
+
+        // Type 4: counter variable.
+        types.extend(21_u32.to_le_bytes());
+        types.extend((14_u32 << 24).to_le_bytes());
+        types.extend(1_u32.to_le_bytes());
+        types.extend(1_u32.to_le_bytes());
+
+        // Type 5: .data data section.
+        types.extend(29_u32.to_le_bytes());
+        types.extend(((15_u32 << 24) | 1).to_le_bytes());
+        types.extend(4_u32.to_le_bytes());
+        types.extend(4_u32.to_le_bytes());
         types.extend(0_u32.to_le_bytes());
         types.extend(4_u32.to_le_bytes());
 
@@ -1759,6 +2041,11 @@ mod tests {
         assert!(source.contains("program.spec().auto_attach()"));
         assert!(source.contains("impl ::ebeepf::OpenSkeleton"));
         assert!(source.contains("pub fn rodata(&self)"));
+        assert!(source.contains("rodata_memory: ::ebeepf::MapMemory"));
+        assert!(source.contains("data_memory: ::ebeepf::MapMemoryMut"));
+        assert!(source.contains("object.map(\"network_events.rodata\")?.mmap()?"));
+        assert!(source.contains("object.map(\"network_events.data\")?.mmap_mut()?"));
+        assert!(source.contains("pub fn token(mut self, token: &::ebeepf::BpfToken)"));
         assert!(source.contains("pub fn setting(&self) -> ::ebeepf::Result<u32>"));
         assert!(source.contains("pub fn set_setting(&mut self, value: &u32)"));
         assert!(source.contains("const OBJECT_BYTES: &[u8] = &["));
@@ -1822,6 +2109,15 @@ pub fn configure() -> ebeepf::Result<()> {
     open.rodata_mut()?.set_setting(&42)?;
     let _ = open.maps().event_counts()?;
     let _ = open.programs().type_()?;
+    Ok(())
+}
+
+pub fn read_loaded(skeleton: &mut generated::NetworkEventsSkel) -> ebeepf::Result<u32> {
+    skeleton.rodata()?.setting()
+}
+
+pub fn modify_loaded(skeleton: &mut generated::NetworkEventsSkel) -> ebeepf::Result<()> {
+    skeleton.data_mut()?.set_counter(&9)?;
     Ok(())
 }
 "#,

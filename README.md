@@ -90,6 +90,9 @@ The crate currently provides:
   batch operations, and per-CPU values;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
+- safe mmapable array-map views using volatile snapshots/writes instead of
+  aliasable shared-memory slices; generated skeletons retain these mappings
+  and expose live typed `.bss`, `.data`, and read-only `.rodata` accessors;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with
@@ -104,7 +107,8 @@ The crate currently provides:
   exposing C pointers in the public API;
 - build-script and CLI skeleton generation with named open/loaded
   map/program accessors, runtime-configurable transactional auto-attach,
-  retained links, and safe typed global-data configuration.
+  retained links, delegated-token configuration, and safe typed global-data
+  configuration before and after loading.
 
 The ordinary suite is unprivileged:
 

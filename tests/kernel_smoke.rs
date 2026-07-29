@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use ebeepf::{
     AttachType, BpfToken, Btf, BtfObject, HelperId, Instruction, LinkType, Map, MapCreateOptions,
-    MapSpec, MapType, Object, ProgramType, RingBuffer, TcAttachOptions, TcAttachPoint, TcHook,
-    TestRunOptions, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
+    MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType, RingBuffer,
+    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions, Xdp,
+    XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -436,6 +437,26 @@ fn loads_program_and_exercises_map_crud() {
     assert!(ProgramType::SocketFilter
         .is_helper_supported(HelperId::MAP_LOOKUP_ELEMENT)
         .unwrap());
+
+    let mut mmap_spec = MapSpec::new("mapped_values", MapType::Array, 4, 8, 2);
+    mmap_spec.set_flags(MapFlags::MMAPABLE);
+    let mmap_map = Map::create(mmap_spec).unwrap();
+    let mut memory = mmap_map.mmap_mut().unwrap();
+    assert!(mmap_map.mmap().is_err());
+    {
+        let mut data = MappedDataSectionMut::new(&mut memory);
+        data.write(0, &0xfeed_face_cafe_beef_u64).unwrap();
+        assert_eq!(data.read::<u64>(0).unwrap(), 0xfeed_face_cafe_beef);
+    }
+    assert_eq!(
+        mmap_map.lookup(&0_u32.to_ne_bytes()).unwrap().as_deref(),
+        Some(0xfeed_face_cafe_beef_u64.to_ne_bytes().as_slice())
+    );
+    drop(memory);
+    assert_eq!(
+        mmap_map.mmap().unwrap().read_vec(0, 8).unwrap(),
+        0xfeed_face_cafe_beef_u64.to_ne_bytes()
+    );
 
     let object = Object::parse_named("kernel-smoke", &loadable_object()).unwrap();
     let loaded = object.load().unwrap();

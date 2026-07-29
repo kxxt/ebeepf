@@ -1,7 +1,10 @@
 use std::fmt;
 use std::fs;
+use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bitflags::bitflags;
@@ -633,6 +636,7 @@ impl MapBatch {
 pub struct Map {
     pub(crate) fd: Arc<OwnedFd>,
     spec: MapSpec,
+    mapping: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for Map {
@@ -641,6 +645,7 @@ impl fmt::Debug for Map {
             .debug_struct("Map")
             .field("fd", &self.fd.as_raw_fd())
             .field("spec", &self.spec)
+            .field("mapped", &self.mapping.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -656,6 +661,7 @@ impl Map {
         Self {
             fd: Arc::new(fd),
             spec,
+            mapping: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -780,6 +786,88 @@ impl Map {
     /// Borrows the kernel file descriptor.
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// Creates an immutable shared-memory view of an mmapable array map.
+    ///
+    /// Only one memory view may exist for a map (including its clones) at a
+    /// time. The returned mapping covers the kernel's page-rounded allocation;
+    /// [`MapSpec::value_size`] describes each logical entry.
+    pub fn mmap(&self) -> Result<MapMemory> {
+        self.mmap_impl(false).map(MapMemory)
+    }
+
+    /// Creates a mutable shared-memory view of an mmapable array map.
+    ///
+    /// Program-read-only maps such as `.rodata` cannot be mapped mutably after
+    /// loading. Mutation is immediately visible to eBPF programs and other map
+    /// users; no explicit update syscall is needed.
+    pub fn mmap_mut(&self) -> Result<MapMemoryMut> {
+        if self.spec.flags.contains(MapFlags::PROGRAM_READ_ONLY) {
+            return Err(Error::Unsupported(format!(
+                "map `{}` is program-read-only and cannot be mutably mapped",
+                self.name()
+            )));
+        }
+        self.mmap_impl(true).map(MapMemoryMut)
+    }
+
+    fn mmap_impl(&self, writable: bool) -> Result<MapMapping> {
+        if self.spec.map_type != MapType::Array || !self.spec.flags.contains(MapFlags::MMAPABLE) {
+            return Err(Error::Unsupported(format!(
+                "map `{}` is not an mmapable array",
+                self.name()
+            )));
+        }
+        self.mapping
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .map_err(|_| {
+                Error::InvalidObject(format!("map `{}` already has a memory view", self.name()))
+            })?;
+        let length =
+            match array_mmap_size(self.spec.value_size, self.spec.max_entries, page_size()?) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.mapping.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            };
+        let protection = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+        // SAFETY: the descriptor and length are valid, offset zero is
+        // page-aligned, and successful mappings are owned by `MapMapping`.
+        let pointer = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                length,
+                protection,
+                libc::MAP_SHARED,
+                self.fd.as_raw_fd(),
+                0,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            self.mapping.store(false, Ordering::Release);
+            return Err(Error::system(
+                "memory-map BPF map",
+                io::Error::last_os_error(),
+            ));
+        }
+        let Some(pointer) = NonNull::new(pointer.cast::<u8>()) else {
+            // SAFETY: `pointer` and `length` describe the successful mapping.
+            unsafe {
+                libc::munmap(pointer, length);
+            }
+            self.mapping.store(false, Ordering::Release);
+            return Err(Error::Unsupported(
+                "the kernel mapped a BPF map at the null address".into(),
+            ));
+        };
+        Ok(MapMapping {
+            pointer,
+            length,
+            mapping: Arc::clone(&self.mapping),
+            map: self.clone(),
+        })
     }
 
     /// Looks up a key, returning `None` when it is absent.
@@ -1114,6 +1202,145 @@ impl Map {
     }
 }
 
+struct MapMapping {
+    pointer: NonNull<u8>,
+    length: usize,
+    mapping: Arc<AtomicBool>,
+    // Keeps the kernel descriptor and its shared mapping state alive.
+    map: Map,
+}
+
+impl fmt::Debug for MapMapping {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MapMapping")
+            .field("map", &self.map.name())
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MapMapping {
+    fn read(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        validate_mapping_range(self.length, offset, output.len())?;
+        for (index, byte) in output.iter_mut().enumerate() {
+            // SAFETY: the complete range was validated above. Volatile access
+            // does not create a Rust reference to kernel-shared memory.
+            *byte = unsafe { self.pointer.as_ptr().add(offset + index).read_volatile() };
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, offset: usize, input: &[u8]) -> Result<()> {
+        validate_mapping_range(self.length, offset, input.len())?;
+        for (index, byte) in input.iter().copied().enumerate() {
+            // SAFETY: the complete range was validated above. Volatile access
+            // does not create a Rust reference to kernel-shared memory.
+            unsafe {
+                self.pointer
+                    .as_ptr()
+                    .add(offset + index)
+                    .write_volatile(byte);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MapMapping {
+    fn drop(&mut self) {
+        // SAFETY: this exact mapping was created by `mmap` and has not been
+        // unmapped yet.
+        unsafe {
+            libc::munmap(self.pointer.as_ptr().cast(), self.length);
+        }
+        self.mapping.store(false, Ordering::Release);
+    }
+}
+
+/// An immutable, page-rounded shared-memory view of a BPF array map.
+///
+/// Reads copy through volatile accesses instead of exposing slices: eBPF
+/// programs and other descriptors can change the shared allocation
+/// concurrently. A multi-byte read is a snapshot, not an atomic transaction.
+#[derive(Debug)]
+pub struct MapMemory(MapMapping);
+
+impl MapMemory {
+    /// Mapped allocation length, including kernel-required page padding.
+    pub fn len(&self) -> usize {
+        self.0.length
+    }
+
+    /// Whether the mapped allocation is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.length == 0
+    }
+
+    /// Copies bytes from the mapped allocation into `output`.
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        self.0.read(offset, output)
+    }
+
+    /// Copies and returns `length` bytes from the mapped allocation.
+    pub fn read_vec(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; length];
+        self.read(offset, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// A mutable, page-rounded shared-memory view of a BPF array map.
+///
+/// Reads and writes use volatile byte copies and never expose references into
+/// memory which the kernel can modify concurrently.
+#[derive(Debug)]
+pub struct MapMemoryMut(MapMapping);
+
+impl MapMemoryMut {
+    /// Mapped allocation length, including kernel-required page padding.
+    pub fn len(&self) -> usize {
+        self.0.length
+    }
+
+    /// Whether the mapped allocation is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.length == 0
+    }
+
+    /// Copies bytes from the mapped allocation into `output`.
+    pub fn read(&self, offset: usize, output: &mut [u8]) -> Result<()> {
+        self.0.read(offset, output)
+    }
+
+    /// Copies and returns `length` bytes from the mapped allocation.
+    pub fn read_vec(&self, offset: usize, length: usize) -> Result<Vec<u8>> {
+        let mut bytes = vec![0; length];
+        self.read(offset, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Copies `input` into the mapped allocation.
+    pub fn write(&mut self, offset: usize, input: &[u8]) -> Result<()> {
+        self.0.write(offset, input)
+    }
+}
+
+fn validate_mapping_range(length: usize, offset: usize, requested: usize) -> Result<()> {
+    let end = offset
+        .checked_add(requested)
+        .ok_or_else(|| Error::InvalidObject("mapped map range overflow".into()))?;
+    if end <= length {
+        Ok(())
+    } else {
+        Err(Error::SizeMismatch {
+            what: "mapped map allocation",
+            expected: end,
+            actual: length,
+        })
+    }
+}
+
 /// Iterator returned by [`Map::keys`].
 #[derive(Debug)]
 pub struct KeyIterator<'map> {
@@ -1160,6 +1387,39 @@ pub(crate) fn possible_cpu_count() -> Result<usize> {
     let text = fs::read_to_string("/sys/devices/system/cpu/possible")
         .map_err(|source| Error::system("read possible CPU list", source))?;
     parse_cpu_list(text.trim())
+}
+
+fn page_size() -> Result<usize> {
+    // SAFETY: `sysconf` has no pointer arguments.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::system("read page size", io::Error::last_os_error()))
+}
+
+fn array_mmap_size(value_size: u32, maximum_entries: u32, page_size: usize) -> Result<usize> {
+    if !page_size.is_power_of_two() {
+        return Err(Error::InvalidObject(format!(
+            "system page size {page_size} is not a power of two"
+        )));
+    }
+    let value_size = usize::try_from(value_size)
+        .map_err(|_| Error::InvalidObject("map value size does not fit usize".into()))?;
+    let maximum_entries = usize::try_from(maximum_entries)
+        .map_err(|_| Error::InvalidObject("map capacity does not fit usize".into()))?;
+    let stride = value_size
+        .checked_add(7)
+        .map(|size| size & !7)
+        .ok_or_else(|| Error::InvalidObject("mmapable map stride overflow".into()))?;
+    let bytes = stride
+        .checked_mul(maximum_entries)
+        .ok_or_else(|| Error::InvalidObject("mmapable map size overflow".into()))?;
+    bytes
+        .checked_add(page_size - 1)
+        .map(|size| size & !(page_size - 1))
+        .filter(|size| *size > 0)
+        .ok_or_else(|| Error::InvalidObject("mmapable map allocation size overflow".into()))
 }
 
 fn parse_cpu_list(list: &str) -> Result<usize> {
@@ -1272,5 +1532,14 @@ mod tests {
         };
         assert!(batch.is_last());
         assert_eq!(batch.entries(), [(vec![1], vec![2])]);
+    }
+
+    #[test]
+    fn mmap_size_uses_eight_byte_stride_and_page_rounding() {
+        assert_eq!(array_mmap_size(1, 1, 4096).unwrap(), 4096);
+        assert_eq!(array_mmap_size(9, 256, 4096).unwrap(), 4096);
+        assert_eq!(array_mmap_size(9, 257, 4096).unwrap(), 8192);
+        assert!(array_mmap_size(0, 1, 4096).is_err());
+        assert!(array_mmap_size(8, 1, 3000).is_err());
     }
 }

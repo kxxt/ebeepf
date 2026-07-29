@@ -35,8 +35,8 @@ pub use crate::instruction::Instruction;
 pub use crate::iter::BpfIterator;
 pub use crate::link::{AttachType, Link, LinkInfo, LinkType};
 pub use crate::map::{
-    BatchCursor, KeyIterator, Map, MapBatch, MapCreateOptions, MapFlags, MapInfo, MapSpec, MapType,
-    Pinning, UpdateMode,
+    BatchCursor, KeyIterator, Map, MapBatch, MapCreateOptions, MapFlags, MapInfo, MapMemory,
+    MapMemoryMut, MapSpec, MapType, Pinning, UpdateMode,
 };
 pub use crate::object::{LoadedObject, Object};
 pub use crate::perfbuf::{PerfBuffer, PerfBufferBuilder, PerfEvent};
@@ -47,7 +47,8 @@ pub use crate::program::{
 };
 pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
 pub use crate::skel::{
-    DataSection, DataSectionMut, DataValue, OpenSkeleton, Skeleton, SkeletonBuilder,
+    DataSection, DataSectionMut, DataValue, MappedDataSection, MappedDataSectionMut, OpenSkeleton,
+    Skeleton, SkeletonBuilder,
 };
 pub use crate::tc::{TcAttachOptions, TcAttachPoint, TcFilter, TcFilterId, TcFilterInfo, TcHook};
 pub use crate::token::{BpfToken, BpfTokenInfo};
