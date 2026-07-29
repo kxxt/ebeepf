@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::mem::size_of;
@@ -30,6 +31,7 @@ const R_BPF_64_NODYLD32: u32 = 4;
 const BPF_LD_IMM_DW: u8 = 0x18;
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_PSEUDO_MAP_VALUE: u8 = 2;
+const BPF_PSEUDO_BTF_ID: u8 = 3;
 const BPF_PSEUDO_CALL: u8 = 1;
 const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 const BPF_PSEUDO_FUNC: u8 = 4;
@@ -56,6 +58,22 @@ struct KfuncRelocation {
     program: String,
     instruction_index: usize,
     name: String,
+    weak: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KsymKind {
+    Variable,
+    Function,
+    Untyped,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KsymRelocation {
+    program: String,
+    instruction_index: usize,
+    name: String,
+    kind: KsymKind,
     weak: bool,
 }
 
@@ -127,6 +145,7 @@ pub struct Object {
     map_relocations: Vec<MapRelocation>,
     core_relocations: Vec<CoreRelocation>,
     kfunc_relocations: Vec<KfuncRelocation>,
+    ksym_relocations: Vec<KsymRelocation>,
     struct_ops: BTreeMap<String, StructOpsDefinition>,
     pin_root: PathBuf,
     reused_maps: BTreeMap<String, Map>,
@@ -190,6 +209,7 @@ impl Object {
 
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
+        let ksym_kinds = collect_ksym_kinds(btf.as_ref())?;
         let extern_data = add_kconfig_map(&name, btf.as_mut(), &mut maps)?;
         let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
         resolve_inner_maps(&elf, &sections, &mut maps)?;
@@ -198,6 +218,7 @@ impl Object {
         let mut map_relocations = Vec::new();
         let mut core_relocations = Vec::new();
         let mut kfunc_relocations = Vec::new();
+        let mut ksym_relocations = Vec::new();
         for entry in executable_entries(&elf, &sections)? {
             let entry_index = entry.section_index;
             let entry_name = sections.name(entry_index)?;
@@ -260,7 +281,7 @@ impl Object {
                 attach_btf_id: 0,
                 attach_program: None,
                 attach_btf_object: None,
-                kfunc_btf_objects: Vec::new(),
+                kernel_btf_objects: Vec::new(),
                 func_info: Vec::new(),
                 func_info_record_size: 0,
                 line_info: Vec::new(),
@@ -280,6 +301,8 @@ impl Object {
                 &mut spec.instructions,
                 &mut map_relocations,
                 &mut kfunc_relocations,
+                &mut ksym_relocations,
+                &ksym_kinds,
             )?;
 
             if let Some(ext) = &btf_ext {
@@ -329,6 +352,7 @@ impl Object {
             map_relocations,
             core_relocations,
             kfunc_relocations,
+            ksym_relocations,
             struct_ops,
             pin_root: "/sys/fs/bpf".into(),
             reused_maps: BTreeMap::new(),
@@ -505,6 +529,7 @@ impl Object {
             &mut self.struct_ops,
         )?;
         resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations, token.as_ref())?;
+        resolve_ksym_relocations(&mut self.programs, &self.ksym_relocations, token.as_ref())?;
         resolve_attach_btf_ids(&mut self.programs, token.as_ref())?;
 
         let kernel_btf = self
@@ -519,7 +544,11 @@ impl Object {
         let btf_fd = match kernel_btf.as_ref() {
             Some(btf) => match sys::load_btf_with_token(btf.as_bytes(), 256 * 1024, token_fd) {
                 Ok(fd) => Some(fd),
-                Err(_) if !self.kfunc_relocations.is_empty() => None,
+                Err(_)
+                    if !self.kfunc_relocations.is_empty() || !self.ksym_relocations.is_empty() =>
+                {
+                    None
+                }
                 Err((source, log)) => {
                     return Err(Error::InvalidObject(format!(
                         "kernel rejected object BTF: {source}\n{log}"
@@ -1399,6 +1428,48 @@ fn add_kconfig_map(
     Ok(symbols)
 }
 
+fn collect_ksym_kinds(btf: Option<&Btf>) -> Result<HashMap<String, KsymKind>> {
+    let Some(btf) = btf else {
+        return Ok(HashMap::new());
+    };
+    let Some((_, BtfType::DataSection { variables, .. })) =
+        btf.find(crate::BtfKind::DataSection, ".ksyms")
+    else {
+        return Ok(HashMap::new());
+    };
+    let mut symbols = HashMap::new();
+    for entry in variables {
+        let ty = btf
+            .type_by_id(entry.ty)
+            .ok_or_else(|| Error::Btf(format!(".ksyms references missing type {}", entry.ty.0)))?;
+        let (name, kind) = match ty {
+            BtfType::Variable { name, ty, .. } => (
+                name,
+                if btf.resolve_type(*ty)? == TypeId::VOID {
+                    KsymKind::Untyped
+                } else {
+                    KsymKind::Variable
+                },
+            ),
+            BtfType::Function { name, .. } => (name, KsymKind::Function),
+            _ => {
+                return Err(Error::Btf(format!(
+                    ".ksyms type {} is neither a variable nor function",
+                    entry.ty.0
+                )));
+            }
+        };
+        if let Some(previous) = symbols.insert(name.clone(), kind) {
+            if previous != kind {
+                return Err(Error::InvalidObject(format!(
+                    "kernel symbol `{name}` has conflicting BTF declarations"
+                )));
+            }
+        }
+    }
+    Ok(symbols)
+}
+
 fn mark_hidden_subprograms_static(
     elf: &Elf<'_>,
     sections: &Sections<'_>,
@@ -1705,6 +1776,8 @@ fn apply_program_relocations(
     instructions: &mut [Instruction],
     map_relocations: &mut Vec<MapRelocation>,
     kfunc_relocations: &mut Vec<KfuncRelocation>,
+    ksym_relocations: &mut Vec<KsymRelocation>,
+    ksym_kinds: &HashMap<String, KsymKind>,
 ) -> Result<()> {
     for (relocation_index, relocations) in &elf.shdr_relocs {
         let source_section = elf.section_headers[*relocation_index].sh_info as usize;
@@ -1813,6 +1886,45 @@ fn apply_program_relocations(
                             Error::InvalidObject("function relocation does not fit i32".into())
                         })?;
                         continue;
+                    }
+
+                    if target_section == 0 {
+                        let name = symbol_name(elf, &symbol)?;
+                        if !extern_data.contains_key(name) && !maps.contains_key(name) {
+                            if relocation.r_addend.unwrap_or_default() != 0 {
+                                return Err(Error::Unsupported(format!(
+                                    "kernel symbol `{name}` uses a nonzero relocation addend"
+                                )));
+                            }
+                            let end = instruction_index.checked_add(2).ok_or_else(|| {
+                                Error::InvalidObject(
+                                    "kernel-symbol relocation range overflows".into(),
+                                )
+                            })?;
+                            let Some([instruction, second]) =
+                                instructions.get_mut(instruction_index..end)
+                            else {
+                                return Err(Error::InvalidObject(
+                                    "kernel-symbol relocation is truncated".into(),
+                                ));
+                            };
+                            if instruction.code != BPF_LD_IMM_DW {
+                                return Err(Error::InvalidObject(format!(
+                                    "kernel-symbol relocation in `{program_name}` does not target ldimm64"
+                                )));
+                            }
+                            instruction.set_source(0)?;
+                            instruction.immediate = 0;
+                            second.immediate = 0;
+                            ksym_relocations.push(KsymRelocation {
+                                program: program_name.into(),
+                                instruction_index,
+                                name: name.into(),
+                                kind: ksym_kinds.get(name).copied().unwrap_or(KsymKind::Untyped),
+                                weak: symbol.st_bind() == STB_WEAK,
+                            });
+                            continue;
+                        }
                     }
 
                     let (map, value_offset) = if let Some(map) = data_sections.get(&target_section)
@@ -2565,25 +2677,7 @@ fn resolve_kfunc_relocations(
         }
         if let Some((type_id, module)) = target {
             let btf_fd_index = match module {
-                Some(module) => {
-                    let index = match program
-                        .kfunc_btf_objects
-                        .iter()
-                        .position(|candidate| candidate.info().id == module.info().id)
-                    {
-                        Some(index) => index + 1,
-                        None => {
-                            program.kfunc_btf_objects.push(module);
-                            program.kfunc_btf_objects.len()
-                        }
-                    };
-                    i16::try_from(index).map_err(|_| {
-                        Error::InvalidObject(format!(
-                            "program `{}` references too many module BTF objects",
-                            program.name
-                        ))
-                    })?
-                }
+                Some(module) => retain_kernel_btf_object(program, module)?,
                 None => 0,
             };
             let instruction = &mut program.instructions[relocation.instruction_index];
@@ -2608,6 +2702,197 @@ fn resolve_kfunc_relocations(
     Ok(())
 }
 
+fn resolve_ksym_relocations(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[KsymRelocation],
+    token: Option<&BpfToken>,
+) -> Result<()> {
+    if relocations.is_empty() {
+        return Ok(());
+    }
+    let bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+        operation: "read kernel BTF for kernel-symbol relocation",
+        path: "/sys/kernel/btf/vmlinux".into(),
+        source,
+    })?;
+    let kernel_btf = Btf::parse(&bytes)?;
+    let mut module_btfs = programs
+        .values()
+        .flat_map(|program| program.kernel_btf_objects.iter().cloned())
+        .fold(Vec::<BtfObject>::new(), |mut modules, module| {
+            if !modules
+                .iter()
+                .any(|candidate| candidate.info().id == module.info().id)
+            {
+                modules.push(module);
+            }
+            modules
+        });
+    let mut enumerated_modules = false;
+    let mut kallsyms = None;
+
+    for relocation in relocations {
+        let typed_target = if relocation.kind == KsymKind::Untyped {
+            None
+        } else {
+            let target = find_ksym(&kernel_btf, false, relocation.kind, &relocation.name)
+                .map(|type_id| (type_id, None))
+                .or_else(|| {
+                    module_btfs.iter().find_map(|module| {
+                        find_ksym(module.btf(), true, relocation.kind, &relocation.name)
+                            .map(|type_id| (type_id, Some(module.clone())))
+                    })
+                });
+            if target.is_some() {
+                target
+            } else {
+                if !enumerated_modules {
+                    let discovered = match token {
+                        Some(token) => BtfObject::kernel_modules_with_token(token)?,
+                        None => BtfObject::kernel_modules()?,
+                    };
+                    for module in discovered {
+                        if !module_btfs
+                            .iter()
+                            .any(|candidate| candidate.info().id == module.info().id)
+                        {
+                            module_btfs.push(module);
+                        }
+                    }
+                    enumerated_modules = true;
+                }
+                module_btfs.iter().find_map(|module| {
+                    find_ksym(module.btf(), true, relocation.kind, &relocation.name)
+                        .map(|type_id| (type_id, Some(module.clone())))
+                })
+            }
+        };
+
+        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "kernel-symbol relocation references missing program `{}`",
+                relocation.program
+            ))
+        })?;
+        let end = relocation
+            .instruction_index
+            .checked_add(2)
+            .ok_or_else(|| Error::InvalidObject("kernel-symbol relocation overflows".into()))?;
+        if end > program.instructions.len() {
+            return Err(Error::InvalidObject(
+                "kernel-symbol relocation is outside program".into(),
+            ));
+        }
+
+        if let Some((type_id, module)) = typed_target {
+            let btf_fd = match module {
+                Some(module) => {
+                    let fd = module.as_fd().as_raw_fd();
+                    retain_kernel_btf_object(program, module)?;
+                    fd
+                }
+                None => 0,
+            };
+            let [instruction, second] =
+                &mut program.instructions[relocation.instruction_index..end]
+            else {
+                unreachable!("the kernel-symbol instruction range has length two");
+            };
+            instruction.set_source(BPF_PSEUDO_BTF_ID)?;
+            instruction.immediate = i32::try_from(type_id.0)
+                .map_err(|_| Error::Btf("kernel-symbol BTF ID does not fit i32".into()))?;
+            second.immediate = btf_fd;
+            continue;
+        }
+
+        if relocation.kind != KsymKind::Untyped {
+            if relocation.weak {
+                clear_ksym_instruction(program, relocation.instruction_index)?;
+                continue;
+            }
+            return Err(Error::Unsupported(format!(
+                "kernel BTF does not define {:?} symbol `{}`",
+                relocation.kind, relocation.name
+            )));
+        }
+
+        let symbols = match kallsyms.as_ref() {
+            Some(symbols) => symbols,
+            None => {
+                kallsyms = Some(read_kallsyms()?);
+                kallsyms.as_ref().expect("kallsyms was initialized")
+            }
+        };
+        let address = match symbols.get(&relocation.name) {
+            Some(Some(address)) => Some(*address),
+            Some(None) => {
+                return Err(Error::InvalidObject(format!(
+                    "kernel symbol `{}` resolves to multiple addresses",
+                    relocation.name
+                )));
+            }
+            None => None,
+        };
+        match address {
+            Some(address) => {
+                let [instruction, second] =
+                    &mut program.instructions[relocation.instruction_index..end]
+                else {
+                    unreachable!("the kernel-symbol instruction range has length two");
+                };
+                instruction.set_source(0)?;
+                instruction.immediate = address as u32 as i32;
+                second.immediate = (address >> 32) as u32 as i32;
+            }
+            None if relocation.weak => {
+                clear_ksym_instruction(program, relocation.instruction_index)?;
+            }
+            None => {
+                return Err(Error::Unsupported(format!(
+                    "kernel symbol `{}` is absent or its address is hidden",
+                    relocation.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retain_kernel_btf_object(program: &mut ProgramSpec, module: BtfObject) -> Result<i16> {
+    let index = match program
+        .kernel_btf_objects
+        .iter()
+        .position(|candidate| candidate.info().id == module.info().id)
+    {
+        Some(index) => index + 1,
+        None => {
+            program.kernel_btf_objects.push(module);
+            program.kernel_btf_objects.len()
+        }
+    };
+    i16::try_from(index).map_err(|_| {
+        Error::InvalidObject(format!(
+            "program `{}` references too many module BTF objects",
+            program.name
+        ))
+    })
+}
+
+fn clear_ksym_instruction(program: &mut ProgramSpec, index: usize) -> Result<()> {
+    let end = index
+        .checked_add(2)
+        .ok_or_else(|| Error::InvalidObject("kernel-symbol relocation overflows".into()))?;
+    let Some([instruction, second]) = program.instructions.get_mut(index..end) else {
+        return Err(Error::InvalidObject(
+            "kernel-symbol relocation is outside program".into(),
+        ));
+    };
+    instruction.set_source(0)?;
+    instruction.immediate = 0;
+    second.immediate = 0;
+    Ok(())
+}
+
 fn find_kfunc(btf: &Btf, local_only: bool, name: &str) -> Option<TypeId> {
     let find = |name| {
         if local_only {
@@ -2618,6 +2903,66 @@ fn find_kfunc(btf: &Btf, local_only: bool, name: &str) -> Option<TypeId> {
         .map(|(id, _)| id)
     };
     find(name).or_else(|| name.split_once("___").and_then(|(name, _)| find(name)))
+}
+
+fn find_ksym(btf: &Btf, local_only: bool, kind: KsymKind, name: &str) -> Option<TypeId> {
+    let btf_kind = match kind {
+        KsymKind::Variable => crate::BtfKind::Variable,
+        KsymKind::Function => crate::BtfKind::Function,
+        KsymKind::Untyped => return None,
+    };
+    let find = |name| {
+        if local_only {
+            btf.find_local(btf_kind, name)
+        } else {
+            btf.find(btf_kind, name)
+        }
+        .map(|(id, _)| id)
+    };
+    find(name).or_else(|| name.split_once("___").and_then(|(name, _)| find(name)))
+}
+
+fn read_kallsyms() -> Result<HashMap<String, Option<u64>>> {
+    let contents = fs::read_to_string("/proc/kallsyms").map_err(|source| Error::File {
+        operation: "read kernel symbols",
+        path: "/proc/kallsyms".into(),
+        source,
+    })?;
+    Ok(parse_kallsyms(&contents))
+}
+
+fn parse_kallsyms(contents: &str) -> HashMap<String, Option<u64>> {
+    let mut symbols = HashMap::new();
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let Some(address) = fields
+            .next()
+            .and_then(|address| u64::from_str_radix(address, 16).ok())
+        else {
+            continue;
+        };
+        let Some(_symbol_type) = fields.next() else {
+            continue;
+        };
+        let Some(name) = fields.next() else {
+            continue;
+        };
+        if address == 0 {
+            continue;
+        }
+        match symbols.entry(name.into()) {
+            HashMapEntry::Vacant(entry) => {
+                entry.insert(Some(address));
+            }
+            HashMapEntry::Occupied(mut entry)
+                if entry.get().is_some_and(|previous| previous != address) =>
+            {
+                entry.insert(None);
+            }
+            _ => {}
+        }
+    }
+    symbols
 }
 
 fn symbol_name<'a>(elf: &'a Elf<'_>, symbol: &Sym) -> Result<&'a str> {
@@ -4112,5 +4457,18 @@ mod tests {
             find_kfunc(&btf, false, "target___versioned"),
             Some(TypeId(2))
         );
+    }
+
+    #[test]
+    fn kallsyms_parser_ignores_masked_addresses_and_marks_ambiguity() {
+        let symbols = parse_kallsyms(
+            "0000000000000000 T hidden\n\
+             0000000000000010 T unique\n\
+             0000000000000020 T duplicate\n\
+             0000000000000030 T duplicate [module]\n",
+        );
+        assert!(!symbols.contains_key("hidden"));
+        assert_eq!(symbols.get("unique"), Some(&Some(0x10)));
+        assert_eq!(symbols.get("duplicate"), Some(&None));
     }
 }

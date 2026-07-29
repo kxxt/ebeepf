@@ -738,7 +738,7 @@ pub struct ProgramSpec {
     pub(crate) attach_btf_id: u32,
     pub(crate) attach_program: Option<AttachProgram>,
     pub(crate) attach_btf_object: Option<BtfObject>,
-    pub(crate) kfunc_btf_objects: Vec<BtfObject>,
+    pub(crate) kernel_btf_objects: Vec<BtfObject>,
     pub(crate) func_info: Vec<u8>,
     pub(crate) func_info_record_size: u32,
     pub(crate) line_info: Vec<u8>,
@@ -772,7 +772,7 @@ impl ProgramSpec {
             attach_btf_id: 0,
             attach_program: None,
             attach_btf_object: None,
-            kfunc_btf_objects: Vec::new(),
+            kernel_btf_objects: Vec::new(),
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),
@@ -842,12 +842,20 @@ impl ProgramSpec {
         self.attach_btf_object.as_ref()
     }
 
-    /// Module BTF objects referenced by relocated kfunc calls.
+    /// Module BTF objects referenced by relocated kfunc calls or typed ksyms.
     ///
     /// These objects are retained through program verification and correspond
-    /// to positive BTF FD-array indexes encoded in kfunc call instructions.
+    /// to positive BTF FD-array indexes or typed-symbol descriptor operands.
+    pub fn kernel_btf_objects(&self) -> impl ExactSizeIterator<Item = &BtfObject> {
+        self.kernel_btf_objects.iter()
+    }
+
+    /// Module BTF objects referenced specifically by relocated kfunc calls.
+    ///
+    /// This compatibility alias returns all retained module BTF dependencies;
+    /// use [`Self::kernel_btf_objects`] for code that also handles ksyms.
     pub fn kfunc_btf_objects(&self) -> impl ExactSizeIterator<Item = &BtfObject> {
-        self.kfunc_btf_objects.iter()
+        self.kernel_btf_objects()
     }
 
     /// Whether [`Program::attach`] can attach this program without additional
@@ -1391,13 +1399,13 @@ impl Program {
             .as_ref()
             .map(|target| target.as_fd().as_raw_fd());
         let mut fd_array = Vec::new();
-        if !spec.kfunc_btf_objects.is_empty() {
+        if !spec.kernel_btf_objects.is_empty() {
             // Kfunc instruction offset zero denotes vmlinux. Module BTF
             // descriptors therefore start at index one.
-            fd_array.reserve(spec.kfunc_btf_objects.len() + 1);
+            fd_array.reserve(spec.kernel_btf_objects.len() + 1);
             fd_array.push(0);
             fd_array.extend(
-                spec.kfunc_btf_objects
+                spec.kernel_btf_objects
                     .iter()
                     .map(|btf| btf.as_fd().as_raw_fd()),
             );
@@ -1486,7 +1494,7 @@ impl Program {
             attach_btf_id: 0,
             attach_program: None,
             attach_btf_object: None,
-            kfunc_btf_objects: Vec::new(),
+            kernel_btf_objects: Vec::new(),
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),

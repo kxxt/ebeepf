@@ -289,6 +289,44 @@ fn loads_program_calling_kernel_module_kfuncs() {
 }
 
 #[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, BTF ksyms, and visible kallsyms"]
+fn relocates_typed_and_typeless_kernel_symbols() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/ksyms.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("ksyms.bpf.o");
+    compile_bpf(&source, &object);
+
+    let loaded = Object::open(&object).unwrap().load().unwrap();
+    for name in [
+        "read_typed_kernel_variable",
+        "compare_typed_kernel_function",
+        "compare_typed_module_function",
+    ] {
+        let program = loaded.program(name).unwrap();
+        assert!(program
+            .spec()
+            .instructions()
+            .iter()
+            .any(|instruction| instruction.code == 0x18 && instruction.source() == 3));
+    }
+    let module = loaded.program("compare_typed_module_function").unwrap();
+    assert_eq!(
+        module
+            .spec()
+            .kernel_btf_objects()
+            .next()
+            .unwrap()
+            .info()
+            .name,
+        "dummy"
+    );
+    let typeless = loaded.program("retain_typeless_kernel_symbol").unwrap();
+    assert!(typeless.spec().instructions().iter().any(|instruction| {
+        instruction.code == 0x18 && instruction.source() == 0 && instruction.immediate != 0
+    }));
+}
+
+#[test]
 #[ignore = "requires root and a kernel with BPF token delegation"]
 fn creates_resources_with_a_delegated_bpf_token() {
     const TOKEN_SOCKET: &str = "EBEEPF_TEST_TOKEN_SOCKET";

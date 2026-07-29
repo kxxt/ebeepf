@@ -92,7 +92,8 @@ The crate currently provides:
   capability metadata and retained authorization for later BTF lookup;
 - vmlinux and kernel-module split-BTF parsing, owned module BTF lookup, and
   module-qualified BTF tracing targets and module kfunc relocation through
-  verifier BTF descriptor arrays;
+  verifier BTF descriptor arrays, plus typed and typeless `.ksyms`
+  relocations;
 - ELF-defined `.struct_ops` and `.struct_ops.link` implementations, including
   callback relocations, kernel-BTF wrapper layout translation, vmlinux value
   type metadata, modern link and legacy registration lifetimes, and
