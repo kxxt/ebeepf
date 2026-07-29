@@ -503,7 +503,32 @@ fn populates_real_and_virtual_kconfig_externs() {
     let object_path = build.path().join("kconfig.bpf.o");
     compile_bpf(&source, &object_path);
 
-    let object = Object::open(&object_path).unwrap();
+    let mut object = Object::open(&object_path).unwrap();
+    let before = object
+        .maps()
+        .find(|map| map.name().ends_with(".kconfig"))
+        .unwrap()
+        .initial_value()
+        .unwrap()
+        .to_vec();
+    assert!(object.set_kconfig("CONFIG_PREEMPT_DYNAMIC=m").is_err());
+    assert_eq!(
+        object
+            .maps()
+            .find(|map| map.name().ends_with(".kconfig"))
+            .unwrap()
+            .initial_value()
+            .unwrap(),
+        before
+    );
+    object
+        .set_kconfig(
+            "CONFIG_HZ=250\n\
+             CONFIG_PREEMPT_DYNAMIC=n\n\
+             CONFIG_VFAT_FS=m\n\
+             CONFIG_LOCALVERSION=\"ebeepf\"\n",
+        )
+        .unwrap();
     let btf = object.btf().unwrap();
     let map = object
         .maps()
@@ -533,14 +558,14 @@ fn populates_real_and_virtual_kconfig_externs() {
     };
     assert_eq!(
         u32::from_ne_bytes(value("CONFIG_HZ").0.try_into().unwrap()),
-        1000
+        250
     );
-    assert_eq!(value("CONFIG_PREEMPT_DYNAMIC").0, [1]);
+    assert_eq!(value("CONFIG_PREEMPT_DYNAMIC").0, [0]);
     assert_eq!(
         u32::from_ne_bytes(value("CONFIG_VFAT_FS").0.try_into().unwrap()),
         1
     );
-    assert_eq!(value("CONFIG_LOCALVERSION").0[0], 0);
+    assert_eq!(value("CONFIG_LOCALVERSION").0[0], b'e');
     assert_ne!(
         u32::from_ne_bytes(value("LINUX_KERNEL_VERSION").0.try_into().unwrap()),
         0

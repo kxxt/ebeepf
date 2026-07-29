@@ -101,6 +101,15 @@ struct KconfigEntry {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct KconfigDefinition {
+    map_name: String,
+    size: u32,
+    entries: Vec<KconfigEntry>,
+    system: Option<HashMap<String, String>>,
+    overrides: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct StructOpsCallback {
     member_index: usize,
     program: String,
@@ -171,6 +180,7 @@ pub struct Object {
     core_relocations: Vec<CoreRelocation>,
     kfunc_relocations: Vec<KfuncRelocation>,
     ksym_relocations: Vec<KsymRelocation>,
+    kconfig: Option<KconfigDefinition>,
     struct_ops: BTreeMap<String, StructOpsDefinition>,
     pin_root: PathBuf,
     reused_maps: BTreeMap<String, Map>,
@@ -240,7 +250,7 @@ impl Object {
             .map(|index| sections.owned_data(index))
             .transpose()?;
         let ksym_kinds = collect_ksym_kinds(btf.as_ref())?;
-        let extern_data = add_kconfig_map(&name, &elf, btf.as_mut(), &mut maps)?;
+        let (extern_data, kconfig) = add_kconfig_map(&name, &elf, btf.as_mut(), &mut maps)?;
         let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
         resolve_inner_maps(&elf, &sections, &mut maps)?;
 
@@ -388,6 +398,7 @@ impl Object {
             core_relocations,
             kfunc_relocations,
             ksym_relocations,
+            kconfig,
             struct_ops,
             pin_root: "/sys/fs/bpf".into(),
             reused_maps: BTreeMap::new(),
@@ -467,6 +478,37 @@ impl Object {
     pub fn set_pin_root(&mut self, path: impl Into<PathBuf>) -> &mut Self {
         self.pin_root = path.into();
         self
+    }
+
+    /// Replaces custom kernel-configuration overrides.
+    ///
+    /// Lines use the usual `CONFIG_NAME=value` syntax. Overrides take
+    /// precedence over the running kernel's configuration and are reflected
+    /// immediately in the parsed `.kconfig` map. Unmentioned entries continue
+    /// to use the system configuration.
+    pub fn set_kconfig(&mut self, contents: impl AsRef<str>) -> Result<&mut Self> {
+        let Some(mut definition) = self.kconfig.clone() else {
+            return Ok(self);
+        };
+        definition.overrides = parse_kconfig_overrides(contents.as_ref())?;
+        let initial = build_kconfig_value(
+            &definition,
+            self.btf
+                .as_ref()
+                .ok_or_else(|| Error::InvalidObject(".kconfig requires BTF".into()))?,
+            false,
+        )?;
+        self.maps
+            .get_mut(&definition.map_name)
+            .ok_or_else(|| Error::MapNotFound(definition.map_name.clone()))?
+            .initial_value = Some(initial);
+        self.kconfig = Some(definition);
+        Ok(self)
+    }
+
+    /// Removes custom kernel-configuration overrides.
+    pub fn clear_kconfig(&mut self) -> Result<&mut Self> {
+        self.set_kconfig("")
     }
 
     /// Uses a delegated BPF token for kernel resource creation during load.
@@ -549,6 +591,7 @@ impl Object {
     pub fn load(mut self) -> Result<LoadedObject> {
         let token = self.token.clone();
         let token_fd = token.as_ref().map(|token| token.as_fd().as_raw_fd());
+        self.refresh_kconfig(true)?;
         for map in self.maps.values_mut() {
             if map.map_type == MapType::PerfEventArray && map.max_entries == 0 {
                 map.max_entries = u32::try_from(possible_cpu_count()?).map_err(|_| {
@@ -645,6 +688,24 @@ impl Object {
             programs,
             token,
         })
+    }
+
+    fn refresh_kconfig(&mut self, require_all: bool) -> Result<()> {
+        let Some(definition) = self.kconfig.as_ref() else {
+            return Ok(());
+        };
+        let initial = build_kconfig_value(
+            definition,
+            self.btf
+                .as_ref()
+                .ok_or_else(|| Error::InvalidObject(".kconfig requires BTF".into()))?,
+            require_all,
+        )?;
+        self.maps
+            .get_mut(&definition.map_name)
+            .ok_or_else(|| Error::MapNotFound(definition.map_name.clone()))?
+            .initial_value = Some(initial);
+        Ok(())
     }
 }
 
@@ -1468,14 +1529,14 @@ fn add_kconfig_map(
     elf: &Elf<'_>,
     btf: Option<&mut Btf>,
     maps: &mut BTreeMap<String, MapSpec>,
-) -> Result<HashMap<String, (String, u32)>> {
+) -> Result<(HashMap<String, (String, u32)>, Option<KconfigDefinition>)> {
     let Some(btf) = btf else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     };
     let Some((data_section_id, BtfType::DataSection { variables, .. })) =
         btf.find(crate::BtfKind::DataSection, ".kconfig")
     else {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     };
     let variables = variables.clone();
     let name = format!("{}.kconfig", sanitize_kernel_name(object_name));
@@ -1517,7 +1578,7 @@ fn add_kconfig_map(
             .ok_or_else(|| Error::InvalidObject(".kconfig data size overflow".into()))?;
     }
     if size == 0 {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), None));
     }
     let layout = entries
         .iter()
@@ -1529,16 +1590,42 @@ fn add_kconfig_map(
     for entry in &entries {
         symbols.insert(entry.name.clone(), (name.clone(), entry.offset));
     }
-    let mut initial_value = vec![0; size as usize];
     let needs_kernel_config = entries
         .iter()
         .any(|entry| entry.name.starts_with("CONFIG_"));
-    let kernel_config = needs_kernel_config
+    let system = needs_kernel_config
         .then(read_kernel_config)
         .transpose()?
         .flatten();
+    let definition = KconfigDefinition {
+        map_name: name.clone(),
+        size,
+        entries,
+        system,
+        overrides: HashMap::new(),
+    };
+    let initial_value = build_kconfig_value(&definition, btf, false)?;
 
-    for entry in entries {
+    let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
+    spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
+    spec.initial_value = Some(initial_value);
+    spec.freeze_after_init = true;
+    spec.btf_value_type = data_section_id;
+    if maps.insert(name.clone(), spec).is_some() {
+        return Err(Error::InvalidObject(format!(
+            "kconfig map name `{name}` conflicts with a declared map"
+        )));
+    }
+    Ok((symbols, Some(definition)))
+}
+
+fn build_kconfig_value(
+    definition: &KconfigDefinition,
+    btf: &Btf,
+    require_all: bool,
+) -> Result<Vec<u8>> {
+    let mut initial_value = vec![0; definition.size as usize];
+    for entry in &definition.entries {
         if let Some(value) = match entry.name.as_str() {
             "LINUX_KERNEL_VERSION" => Some(u64::from(running_kernel_version())),
             "LINUX_HAS_BPF_COOKIE" => Some(u64::from(sys::supports_bpf_cookie())),
@@ -1570,9 +1657,10 @@ fn add_kconfig_map(
                 entry.name
             )));
         }
-        let value = kernel_config
-            .as_ref()
-            .and_then(|config| config.get(&entry.name));
+        let value = definition
+            .overrides
+            .get(&entry.name)
+            .or_else(|| definition.system.as_ref()?.get(&entry.name));
         match value {
             Some(value) => write_kconfig_value(
                 &mut initial_value,
@@ -1582,27 +1670,16 @@ fn add_kconfig_map(
                 value,
                 btf,
             )?,
-            None if entry.weak => {}
+            None if entry.weak || !require_all => {}
             None => {
                 return Err(Error::InvalidObject(format!(
-                    "strong kconfig extern `{}` is absent from the running kernel configuration",
+                    "strong kconfig extern `{}` is absent from the running kernel configuration and custom overrides",
                     entry.name
                 )));
             }
         }
     }
-
-    let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
-    spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
-    spec.initial_value = Some(initial_value);
-    spec.freeze_after_init = true;
-    spec.btf_value_type = data_section_id;
-    if maps.insert(name.clone(), spec).is_some() {
-        return Err(Error::InvalidObject(format!(
-            "kconfig map name `{name}` conflicts with a declared map"
-        )));
-    }
-    Ok(symbols)
+    Ok(initial_value)
 }
 
 fn collect_ksym_kinds(btf: Option<&Btf>) -> Result<HashMap<String, KsymKind>> {
@@ -1758,6 +1835,47 @@ fn parse_kernel_config(contents: &str) -> HashMap<String, String> {
         }
     }
     config
+}
+
+fn parse_kconfig_overrides(contents: &str) -> Result<HashMap<String, String>> {
+    let mut config = HashMap::new();
+    for (line_index, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix("# CONFIG_")
+            .and_then(|line| line.strip_suffix(" is not set"))
+        {
+            if name.is_empty() {
+                return Err(Error::InvalidObject(format!(
+                    "invalid custom kconfig line {}",
+                    line_index + 1
+                )));
+            }
+            config.insert(format!("CONFIG_{name}"), "n".into());
+            continue;
+        }
+        let Some(line) = line.strip_prefix("CONFIG_") else {
+            continue;
+        };
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(Error::InvalidObject(format!(
+                "custom kconfig line {} has no `=` separator",
+                line_index + 1
+            )));
+        };
+        let value = value.trim();
+        if name.is_empty() || value.is_empty() {
+            return Err(Error::InvalidObject(format!(
+                "custom kconfig line {} has an empty name or value",
+                line_index + 1
+            )));
+        }
+        config.insert(format!("CONFIG_{name}"), value.into());
+    }
+    Ok(config)
 }
 
 fn kernel_has_syscall_wrapper() -> Result<bool> {
@@ -5336,6 +5454,27 @@ mod tests {
             config.get("CONFIG_TEXT").map(String::as_str),
             Some("\"hello=world\"")
         );
+        let overrides = parse_kconfig_overrides(
+            "CONFIG_ENABLED=n\n\
+             # CONFIG_DISABLED is not set\n\
+             ignored=true\n\
+             CONFIG_TEXT=\"override\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            overrides.get("CONFIG_ENABLED").map(String::as_str),
+            Some("n")
+        );
+        assert_eq!(
+            overrides.get("CONFIG_DISABLED").map(String::as_str),
+            Some("n")
+        );
+        assert_eq!(
+            overrides.get("CONFIG_TEXT").map(String::as_str),
+            Some("\"override\"")
+        );
+        assert!(parse_kconfig_overrides("CONFIG_BROKEN").is_err());
+        assert!(parse_kconfig_overrides("CONFIG_EMPTY=").is_err());
         assert_eq!(parse_kconfig_integer("42").unwrap(), 42);
         assert_eq!(parse_kconfig_integer("077").unwrap(), 0o77);
         assert_eq!(parse_kconfig_integer("0x2a").unwrap(), 42);
