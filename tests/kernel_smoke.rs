@@ -47,7 +47,7 @@ fn instruction_array_object() -> Vec<u8> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
     let program = object.add_section(Vec::new(), b"socket".to_vec(), SectionKind::Text);
     let entry_instructions = [
-        Instruction::new(0x85, 0, 0, 0, 0),
+        Instruction::new(0x85, 0, 1, 0, -1),
         Instruction::new(0x95, 0, 0, 0, 0),
     ];
     object.append_section_data(program, &instruction_bytes(&entry_instructions), 8);

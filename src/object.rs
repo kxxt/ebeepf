@@ -347,6 +347,12 @@ impl Object {
                 &mut ksym_relocations,
                 &ksym_kinds,
             )?;
+            apply_unrelocated_subprogram_calls(
+                &elf,
+                &placements,
+                &program_name,
+                &mut spec.instructions,
+            )?;
 
             if let Some(ext) = &btf_ext {
                 append_ext_info(
@@ -2329,7 +2335,7 @@ fn linked_subprograms(
     entry: &EntryPoint,
 ) -> Result<Vec<EntryPoint>> {
     let mut linked = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::from([(entry.section_index, entry.byte_offset)]);
     let mut queue = vec![entry.clone()];
     let mut position = 0;
     while let Some(source) = queue.get(position).cloned() {
@@ -2338,6 +2344,15 @@ fn linked_subprograms(
             .byte_offset
             .checked_add(source.byte_size)
             .ok_or_else(|| Error::InvalidObject("subprogram range overflow".into()))?;
+        let source_instructions = Instruction::decode(
+            sections
+                .data(source.section_index)?
+                .get(source.byte_offset..source_end)
+                .ok_or_else(|| {
+                    Error::InvalidObject("subprogram lies outside its section".into())
+                })?,
+        )?;
+        let mut relocated_instructions = HashSet::new();
         for (relocation_index, relocations) in &elf.shdr_relocs {
             if elf.section_headers[*relocation_index].sh_info as usize != source.section_index {
                 continue;
@@ -2352,6 +2367,7 @@ fn linked_subprograms(
                 {
                     continue;
                 }
+                relocated_instructions.insert(offset);
                 let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
                     Error::Elf(format!(
                         "subprogram relocation references missing symbol {}",
@@ -2362,34 +2378,102 @@ fn linked_subprograms(
                 if target_section == 0 || !sections.name(target_section)?.starts_with(".text") {
                     continue;
                 }
-                let target_symbol = if symbol.st_type() == STT_FUNC {
-                    symbol
-                } else {
-                    let target_offset =
-                        i128::from(symbol.st_value) + i128::from(relocation.r_addend.unwrap_or(0));
-                    elf.syms
-                        .iter()
-                        .find(|candidate| {
-                            candidate.st_shndx == target_section
-                                && candidate.st_type() == STT_FUNC
-                                && i128::from(candidate.st_value) == target_offset
-                        })
-                        .ok_or_else(|| {
-                            Error::Unsupported(format!(
-                                "function-address relocation in `{}` has no target symbol",
-                                source.name
-                            ))
-                        })?
-                };
-                let target = function_entry(elf, target_section, &target_symbol)?;
+                let local_index = (offset - source.byte_offset) / Instruction::SIZE;
+                let instruction = source_instructions.get(local_index).ok_or_else(|| {
+                    Error::InvalidObject("subprogram relocation is outside its function".into())
+                })?;
+                let target_offset =
+                    subprogram_relocation_offset(&symbol, instruction, relocation.r_type)?;
+                let target = function_entry_at(elf, target_section, target_offset, &source.name)?;
                 if seen.insert((target.section_index, target.byte_offset)) {
                     queue.push(target.clone());
                     linked.push(target);
                 }
             }
         }
+
+        for (local_index, instruction) in source_instructions.iter().enumerate() {
+            let source_offset = source.byte_offset + local_index * Instruction::SIZE;
+            if relocated_instructions.contains(&source_offset)
+                || instruction.code != 0x85
+                || instruction.source() != BPF_PSEUDO_CALL
+            {
+                continue;
+            }
+            let target_index = relative_call_target(
+                source_offset / Instruction::SIZE,
+                instruction.immediate,
+                "unrelocated subprogram call",
+            )?;
+            let target_offset = target_index
+                .checked_mul(Instruction::SIZE)
+                .ok_or_else(|| Error::InvalidObject("subprogram target offset overflows".into()))?;
+            let target = function_entry_at(elf, source.section_index, target_offset, &source.name)?;
+            if seen.insert((target.section_index, target.byte_offset)) {
+                queue.push(target.clone());
+                linked.push(target);
+            }
+        }
     }
     Ok(linked)
+}
+
+fn subprogram_relocation_offset(
+    symbol: &Sym,
+    instruction: &Instruction,
+    kind: u32,
+) -> Result<usize> {
+    let displacement = match kind {
+        R_BPF_64_32 => i128::from(instruction.immediate)
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(Instruction::SIZE as i128))
+            .ok_or_else(|| Error::InvalidObject("call relocation target overflows".into()))?,
+        R_BPF_64_64 => i128::from(instruction.immediate),
+        _ => unreachable!(),
+    };
+    let target = i128::from(symbol.st_value)
+        .checked_add(displacement)
+        .ok_or_else(|| Error::InvalidObject("subprogram relocation target overflows".into()))?;
+    let target = usize::try_from(target)
+        .map_err(|_| Error::InvalidObject("subprogram relocation target is negative".into()))?;
+    if target % Instruction::SIZE != 0 {
+        return Err(Error::InvalidObject(format!(
+            "subprogram relocation target {target} is not instruction-aligned"
+        )));
+    }
+    Ok(target)
+}
+
+fn relative_call_target(source: usize, immediate: i32, what: &str) -> Result<usize> {
+    let target = i128::try_from(source)
+        .ok()
+        .and_then(|source| source.checked_add(i128::from(immediate)))
+        .and_then(|target| target.checked_add(1))
+        .ok_or_else(|| Error::InvalidObject(format!("{what} target overflows")))?;
+    usize::try_from(target)
+        .map_err(|_| Error::InvalidObject(format!("{what} target is negative or too large")))
+}
+
+fn function_entry_at(
+    elf: &Elf<'_>,
+    section_index: usize,
+    byte_offset: usize,
+    source_name: &str,
+) -> Result<EntryPoint> {
+    let symbol = elf
+        .syms
+        .iter()
+        .find(|candidate| {
+            candidate.st_shndx == section_index
+                && candidate.st_type() == STT_FUNC
+                && usize::try_from(candidate.st_value) == Ok(byte_offset)
+        })
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "subprogram reference in `{source_name}` has no function at section offset {byte_offset}"
+            ))
+        })?;
+    function_entry(elf, section_index, &symbol)
 }
 
 fn function_entry(elf: &Elf<'_>, section_index: usize, symbol: &Sym) -> Result<EntryPoint> {
@@ -2506,8 +2590,17 @@ fn apply_program_relocations(
                             symbol_name(elf, &symbol).unwrap_or("<unnamed>")
                         )));
                     }
-                    let target_local = usize::try_from(symbol.st_value / Instruction::SIZE as u64)
-                        .map_err(|_| Error::InvalidObject("call target is too large".into()))?;
+                    let instruction = instructions.get(instruction_index).ok_or_else(|| {
+                        Error::InvalidObject("call relocation is outside program".into())
+                    })?;
+                    if instruction.code != 0x85 || instruction.source() != BPF_PSEUDO_CALL {
+                        return Err(Error::InvalidObject(format!(
+                            "subprogram relocation in `{program_name}` does not target a pseudo call"
+                        )));
+                    }
+                    let target_local =
+                        subprogram_relocation_offset(&symbol, instruction, R_BPF_64_32)?
+                            / Instruction::SIZE;
                     let target = translate_placement(placements, target_section, target_local)
                         .ok_or_else(|| {
                             Error::Unsupported(format!(
@@ -2532,10 +2625,19 @@ fn apply_program_relocations(
                 }
                 R_BPF_64_64 => {
                     if placements.contains_key(&target_section) {
-                        let target_local = usize::try_from(
-                            symbol.st_value / Instruction::SIZE as u64,
-                        )
-                        .map_err(|_| Error::InvalidObject("function target too large".into()))?;
+                        let instruction = instructions.get(instruction_index).ok_or_else(|| {
+                            Error::InvalidObject("function relocation is outside program".into())
+                        })?;
+                        if instruction.code != BPF_LD_IMM_DW
+                            || instructions.get(instruction_index + 1).is_none()
+                        {
+                            return Err(Error::InvalidObject(format!(
+                                "function relocation in `{program_name}` does not target ldimm64"
+                            )));
+                        }
+                        let target_local =
+                            subprogram_relocation_offset(&symbol, instruction, R_BPF_64_64)?
+                                / Instruction::SIZE;
                         let target =
                             translate_placement(placements, target_section, target_local)
                                 .ok_or_else(|| {
@@ -2718,6 +2820,79 @@ fn apply_program_relocations(
                         "program `{program_name}` uses ELF relocation type {kind}"
                     )));
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_unrelocated_subprogram_calls(
+    elf: &Elf<'_>,
+    placements: &Placements,
+    program_name: &str,
+    instructions: &mut [Instruction],
+) -> Result<()> {
+    let relocated = elf
+        .shdr_relocs
+        .iter()
+        .flat_map(|(relocation_index, relocations)| {
+            let section_index = elf.section_headers[*relocation_index].sh_info as usize;
+            relocations.iter().filter_map(move |relocation| {
+                if relocation.r_offset % Instruction::SIZE as u64 != 0 {
+                    return None;
+                }
+                usize::try_from(relocation.r_offset / Instruction::SIZE as u64)
+                    .ok()
+                    .map(|instruction_index| (section_index, instruction_index))
+            })
+        })
+        .collect::<HashSet<_>>();
+
+    for (section_index, section_placements) in placements {
+        for placement in section_placements {
+            for local in 0..placement.instruction_count {
+                let source_index = placement.source_start.checked_add(local).ok_or_else(|| {
+                    Error::InvalidObject("source instruction index overflows".into())
+                })?;
+                if relocated.contains(&(*section_index, source_index)) {
+                    continue;
+                }
+                let destination_index =
+                    placement
+                        .destination_start
+                        .checked_add(local)
+                        .ok_or_else(|| {
+                            Error::InvalidObject("destination instruction index overflows".into())
+                        })?;
+                let instruction = instructions.get(destination_index).ok_or_else(|| {
+                    Error::InvalidObject("subprogram placement lies outside program".into())
+                })?;
+                if instruction.code != 0x85 || instruction.source() != BPF_PSEUDO_CALL {
+                    continue;
+                }
+                let target_source = relative_call_target(
+                    source_index,
+                    instruction.immediate,
+                    "unrelocated subprogram call",
+                )?;
+                let target =
+                    translate_placement(placements, *section_index, target_source).ok_or_else(
+                        || {
+                            Error::Unsupported(format!(
+                                "program `{program_name}` calls an unlinked function at instruction {target_source}"
+                            ))
+                        },
+                    )?;
+                let delta = i64::try_from(target)
+                    .and_then(|target| {
+                        i64::try_from(destination_index).map(|source| target - source - 1)
+                    })
+                    .map_err(|_| {
+                        Error::InvalidObject("subprogram call relocation does not fit i64".into())
+                    })?;
+                instructions[destination_index].immediate = i32::try_from(delta).map_err(|_| {
+                    Error::InvalidObject("subprogram call relocation does not fit i32".into())
+                })?;
             }
         }
     }
@@ -4865,7 +5040,7 @@ mod tests {
         ];
         if with_subprogram {
             program = vec![
-                Instruction::new(0x85, 0, 0, 0, 0),
+                Instruction::new(0x85, 0, BPF_PSEUDO_CALL, 0, -1),
                 Instruction::new(0x95, 0, 0, 0, 0),
             ];
         }
@@ -4996,7 +5171,7 @@ mod tests {
         object.append_section_data(
             entry,
             &instruction_bytes(&[
-                Instruction::new(0x85, 0, 0, 0, 0),
+                Instruction::new(0x85, 0, BPF_PSEUDO_CALL, 0, -1),
                 Instruction::new(0x95, 0, 0, 0, 0),
             ]),
             8,
@@ -5056,6 +5231,97 @@ mod tests {
                 },
             )
             .unwrap();
+        object.write().unwrap()
+    }
+
+    fn section_symbol_subprogram_fixture() -> Vec<u8> {
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let entry = object.add_section(
+            Vec::new(),
+            b"raw_tracepoint/sys_enter".to_vec(),
+            SectionKind::Text,
+        );
+        object.append_section_data(
+            entry,
+            &instruction_bytes(&[
+                // Static calls against a section symbol encode the target as
+                // sym_off / 8 + imm + 1.
+                Instruction::new(0x85, 0, BPF_PSEUDO_CALL, 0, 1),
+                // Static function addresses encode a byte offset in imm.
+                Instruction::new(BPF_LD_IMM_DW, 1, 0, 0, 16),
+                Instruction::default(),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ]),
+            8,
+        );
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 32,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(entry),
+            flags: SymbolFlags::None,
+        });
+
+        let text = object.section_id(StandardSection::Text);
+        object.append_section_data(
+            text,
+            &instruction_bytes(&[
+                Instruction::new(0xb7, 0, 0, 0, 99),
+                Instruction::new(0x95, 0, 0, 0, 0),
+                // This call has no relocation. It skips one unreferenced
+                // function in the original .text layout.
+                Instruction::new(0x85, 0, BPF_PSEUDO_CALL, 0, 3),
+                Instruction::new(0x95, 0, 0, 0, 0),
+                Instruction::new(0xb7, 0, 0, 0, 88),
+                Instruction::new(0x95, 0, 0, 0, 0),
+                Instruction::new(0xb7, 0, 0, 0, 7),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ]),
+            8,
+        );
+        for (name, value) in [
+            (b"unused".as_slice(), 0),
+            (b"used".as_slice(), 16),
+            (b"middle".as_slice(), 32),
+            (b"nested".as_slice(), 48),
+        ] {
+            object.add_symbol(Symbol {
+                name: name.to_vec(),
+                value,
+                size: 16,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Section(text),
+                flags: SymbolFlags::None,
+            });
+        }
+        let text_symbol = object.add_symbol(Symbol {
+            name: b".text".to_vec(),
+            value: 0,
+            size: 0,
+            kind: SymbolKind::Section,
+            scope: SymbolScope::Compilation,
+            weak: false,
+            section: SymbolSection::Section(text),
+            flags: SymbolFlags::None,
+        });
+        for (offset, kind) in [(0, R_BPF_64_32), (8, R_BPF_64_64)] {
+            object
+                .add_relocation(
+                    entry,
+                    Relocation {
+                        offset,
+                        symbol: text_symbol,
+                        addend: 0,
+                        flags: RelocationFlags::Elf { r_type: kind },
+                    },
+                )
+                .unwrap();
+        }
         object.write().unwrap()
     }
 
@@ -5370,6 +5636,20 @@ mod tests {
         assert_eq!(instructions[0].source(), BPF_PSEUDO_CALL);
         assert_eq!(instructions[0].immediate, 1);
         assert_eq!(instructions[2].immediate, 2);
+    }
+
+    #[test]
+    fn links_static_section_symbol_targets_and_rewrites_relative_calls() {
+        let object = Object::parse(&section_symbol_subprogram_fixture()).unwrap();
+        let instructions = object.program("entry").unwrap().instructions();
+        assert_eq!(instructions.len(), 8);
+        assert_eq!(instructions[0].source(), BPF_PSEUDO_CALL);
+        assert_eq!(instructions[0].immediate, 3);
+        assert_eq!(instructions[1].source(), BPF_PSEUDO_FUNC);
+        assert_eq!(instructions[1].immediate, 2);
+        assert_eq!(instructions[4].source(), BPF_PSEUDO_CALL);
+        assert_eq!(instructions[4].immediate, 1);
+        assert_eq!(instructions[6].immediate, 7);
     }
 
     #[test]
