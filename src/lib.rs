@@ -14,6 +14,7 @@ mod error;
 mod instruction;
 mod iter;
 mod link;
+mod linker;
 mod map;
 mod netlink;
 mod object;
@@ -34,6 +35,7 @@ pub use crate::error::{Error, Result};
 pub use crate::instruction::Instruction;
 pub use crate::iter::BpfIterator;
 pub use crate::link::{AttachType, Link, LinkInfo, LinkType};
+pub use crate::linker::{LinkedObject, ObjectLinker};
 pub use crate::map::{
     BatchCursor, KeyIterator, Map, MapBatch, MapCreateOptions, MapFlags, MapInfo, MapMemory,
     MapMemoryMut, MapSpec, MapType, Pinning, UpdateMode,

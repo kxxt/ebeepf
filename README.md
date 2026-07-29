@@ -55,6 +55,20 @@ Existing objects can be generated from the command line with
 `ebeepf-skel generate INPUT.bpf.o OUTPUT.rs`. Pass `--reference` to use
 `include_bytes!`; the default output is self-contained.
 
+Multiple compilation units can be linked without libelf or libbpf. The
+result stays in memory unless explicitly written:
+
+```rust,no_run
+use ebeepf::ObjectLinker;
+
+let mut linker = ObjectLinker::new();
+linker
+    .add_file("probe.bpf.o")?
+    .add_file("shared.bpf.o")?;
+let loaded = linker.link()?.open()?.load()?;
+# Ok::<(), ebeepf::Error>(())
+```
+
 Loading and attaching eBPF generally requires suitable capabilities. Parsing,
 inspection, and the unit test suite do not require privileges.
 
@@ -86,6 +100,10 @@ The crate currently provides:
   configuration, subprogram linking, arena-backed globals with full-width map
   offsets, LLVM jump-table instruction arrays, BTF.ext metadata, and every
   standard CO-RE relocation kind;
+- pure Rust static linking of multiple ELF compilation units with section
+  alignment, weak/global and cross-object symbol resolution, relocation
+  rewriting, BTF global type coalescing, data-section layout merging, and
+  BTF.ext function, line, and CO-RE record remapping;
 - direct `bpf(2)` loading, standalone and reused maps, pinning, rich
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, standard `Read` access to program output streams, type-accurate
@@ -99,9 +117,9 @@ The crate currently provides:
   relocation through verifier BTF descriptor arrays, plus typed and typeless
   `.ksyms` relocations;
 - ELF-defined `.struct_ops` and `.struct_ops.link` implementations, including
-  callback relocations, kernel-BTF wrapper layout translation, vmlinux value
-  type metadata, modern link and legacy registration lifetimes, and
-  transactional skeleton auto-attachment;
+  callback relocations, kernel-BTF wrapper layout translation, vmlinux and
+  module-owned value-type metadata, modern link and legacy registration
+  lifetimes, and transactional skeleton auto-attachment;
 - safe mmapable array and arena views using volatile snapshots/writes instead
   of aliasable shared-memory slices and non-replacing fixed mappings; generated
   skeletons retain these mappings and expose live typed `.bss`, `.data`,

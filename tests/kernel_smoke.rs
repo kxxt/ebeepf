@@ -14,9 +14,9 @@ use std::time::Duration;
 
 use ebeepf::{
     AttachType, BpfToken, Btf, BtfObject, BtfType, Error, HelperId, Instruction, LinkType, Map,
-    MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType,
-    RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, TypeId,
-    UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
+    MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ObjectLinker,
+    ProgramType, RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook,
+    TestRunOptions, TypeId, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -384,6 +384,96 @@ fn reads_program_output_streams() {
     assert_eq!(&output[..count], b"stdout");
     let count = program.stderr().read(&mut output).unwrap();
     assert_eq!(&output[..count], b"stderr");
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF and an eBPF-enabled kernel"]
+fn links_and_loads_multiple_elf_objects() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin");
+    let mut linker = ObjectLinker::new();
+    linker
+        .add_file(fixtures.join("usdt.bpf.o"))
+        .unwrap()
+        .add_file(fixtures.join("ringbuf.bpf.o"))
+        .unwrap();
+    let linked = linker.link().unwrap();
+    let loaded = linked.open().unwrap().load().unwrap();
+    assert!(loaded.program("handle__usdt").is_ok());
+    assert!(loaded.program("handle__sys_enter_getpid").is_ok());
+    assert!(loaded.map("ringbuf").is_ok());
+    assert!(loaded.map("ringbuf1").is_ok());
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and an eBPF-enabled kernel"]
+fn resolves_cross_object_subprograms() {
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
+    let build = tempfile::tempdir().unwrap();
+    let main = build.path().join("link-main.bpf.o");
+    let subprogram = build.path().join("link-subprogram.bpf.o");
+    compile_bpf(&sources.join("link-main.bpf.c"), &main);
+    compile_bpf(&sources.join("link-subprogram.bpf.c"), &subprogram);
+
+    let mut linker = ObjectLinker::new();
+    linker.add_file(main).unwrap().add_file(subprogram).unwrap();
+    let loaded = linker.link().unwrap().open().unwrap().load().unwrap();
+    let result = loaded
+        .program("linked_entry")
+        .unwrap()
+        .test_run(TestRunOptions::new(&[0_u8; 64]))
+        .unwrap();
+    assert_eq!(result.return_value, 42);
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and an eBPF-enabled kernel"]
+fn resolves_cross_object_maps() {
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
+    let build = tempfile::tempdir().unwrap();
+    let main = build.path().join("link-map-main.bpf.o");
+    let definition = build.path().join("link-map-definition.bpf.o");
+    compile_bpf(&sources.join("link-map-main.bpf.c"), &main);
+    compile_bpf(&sources.join("link-map-definition.bpf.c"), &definition);
+
+    let mut linker = ObjectLinker::new();
+    linker.add_file(main).unwrap().add_file(definition).unwrap();
+    let loaded = linker.link().unwrap().open().unwrap().load().unwrap();
+    loaded
+        .map("linked_shared_map")
+        .unwrap()
+        .update(&0_u32.to_ne_bytes(), &73_u64.to_ne_bytes(), UpdateMode::Any)
+        .unwrap();
+    let result = loaded
+        .program("linked_map_entry")
+        .unwrap()
+        .test_run(TestRunOptions::new(&[0_u8; 64]))
+        .unwrap();
+    assert_eq!(result.return_value, 73);
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with CO-RE support, and the zram module with BTF"]
+fn links_core_relocations_across_objects() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-core.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let core = build.path().join("module-core.bpf.o");
+    compile_bpf(&source, &core);
+
+    let mut linker = ObjectLinker::new();
+    linker
+        .add_file(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/ringbuf.bpf.o"),
+        )
+        .unwrap()
+        .add_file(core)
+        .unwrap();
+    let loaded = linker.link().unwrap().open().unwrap().load().unwrap();
+    let output = loaded
+        .program("module_type_exists")
+        .unwrap()
+        .test_run(TestRunOptions::new(&[0_u8; 64]))
+        .unwrap();
+    assert_eq!(output.return_value, 1);
 }
 
 #[test]
