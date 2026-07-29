@@ -14,7 +14,7 @@ use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
 use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT, STV_HIDDEN};
 use goblin::elf::{Elf, SectionHeader, Sym};
 
-use crate::btf::{BtfType, Endian};
+use crate::btf::{BtfMember, BtfType, Endian};
 use crate::map::{arena_mmap_size, page_size, possible_cpu_count, MapFlags, Pinning};
 use crate::program::{
     kind_supports_auto_attach, program_flags_from_section, ProgramKind, VerifierLog,
@@ -118,8 +118,18 @@ struct StructOpsCallback {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedStructOps {
     kernel_value_type: TypeId,
+    value_type_btf_object: Option<BtfObject>,
     value: Vec<u8>,
     callbacks: Vec<(String, usize)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KernelStructOpsLayout {
+    kernel_type: TypeId,
+    kernel_members: Vec<BtfMember>,
+    kernel_value_type: TypeId,
+    wrapper_size: u32,
+    data_offset: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -621,6 +631,7 @@ impl Object {
             &mut self.maps,
             &mut self.programs,
             &mut self.struct_ops,
+            token.as_ref(),
         )?;
         resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations, token.as_ref())?;
         resolve_ksym_relocations(&mut self.programs, &self.ksym_relocations, token.as_ref())?;
@@ -3086,11 +3097,72 @@ fn load_instruction_arrays(
     Ok(arrays.into_values().map(|(_, _, map)| map).collect())
 }
 
+fn find_struct_ops_kernel_layout(
+    btf: &Btf,
+    source_name: &str,
+    local_wrapper_only: bool,
+) -> Result<Option<KernelStructOpsLayout>> {
+    let wrapper_name = format!("bpf_struct_ops_{source_name}");
+    let wrapper = btf
+        .types()
+        .skip(if local_wrapper_only {
+            btf.base_type_count()
+        } else {
+            0
+        })
+        .find(|(_, ty)| {
+            matches!(
+                ty,
+                BtfType::Struct { name, .. } if name == &wrapper_name
+            )
+        });
+    let Some((kernel_value_type, wrapper)) = wrapper else {
+        return Ok(None);
+    };
+    let BtfType::Struct {
+        size: wrapper_size,
+        members: wrapper_members,
+        ..
+    } = wrapper
+    else {
+        unreachable!();
+    };
+    let (kernel_type, kernel_members, data_offset) = btf
+        .types()
+        .find_map(|(id, ty)| match ty {
+            BtfType::Struct { name, members, .. } if essential_name(name) == source_name => {
+                wrapper_members
+                    .iter()
+                    .find_map(|member| {
+                        (member.bitfield_size.is_none()
+                            && member.bit_offset % 8 == 0
+                            && btf.resolve_type(member.ty).ok() == Some(id))
+                        .then_some(member.bit_offset as usize / 8)
+                    })
+                    .map(|data_offset| (id, members.clone(), data_offset))
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "kernel BTF wrapper `{wrapper_name}` has no struct `{source_name}` data member"
+            ))
+        })?;
+    Ok(Some(KernelStructOpsLayout {
+        kernel_type,
+        kernel_members,
+        kernel_value_type,
+        wrapper_size: *wrapper_size,
+        data_offset,
+    }))
+}
+
 fn prepare_struct_ops(
     object_btf: Option<&Btf>,
     maps: &mut BTreeMap<String, MapSpec>,
     programs: &mut BTreeMap<String, ProgramSpec>,
     definitions: &mut BTreeMap<String, StructOpsDefinition>,
+    token: Option<&BpfToken>,
 ) -> Result<()> {
     if definitions.is_empty() {
         return Ok(());
@@ -3125,6 +3197,7 @@ fn prepare_struct_ops(
         source,
     })?;
     let kernel_btf = Btf::parse(&kernel_bytes)?;
+    let mut kernel_modules = None;
 
     for (map_name, definition) in definitions.iter_mut() {
         if !maps.get(map_name).is_some_and(|map| map.autocreate) {
@@ -3143,46 +3216,41 @@ fn prepare_struct_ops(
             )));
         };
         let source_name = essential_name(source_name);
-        let (kernel_type_id, kernel_members) = kernel_btf
-            .types()
-            .find_map(|(id, ty)| match ty {
-                BtfType::Struct { name, members, .. } if essential_name(name) == source_name => {
-                    Some((id, members))
-                }
-                _ => None,
-            })
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "kernel BTF has no struct `{source_name}` required by `{map_name}`"
-                ))
-            })?;
         let wrapper_name = format!("bpf_struct_ops_{source_name}");
-        let (kernel_value_type, wrapper_size, data_offset) = kernel_btf
-            .types()
-            .find_map(|(id, ty)| {
-                let BtfType::Struct {
-                    name,
-                    size,
-                    members,
-                } = ty
-                else {
-                    return None;
+        let (layout, value_type_btf_object) =
+            if let Some(layout) = find_struct_ops_kernel_layout(&kernel_btf, source_name, false)? {
+                (layout, None)
+            } else {
+                let modules = match &kernel_modules {
+                    Some(modules) => modules,
+                    None => kernel_modules.insert(match token {
+                        Some(token) => BtfObject::kernel_modules_with_token(token)?,
+                        None => BtfObject::kernel_modules()?,
+                    }),
                 };
-                if name != &wrapper_name {
-                    return None;
+                let mut target = None;
+                for module in modules {
+                    if let Some(layout) =
+                        find_struct_ops_kernel_layout(module.btf(), source_name, true)?
+                    {
+                        target = Some((layout, Some(module.clone())));
+                        break;
+                    }
                 }
-                members.iter().find_map(|member| {
-                    (member.bitfield_size.is_none()
-                        && member.bit_offset % 8 == 0
-                        && kernel_btf.resolve_type(member.ty).ok() == Some(kernel_type_id))
-                    .then_some((id, *size, member.bit_offset as usize / 8))
-                })
-            })
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "kernel BTF has no `{wrapper_name}` value wrapper for `{map_name}`"
-                ))
-            })?;
+                target.ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "kernel BTF has no `{wrapper_name}` value wrapper for `{map_name}`"
+                    ))
+                })?
+            };
+        let kernel_type_id = layout.kernel_type;
+        let kernel_members = &layout.kernel_members;
+        let kernel_value_type = layout.kernel_value_type;
+        let wrapper_size = layout.wrapper_size;
+        let data_offset = layout.data_offset;
+        let target_btf = value_type_btf_object
+            .as_ref()
+            .map_or(&kernel_btf, BtfObject::btf);
         let map = maps
             .get_mut(map_name)
             .ok_or_else(|| Error::MapNotFound(map_name.clone()))?;
@@ -3247,12 +3315,12 @@ fn prepare_struct_ops(
                 )));
             }
             let source_type = object_btf.resolve_type(source_member.ty)?;
-            let kernel_type = kernel_btf.resolve_type(kernel_member.ty)?;
+            let kernel_type = target_btf.resolve_type(kernel_member.ty)?;
             let source_kind = object_btf
                 .type_by_id(source_type)
                 .ok_or_else(|| Error::Btf(format!("source type {} is missing", source_type.0)))?
                 .kind();
-            let kernel_kind = kernel_btf
+            let kernel_kind = target_btf
                 .type_by_id(kernel_type)
                 .ok_or_else(|| Error::Btf(format!("kernel type {} is missing", kernel_type.0)))?
                 .kind();
@@ -3271,7 +3339,7 @@ fn prepare_struct_ops(
                     ))
                 })?;
 
-            if let BtfType::Pointer { ty: kernel_pointee } = kernel_btf
+            if let BtfType::Pointer { ty: kernel_pointee } = target_btf
                 .type_by_id(kernel_type)
                 .ok_or_else(|| Error::Btf(format!("kernel type {} is missing", kernel_type.0)))?
             {
@@ -3284,9 +3352,9 @@ fn prepare_struct_ops(
                     }
                     continue;
                 };
-                let kernel_prototype = kernel_btf.resolve_type(*kernel_pointee)?;
+                let kernel_prototype = target_btf.resolve_type(*kernel_pointee)?;
                 if !matches!(
-                    kernel_btf.type_by_id(kernel_prototype),
+                    target_btf.type_by_id(kernel_prototype),
                     Some(BtfType::FunctionPrototype { .. })
                 ) {
                     return Err(Error::Unsupported(format!(
@@ -3297,7 +3365,10 @@ fn prepare_struct_ops(
                 let program = programs
                     .get_mut(program_name)
                     .ok_or_else(|| Error::ProgramNotFound(program_name.to_owned()))?;
-                if program.attach_btf_id != 0 && program.attach_btf_id != kernel_type_id.0 {
+                if program.attach_btf_id != 0
+                    && (program.attach_btf_id != kernel_type_id.0
+                        || program.attach_btf_object.as_ref() != value_type_btf_object.as_ref())
+                {
                     return Err(Error::InvalidObject(format!(
                         "struct_ops program `{program_name}` is reused for incompatible structures"
                     )));
@@ -3322,11 +3393,12 @@ fn prepare_struct_ops(
                 }
                 *attach_type = Some(expected_attach_type);
                 program.attach_btf_id = kernel_type_id.0;
+                program.attach_btf_object = value_type_btf_object.clone();
                 prepared_callbacks.push((program_name.to_owned(), kernel_offset));
                 continue;
             }
 
-            let kernel_size = kernel_btf.size_of(kernel_member.ty)?;
+            let kernel_size = target_btf.size_of(kernel_member.ty)?;
             if source_size != kernel_size {
                 return Err(Error::Unsupported(format!(
                     "struct_ops member `{}` has size {source_size}, kernel expects {kernel_size}",
@@ -3352,6 +3424,7 @@ fn prepare_struct_ops(
         map.initial_value = Some(value.clone());
         definition.prepared = Some(PreparedStructOps {
             kernel_value_type,
+            value_type_btf_object,
             value,
             callbacks: prepared_callbacks,
         });
@@ -3475,7 +3548,10 @@ fn load_maps(
                         btf_vmlinux_value_type_id: struct_ops_definition
                             .and_then(|definition| definition.prepared.as_ref())
                             .map_or(0, |prepared| prepared.kernel_value_type.0),
-                        value_type_btf_obj_fd: None,
+                        value_type_btf_obj_fd: struct_ops_definition
+                            .and_then(|definition| definition.prepared.as_ref())
+                            .and_then(|prepared| prepared.value_type_btf_object.as_ref())
+                            .map(|btf| btf.as_fd().as_raw_fd()),
                         map_extra: spec.map_extra,
                         token_fd,
                     })
@@ -5399,6 +5475,55 @@ mod tests {
         Btf::parse(&bytes).unwrap()
     }
 
+    fn struct_ops_kernel_btf() -> Btf {
+        let mut strings = vec![0];
+        let mut add_string = |value: &str| {
+            let offset = strings.len() as u32;
+            strings.extend(value.as_bytes());
+            strings.push(0);
+            offset
+        };
+        let ops_name = add_string("sample_ops");
+        let callback_name = add_string("callback");
+        let wrapper_name = add_string("bpf_struct_ops_sample_ops");
+        let data_name = add_string("data");
+
+        let mut types = Vec::new();
+        // 1: void callback(void), 2: pointer to callback.
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 13 << 24);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 1);
+        // 3: struct sample_ops { callback *callback; }
+        push_u32(&mut types, ops_name);
+        push_u32(&mut types, (4 << 24) | 1);
+        push_u32(&mut types, 8);
+        push_u32(&mut types, callback_name);
+        push_u32(&mut types, 2);
+        push_u32(&mut types, 0);
+        // 4: struct bpf_struct_ops_sample_ops { ...; sample_ops data; }
+        push_u32(&mut types, wrapper_name);
+        push_u32(&mut types, (4 << 24) | 1);
+        push_u32(&mut types, 16);
+        push_u32(&mut types, data_name);
+        push_u32(&mut types, 3);
+        push_u32(&mut types, 64);
+
+        let mut bytes = Vec::new();
+        bytes.extend(0xeb9f_u16.to_le_bytes());
+        bytes.extend([1, 0]);
+        push_u32(&mut bytes, 24);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+        bytes.extend(types);
+        bytes.extend(strings);
+        Btf::parse(&bytes).unwrap()
+    }
+
     fn btf_object_fixture() -> Vec<u8> {
         let mut strings = vec![0];
         let mut add_string = |value: &str| {
@@ -5826,6 +5951,32 @@ mod tests {
                 .value,
             8
         );
+    }
+
+    #[test]
+    fn finds_struct_ops_value_layout_in_target_btf() {
+        let btf = struct_ops_kernel_btf();
+        let layout = find_struct_ops_kernel_layout(&btf, "sample_ops", false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(layout.kernel_type, TypeId(3));
+        assert_eq!(layout.kernel_value_type, TypeId(4));
+        assert_eq!(layout.wrapper_size, 16);
+        assert_eq!(layout.data_offset, 8);
+        assert_eq!(layout.kernel_members[0].name, "callback");
+
+        let mut empty_split = Vec::new();
+        empty_split.extend(0xeb9f_u16.to_le_bytes());
+        empty_split.extend([1, 0]);
+        push_u32(&mut empty_split, 24);
+        push_u32(&mut empty_split, 0);
+        push_u32(&mut empty_split, 0);
+        push_u32(&mut empty_split, 0);
+        push_u32(&mut empty_split, 0);
+        let split = Btf::parse_split(&empty_split, &btf).unwrap();
+        assert!(find_struct_ops_kernel_layout(&split, "sample_ops", true)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
