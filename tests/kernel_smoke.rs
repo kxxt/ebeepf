@@ -784,6 +784,28 @@ fn loads_program_and_exercises_map_crud() {
         .is_helper_supported(HelperId::MAP_LOOKUP_ELEMENT)
         .unwrap());
 
+    if MapType::ResizableHash.is_supported().unwrap() {
+        let mut resizable_spec = MapSpec::resizable_hash("resizable_values", 4, 8, 1024);
+        resizable_spec
+            .set_resizable_hash_initial_capacity(16)
+            .unwrap();
+        let resizable = Map::create(resizable_spec).unwrap();
+        let resizable_info = resizable.info().unwrap();
+        assert_eq!(resizable_info.map_type, MapType::ResizableHash);
+        assert_eq!(resizable_info.map_extra, 16);
+        let resizable_key = 7_u32.to_ne_bytes();
+        let resizable_value = 0x1122_3344_5566_7788_u64.to_ne_bytes();
+        resizable
+            .update(&resizable_key, &resizable_value, UpdateMode::NoExist)
+            .unwrap();
+        assert_eq!(
+            resizable.lookup(&resizable_key).unwrap().as_deref(),
+            Some(resizable_value.as_slice())
+        );
+        assert!(resizable.delete(&resizable_key).unwrap());
+        assert_eq!(resizable.lookup(&resizable_key).unwrap(), None);
+    }
+
     let mut mmap_spec = MapSpec::new("mapped_values", MapType::Array, 4, 8, 2);
     mmap_spec.set_flags(MapFlags::MMAPABLE);
     let mmap_map = Map::create(mmap_spec).unwrap();

@@ -637,6 +637,7 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             map_flags = 1 << 10; // BPF_F_MMAPABLE
         }
         34 => value_size = 16, // struct bpf_insn_array_value
+        35 => map_flags = 1,   // BPF_F_NO_PREALLOC
         _ => return Ok(false),
     }
 

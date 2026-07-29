@@ -133,6 +133,8 @@ pub enum MapType {
     Arena,
     /// Instruction array.
     InstructionArray,
+    /// Dynamically resized hash table.
+    ResizableHash,
     /// A map type introduced after this crate version.
     Other(u32),
 }
@@ -176,6 +178,7 @@ impl MapType {
             32 => Self::CgroupLocalStorage,
             33 => Self::Arena,
             34 => Self::InstructionArray,
+            35 => Self::ResizableHash,
             value => Self::Other(value),
         }
     }
@@ -218,6 +221,7 @@ impl MapType {
             Self::CgroupLocalStorage => 32,
             Self::Arena => 33,
             Self::InstructionArray => 34,
+            Self::ResizableHash => 35,
             Self::Other(value) => value,
         }
     }
@@ -332,6 +336,27 @@ impl MapSpec {
         }
     }
 
+    /// Creates a dynamically resized hash-map definition.
+    ///
+    /// Linux requires [`MapFlags::NO_PREALLOC`] for this map type, so this
+    /// constructor enables it automatically.
+    pub fn resizable_hash(
+        name: impl Into<String>,
+        key_size: u32,
+        value_size: u32,
+        max_entries: u32,
+    ) -> Self {
+        let mut spec = Self::new(
+            name,
+            MapType::ResizableHash,
+            key_size,
+            value_size,
+            max_entries,
+        );
+        spec.flags.insert(MapFlags::NO_PREALLOC);
+        spec
+    }
+
     /// Map name.
     pub fn name(&self) -> &str {
         &self.name
@@ -385,6 +410,18 @@ impl MapSpec {
     /// Type-specific map creation value.
     pub const fn map_extra(&self) -> u64 {
         self.map_extra
+    }
+
+    /// Initial allocation hint for a dynamically resized hash map.
+    ///
+    /// Zero asks the kernel to select its default. `None` means this is not a
+    /// resizable hash map or its raw `map_extra` value is malformed.
+    pub const fn resizable_hash_initial_capacity(&self) -> Option<u16> {
+        if matches!(self.map_type, MapType::ResizableHash) && self.map_extra <= u16::MAX as u64 {
+            Some(self.map_extra as u16)
+        } else {
+            None
+        }
     }
 
     /// Name of the inner-map template used by map-in-map definitions.
@@ -495,6 +532,27 @@ impl MapSpec {
         self
     }
 
+    /// Sets the initial allocation hint for a dynamically resized hash map.
+    ///
+    /// A zero hint lets the kernel select its default. The hint cannot exceed
+    /// the configured maximum number of entries.
+    pub fn set_resizable_hash_initial_capacity(&mut self, capacity: u16) -> Result<&mut Self> {
+        if self.map_type != MapType::ResizableHash {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a resizable hash map",
+                self.name
+            )));
+        }
+        if u32::from(capacity) > self.max_entries {
+            return Err(Error::InvalidObject(format!(
+                "resizable hash map `{}` has initial capacity {capacity} above maximum {}",
+                self.name, self.max_entries
+            )));
+        }
+        self.map_extra = u64::from(capacity);
+        Ok(self)
+    }
+
     /// Changes the BTF key and value type IDs.
     ///
     /// Standalone map creation cannot use nonzero IDs because the IDs belong
@@ -551,6 +609,21 @@ impl MapSpec {
                 "map `{}` is not a map-in-map but has an inner-map template",
                 self.name
             )));
+        }
+        if self.map_type == MapType::ResizableHash {
+            if !self.flags.contains(MapFlags::NO_PREALLOC) {
+                return Err(Error::InvalidObject(format!(
+                    "resizable hash map `{}` requires NO_PREALLOC",
+                    self.name
+                )));
+            }
+            if self.map_extra > u64::from(u16::MAX) || self.map_extra > u64::from(self.max_entries)
+            {
+                return Err(Error::InvalidObject(format!(
+                    "resizable hash map `{}` has invalid initial capacity {}",
+                    self.name, self.map_extra
+                )));
+            }
         }
         if self.map_type != MapType::Arena {
             if let Some(value) = &self.initial_value {
@@ -1625,6 +1698,28 @@ mod tests {
         assert!(MapSpec::new("storage", MapType::TaskStorage, 4, 8, 0)
             .validate()
             .is_ok());
+    }
+
+    #[test]
+    fn resizable_hash_spec_enforces_kernel_invariants() {
+        let mut spec = MapSpec::resizable_hash("dynamic", 4, 8, 1024);
+        assert_eq!(spec.map_type(), MapType::ResizableHash);
+        assert!(spec.flags().contains(MapFlags::NO_PREALLOC));
+        assert_eq!(spec.resizable_hash_initial_capacity(), Some(0));
+        spec.set_resizable_hash_initial_capacity(128).unwrap();
+        assert_eq!(spec.resizable_hash_initial_capacity(), Some(128));
+        assert!(spec.validate().is_ok());
+
+        spec.set_max_entries(64);
+        assert!(spec.validate().is_err());
+        assert!(MapSpec::new("dynamic", MapType::ResizableHash, 4, 8, 64)
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("NO_PREALLOC"));
+        assert!(MapSpec::new("ordinary", MapType::Hash, 4, 8, 64)
+            .set_resizable_hash_initial_capacity(1)
+            .is_err());
     }
 
     #[test]

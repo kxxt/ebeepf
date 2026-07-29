@@ -89,7 +89,8 @@ The crate currently provides:
 - direct `bpf(2)` loading, standalone and reused maps, pinning, rich
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, type-accurate map/program/helper capability probes, map CRUD and
-  batch operations, and per-CPU values;
+  batch operations, per-CPU values, and dynamically resized hash maps with
+  checked initial-capacity hints;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
 - vmlinux and kernel-module split-BTF parsing, owned module BTF lookup, and
