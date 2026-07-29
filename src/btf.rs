@@ -346,6 +346,7 @@ pub struct Btf {
     raw: Vec<u8>,
     types: Vec<BtfType>,
     type_offsets: Vec<usize>,
+    raw_type_id_base: usize,
     type_section_offset: usize,
     strings: Vec<u8>,
     endian: Endian,
@@ -391,7 +392,24 @@ impl Btf {
 
     /// Parses a `.BTF` section.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_with_base(bytes, None)
+    }
+
+    /// Parses split BTF using `base` as its type and string-table prefix.
+    ///
+    /// Kernel module BTF is encoded this way and cannot be interpreted as a
+    /// standalone table.
+    pub fn parse_split(bytes: &[u8], base: &Self) -> Result<Self> {
+        Self::parse_with_base(bytes, Some(base))
+    }
+
+    fn parse_with_base(bytes: &[u8], base: Option<&Self>) -> Result<Self> {
         let endian = Endian::detect(bytes)?;
+        if base.is_some_and(|base| base.endian != endian) {
+            return Err(Error::Btf(
+                "split BTF byte order differs from its base table".into(),
+            ));
+        }
         let mut header = Reader::new(bytes, endian);
         let magic = header.u16()?;
         debug_assert_eq!(magic, BTF_MAGIC);
@@ -419,29 +437,33 @@ impl Btf {
         let type_bytes = bytes
             .get(type_start..type_end)
             .ok_or_else(|| Error::Btf("type section lies outside input".into()))?;
-        let strings = bytes
+        let split_strings = bytes
             .get(string_start..string_end)
             .ok_or_else(|| Error::Btf("string section lies outside input".into()))?;
-        if strings.first() != Some(&0) {
+        if base.is_none() && split_strings.first() != Some(&0) {
             return Err(Error::Btf(
                 "string table does not start with a NUL byte".into(),
             ));
         }
+        let mut strings = base.map_or_else(Vec::new, |base| base.strings.clone());
+        strings.extend_from_slice(split_strings);
 
         let mut reader = Reader::new(type_bytes, endian);
-        let mut types = Vec::new();
-        let mut type_offsets = Vec::new();
+        let mut types = base.map_or_else(Vec::new, |base| base.types.clone());
+        let raw_type_id_base = types.len();
+        let mut type_offsets = vec![0; raw_type_id_base];
         while !reader.is_empty() {
             type_offsets.push(reader.position());
-            types.push(parse_type(&mut reader, strings)?);
+            types.push(parse_type(&mut reader, &strings)?);
         }
 
         let btf = Self {
             raw: bytes.to_vec(),
             types,
             type_offsets,
+            raw_type_id_base,
             type_section_offset: type_start,
-            strings: strings.to_vec(),
+            strings,
             endian,
         };
         btf.validate_references()?;
@@ -463,6 +485,14 @@ impl Btf {
         self.types.is_empty()
     }
 
+    /// Number of type IDs inherited from a split BTF base table.
+    ///
+    /// This is zero for standalone BTF and the vmlinux type count for kernel
+    /// module BTF.
+    pub const fn base_type_count(&self) -> usize {
+        self.raw_type_id_base
+    }
+
     /// Gets a type by ID. Type ID zero (`void`) returns `None`.
     pub fn type_by_id(&self, id: TypeId) -> Option<&BtfType> {
         id.0.checked_sub(1)
@@ -480,6 +510,13 @@ impl Btf {
     /// Finds the first type with the given kind and name.
     pub fn find(&self, kind: BtfKind, name: &str) -> Option<(TypeId, &BtfType)> {
         self.types()
+            .find(|(_, ty)| ty.kind() == kind && ty.name() == Some(name))
+    }
+
+    /// Finds a type defined by this table, excluding inherited split-BTF types.
+    pub fn find_local(&self, kind: BtfKind, name: &str) -> Option<(TypeId, &BtfType)> {
+        self.types()
+            .skip(self.raw_type_id_base)
             .find(|(_, ty)| ty.kind() == kind && ty.name() == Some(name))
     }
 
@@ -621,7 +658,7 @@ impl Btf {
 
     pub(crate) fn set_function_linkage(&mut self, name: &str, linkage: u16) -> Result<bool> {
         let mut changed = false;
-        for index in 0..self.types.len() {
+        for index in self.raw_type_id_base..self.types.len() {
             let BtfType::Function {
                 name: function_name,
                 linkage: current,
@@ -661,9 +698,16 @@ impl Btf {
     }
 
     pub(crate) fn set_data_section_size(&mut self, name: &str, size: u32) -> Result<bool> {
-        let Some(index) = self.types.iter().position(
-            |ty| matches!(ty, BtfType::DataSection { name: candidate, .. } if candidate == name),
-        ) else {
+        let Some(index) = self
+            .types
+            .iter()
+            .enumerate()
+            .skip(self.raw_type_id_base)
+            .find_map(|(index, ty)| {
+                matches!(ty, BtfType::DataSection { name: candidate, .. } if candidate == name)
+                    .then_some(index)
+            })
+        else {
             return Ok(false);
         };
         let BtfType::DataSection {
@@ -691,7 +735,12 @@ impl Btf {
     }
 
     pub(crate) fn sanitize_extern_linkage_for_kernel(&mut self) -> Result<()> {
-        for (index, ty) in self.types.iter_mut().enumerate() {
+        for (index, ty) in self
+            .types
+            .iter_mut()
+            .enumerate()
+            .skip(self.raw_type_id_base)
+        {
             let record_offset = self
                 .type_section_offset
                 .checked_add(self.type_offsets[index])
@@ -762,6 +811,14 @@ pub struct BtfObject {
     info: BtfInfo,
 }
 
+impl PartialEq for BtfObject {
+    fn eq(&self, other: &Self) -> bool {
+        self.info == other.info
+    }
+}
+
+impl Eq for BtfObject {}
+
 impl BtfObject {
     /// Opens and parses a kernel BTF object by ID.
     pub fn from_id(id: u32) -> Result<Self> {
@@ -777,6 +834,70 @@ impl BtfObject {
         Self::from_fd(fd)
     }
 
+    /// Opens split BTF by kernel ID and parses it against `base`.
+    pub fn from_split_id(id: u32, base: &Btf) -> Result<Self> {
+        let fd = sys::object_get_fd_by_id(sys::ObjectKind::Btf, id)
+            .map_err(|source| Error::system("open split BTF object by ID", source))?;
+        Self::from_split_fd(fd, base)
+    }
+
+    /// Opens split BTF by ID using a delegated token and parses it against `base`.
+    pub fn from_split_id_with_token(id: u32, base: &Btf, token: &BpfToken) -> Result<Self> {
+        let fd =
+            sys::btf_get_fd_by_id_with_token(id, token.as_fd().as_raw_fd()).map_err(|source| {
+                Error::system("open split BTF object by ID with BPF token", source)
+            })?;
+        Self::from_split_fd(fd, base)
+    }
+
+    /// Finds and opens a loaded kernel module's split BTF by module name.
+    pub fn from_kernel_module(name: &str) -> Result<Self> {
+        Self::from_kernel_module_with_optional_token(name, None)
+    }
+
+    /// Finds and opens module split BTF using a delegated BPF token.
+    pub fn from_kernel_module_with_token(name: &str, token: &BpfToken) -> Result<Self> {
+        Self::from_kernel_module_with_optional_token(name, Some(token))
+    }
+
+    fn from_kernel_module_with_optional_token(
+        name: &str,
+        token: Option<&BpfToken>,
+    ) -> Result<Self> {
+        if name.is_empty() || name == "vmlinux" {
+            return Err(Error::InvalidObject(
+                "kernel module BTF requires a non-vmlinux module name".into(),
+            ));
+        }
+        let base = Btf::from_vmlinux()?;
+        let mut id = 0;
+        loop {
+            id = sys::next_id(sys::ObjectKind::Btf, id)
+                .map_err(|source| Error::system("enumerate kernel BTF objects", source))?
+                .ok_or_else(|| {
+                    Error::InvalidObject(format!(
+                        "loaded kernel module `{name}` has no visible BTF object"
+                    ))
+                })?;
+            let fd = match token {
+                Some(token) => sys::btf_get_fd_by_id_with_token(id, token.as_fd().as_raw_fd()),
+                None => sys::object_get_fd_by_id(sys::ObjectKind::Btf, id),
+            };
+            let fd = match fd {
+                Ok(fd) => fd,
+                Err(source) if source.raw_os_error() == Some(libc::ENOENT) => continue,
+                Err(source) => {
+                    return Err(Error::system("open kernel BTF object", source));
+                }
+            };
+            let (raw, encoded_name) = sys::btf_metadata(fd.as_raw_fd())
+                .map_err(|source| Error::system("read kernel BTF metadata", source))?;
+            if raw.kernel_btf != 0 && kernel_btf_name(&encoded_name) == name {
+                return Self::from_split_fd(fd, &base);
+            }
+        }
+    }
+
     /// Opens the BTF associated with a loaded eBPF program ID.
     pub fn from_program_id(program_id: u32) -> Result<Self> {
         let program = crate::Program::from_id(program_id)?;
@@ -790,21 +911,28 @@ impl BtfObject {
     }
 
     pub(crate) fn from_fd(fd: OwnedFd) -> Result<Self> {
+        Self::from_fd_with_base(fd, None)
+    }
+
+    fn from_split_fd(fd: OwnedFd, base: &Btf) -> Result<Self> {
+        Self::from_fd_with_base(fd, Some(base))
+    }
+
+    fn from_fd_with_base(fd: OwnedFd, base: Option<&Btf>) -> Result<Self> {
         let (raw, bytes, name) = sys::btf_info(fd.as_fd().as_raw_fd())
             .map_err(|source| Error::system("read BTF object metadata", source))?;
-        let name_end = name
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(name.len());
         let info = BtfInfo {
             id: raw.id,
-            name: String::from_utf8_lossy(&name[..name_end]).into_owned(),
+            name: kernel_btf_name(&name).into(),
             kernel: raw.kernel_btf != 0,
             size: raw.btf_size,
         };
         Ok(Self {
             fd: Arc::new(fd),
-            btf: Btf::parse(&bytes)?,
+            btf: match base {
+                Some(base) => Btf::parse_split(&bytes, base)?,
+                None => Btf::parse(&bytes)?,
+            },
             info,
         })
     }
@@ -823,6 +951,14 @@ impl BtfObject {
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
+}
+
+fn kernel_btf_name(bytes: &[u8]) -> &str {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    str::from_utf8(&bytes[..end]).unwrap_or("")
 }
 
 impl AsFd for BtfObject {
@@ -1178,6 +1314,42 @@ mod tests {
         };
         assert_eq!(members[1].name, "second");
         assert_eq!(members[1].bit_offset, 32);
+    }
+
+    #[test]
+    fn parses_split_btf_with_base_type_and_string_ids() {
+        let base = Btf::parse(&sample_btf()).unwrap();
+        let split_strings = b"module_func\0";
+        let mut types = Vec::new();
+        // Type 5: u32 module_func(void) prototype, referencing base type 1.
+        types.extend(u32_bytes(0));
+        types.extend(u32_bytes(13 << 24));
+        types.extend(u32_bytes(1));
+        // Type 6: module_func.
+        types.extend(u32_bytes(base.strings.len() as u32));
+        types.extend(u32_bytes((12 << 24) | 1));
+        types.extend(u32_bytes(5));
+
+        let mut bytes = Vec::new();
+        bytes.extend(BTF_MAGIC.to_le_bytes());
+        bytes.push(BTF_VERSION);
+        bytes.push(0);
+        bytes.extend(u32_bytes(BTF_HEADER_LEN as u32));
+        bytes.extend(u32_bytes(0));
+        bytes.extend(u32_bytes(types.len() as u32));
+        bytes.extend(u32_bytes(types.len() as u32));
+        bytes.extend(u32_bytes(split_strings.len() as u32));
+        bytes.extend(types);
+        bytes.extend(split_strings);
+
+        let split = Btf::parse_split(&bytes, &base).unwrap();
+        assert_eq!(split.len(), 6);
+        assert_eq!(
+            split.find(BtfKind::Function, "module_func").unwrap().0,
+            TypeId(6)
+        );
+        assert_eq!(split.size_of(TypeId(1)).unwrap(), 4);
+        assert!(Btf::parse(&bytes).is_err());
     }
 
     #[test]

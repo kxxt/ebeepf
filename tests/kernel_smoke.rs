@@ -13,10 +13,10 @@ use std::ptr;
 use std::time::Duration;
 
 use ebeepf::{
-    AttachType, BpfToken, Btf, BtfObject, HelperId, Instruction, LinkType, Map, MapCreateOptions,
-    MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType, RingBuffer,
-    SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode,
-    UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
+    AttachType, BpfToken, Btf, BtfObject, Error, HelperId, Instruction, LinkType, Map,
+    MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType,
+    RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions,
+    UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -204,6 +204,65 @@ fn minimal_btf() -> Vec<u8> {
     bytes.extend(32_u32.to_le_bytes()); // bit width
     bytes.extend(b"\0int\0");
     bytes
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF and a loaded kernel module exposing BTF"]
+fn opens_kernel_module_split_btf() {
+    let module_name = fs::read_dir("/sys/kernel/btf")
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|name| name != "vmlinux")
+        .expect("the test kernel has no module BTF");
+    let module = BtfObject::from_kernel_module(&module_name).unwrap();
+    assert!(module.info().kernel);
+    assert_eq!(module.info().name, module_name);
+    assert!(module.btf().len() > Btf::from_vmlinux().unwrap().len());
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and the dummy module with BTF"]
+fn loads_and_attaches_kernel_module_fentry() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-fentry.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("module-fentry.bpf.o");
+    compile_bpf(&source, &object);
+
+    let loaded = Object::open(&object).unwrap().load().unwrap();
+    let program = loaded.program("observe_dummy_xmit").unwrap();
+    let target = program.spec().attach_btf_object().unwrap();
+    assert_eq!(target.info().name, "dummy");
+    assert!(program.spec().attach_btf_id() as usize > target.btf().base_type_count());
+    let link = program.attach().unwrap();
+    assert_eq!(link.info().unwrap().link_type, LinkType::Tracing);
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and tracing-multi module support"]
+fn loads_and_attaches_kernel_module_fentry_multi() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-fentry-multi.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("module-fentry-multi.bpf.o");
+    compile_bpf(&source, &object);
+
+    let loaded = match Object::open(&object).unwrap().load() {
+        Ok(loaded) => loaded,
+        Err(Error::Verifier { source, log, .. })
+            if source.raw_os_error() == Some(libc::EINVAL) && log.is_empty() =>
+        {
+            // The library surface can be newer than the running kernel.
+            return;
+        }
+        Err(error) => panic!("failed to load tracing-multi fixture: {error}"),
+    };
+    let program = loaded.program("observe_dummy_functions").unwrap();
+    assert_eq!(
+        program.spec().attach_btf_object().unwrap().info().name,
+        "dummy"
+    );
+    let link = program.attach().unwrap();
+    assert_eq!(link.info().unwrap().link_type, LinkType::TracingMulti);
 }
 
 #[test]

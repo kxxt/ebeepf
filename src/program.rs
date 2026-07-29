@@ -696,18 +696,7 @@ pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind) -> bool {
         ProgramKind::Kprobe { .. }
         | ProgramKind::Tracepoint { .. }
         | ProgramKind::RawTracepoint { .. } => true,
-        ProgramKind::Tracing {
-            attach_type,
-            target,
-        } => {
-            !target.is_empty()
-                && !matches!(
-                    attach_type,
-                    AttachType::TraceFunctionEntryMulti
-                        | AttachType::TraceFunctionExitMulti
-                        | AttachType::TraceFunctionSessionMulti
-                )
-        }
+        ProgramKind::Tracing { target, .. } => !target.is_empty(),
         _ => false,
     }
 }
@@ -748,6 +737,7 @@ pub struct ProgramSpec {
     pub(crate) interface_index: u32,
     pub(crate) attach_btf_id: u32,
     pub(crate) attach_program: Option<AttachProgram>,
+    pub(crate) attach_btf_object: Option<BtfObject>,
     pub(crate) func_info: Vec<u8>,
     pub(crate) func_info_record_size: u32,
     pub(crate) line_info: Vec<u8>,
@@ -780,6 +770,7 @@ impl ProgramSpec {
             interface_index: 0,
             attach_btf_id: 0,
             attach_program: None,
+            attach_btf_object: None,
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),
@@ -844,6 +835,11 @@ impl ProgramSpec {
         self.attach_program.as_ref().map(|target| target.fd.as_fd())
     }
 
+    /// Borrows the kernel or module BTF object selected as an attachment target.
+    pub fn attach_btf_object(&self) -> Option<&BtfObject> {
+        self.attach_btf_object.as_ref()
+    }
+
     /// Whether [`Program::attach`] can attach this program without additional
     /// runtime arguments.
     pub fn auto_attachable(&self) -> bool {
@@ -891,7 +887,21 @@ impl ProgramSpec {
         self.attach_program = Some(AttachProgram {
             fd: Arc::clone(&program.fd),
         });
+        self.attach_btf_object = None;
         self.attach_btf_id = function.0;
+        self
+    }
+
+    /// Targets a type in a kernel or module BTF object.
+    ///
+    /// This is the explicit form used for module `fentry`, `fexit`, LSM, and
+    /// other BTF-based programs. Section targets such as
+    /// `"fentry/module:function"` are resolved automatically during object
+    /// loading.
+    pub fn set_kernel_attach_target(&mut self, btf: &BtfObject, target: TypeId) -> &mut Self {
+        self.attach_program = None;
+        self.attach_btf_object = Some(btf.clone());
+        self.attach_btf_id = target.0;
         self
     }
 
@@ -924,6 +934,7 @@ impl ProgramSpec {
     /// Clears a previously configured loaded-program attachment target.
     pub fn clear_attach_target(&mut self) -> &mut Self {
         self.attach_program = None;
+        self.attach_btf_object = None;
         self.attach_btf_id = 0;
         self
     }
@@ -947,6 +958,26 @@ impl ProgramSpec {
         if self.attach_program.is_some() && self.attach_btf_id == 0 {
             return Err(Error::InvalidObject(format!(
                 "program `{}` has an attachment program but no target BTF ID",
+                self.name
+            )));
+        }
+        let tracing_multi = matches!(
+            self.kind.attach_type(),
+            Some(
+                AttachType::TraceFunctionEntryMulti
+                    | AttachType::TraceFunctionExitMulti
+                    | AttachType::TraceFunctionSessionMulti
+            )
+        );
+        if self.attach_btf_object.is_some() && self.attach_btf_id == 0 && !tracing_multi {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` has an attachment BTF object but no target type ID",
+                self.name
+            )));
+        }
+        if self.attach_program.is_some() && self.attach_btf_object.is_some() {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` has both program and kernel-BTF attachment targets",
                 self.name
             )));
         }
@@ -1053,6 +1084,46 @@ impl<'target> KprobeMultiOptions<'target> {
     /// Selects a kprobe session link.
     pub const fn session(mut self, enabled: bool) -> Self {
         self.session = enabled;
+        self
+    }
+}
+
+/// Kernel BTF targets used by a tracing-multi attachment.
+#[derive(Clone, Copy, Debug)]
+pub enum TracingMultiTargets<'target> {
+    /// Explicit kernel BTF function type IDs.
+    TypeIds(&'target [TypeId]),
+    /// A glob pattern matched against traceable kernel BTF function names.
+    Pattern(&'target str),
+}
+
+/// Options for `fentry.multi`, `fexit.multi`, and `fsession.multi` links.
+#[derive(Clone, Copy, Debug)]
+pub struct TracingMultiOptions<'target> {
+    targets: TracingMultiTargets<'target>,
+    cookies: Option<&'target [u64]>,
+}
+
+impl<'target> TracingMultiOptions<'target> {
+    /// Creates options targeting explicit BTF function IDs.
+    pub const fn type_ids(ids: &'target [TypeId]) -> Self {
+        Self {
+            targets: TracingMultiTargets::TypeIds(ids),
+            cookies: None,
+        }
+    }
+
+    /// Creates options selecting function names with `*` and `?` wildcards.
+    pub const fn pattern(pattern: &'target str) -> Self {
+        Self {
+            targets: TracingMultiTargets::Pattern(pattern),
+            cookies: None,
+        }
+    }
+
+    /// Supplies one attachment cookie per selected function.
+    pub const fn cookies(mut self, cookies: &'target [u64]) -> Self {
+        self.cookies = Some(cookies);
         self
     }
 }
@@ -1305,6 +1376,10 @@ impl Program {
             .attach_program
             .as_ref()
             .map(|target| target.fd.as_raw_fd());
+        let attach_btf_object_fd = spec
+            .attach_btf_object
+            .as_ref()
+            .map(|target| target.as_fd().as_raw_fd());
         let (func_info, func_info_record_size, line_info, line_info_record_size) =
             if btf_fd.is_some() {
                 (
@@ -1332,6 +1407,7 @@ impl Program {
             line_info_record_size,
             attach_btf_id: spec.attach_btf_id,
             attach_program_fd,
+            attach_btf_object_fd,
             log_level: spec.verifier_log.level,
             log_size: spec.verifier_log.capacity,
             token_fd,
@@ -1386,6 +1462,7 @@ impl Program {
             interface_index: raw.ifindex,
             attach_btf_id: 0,
             attach_program: None,
+            attach_btf_object: None,
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),
@@ -1612,6 +1689,94 @@ impl Program {
             options.return_probe,
         )
         .map_err(|source| Error::system("attach multi-kprobe program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
+    /// Attaches a tracing program to multiple kernel BTF functions.
+    pub fn attach_tracing_multi(&self, options: TracingMultiOptions<'_>) -> Result<Link> {
+        let attach_type = self.spec.kind.attach_type().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "program `{}` has no tracing-multi attachment type",
+                self.name()
+            ))
+        })?;
+        if !matches!(
+            attach_type,
+            AttachType::TraceFunctionEntryMulti
+                | AttachType::TraceFunctionExitMulti
+                | AttachType::TraceFunctionSessionMulti
+        ) {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` is not a tracing-multi program",
+                self.name()
+            )));
+        }
+        let ids = match options.targets {
+            TracingMultiTargets::TypeIds(ids) => ids.iter().map(|id| id.0).collect::<Vec<_>>(),
+            TracingMultiTargets::Pattern(pattern) => {
+                if pattern.is_empty() {
+                    return Err(Error::InvalidObject(
+                        "tracing-multi pattern cannot be empty".into(),
+                    ));
+                }
+                let (module_name, pattern) = match pattern.split_once(':') {
+                    Some((module, pattern)) if !module.is_empty() && !pattern.is_empty() => {
+                        (Some(module), pattern)
+                    }
+                    Some(_) => {
+                        return Err(Error::InvalidObject(format!(
+                            "invalid tracing-multi module pattern `{pattern}`"
+                        )));
+                    }
+                    None => (None, pattern),
+                };
+                let owned_btf = (module_name.is_none() && self.spec.attach_btf_object.is_none())
+                    .then(crate::Btf::from_vmlinux)
+                    .transpose()?;
+                let btf = match (module_name, self.spec.attach_btf_object.as_ref()) {
+                    (Some(module), Some(btf)) if btf.info().name == module => btf.btf(),
+                    (Some(module), Some(btf)) => {
+                        return Err(Error::InvalidObject(format!(
+                            "program `{}` was verified for module `{}`, not `{module}`",
+                            self.name(),
+                            btf.info().name
+                        )));
+                    }
+                    (Some(module), None) => {
+                        return Err(Error::InvalidObject(format!(
+                            "program `{}` was not loaded for module `{module}`",
+                            self.name()
+                        )));
+                    }
+                    (None, Some(btf)) => btf.btf(),
+                    (None, None) => owned_btf
+                        .as_ref()
+                        .expect("vmlinux BTF is loaded for an unqualified pattern"),
+                };
+                let local_only = self.spec.attach_btf_object.is_some();
+                btf.types()
+                    .filter(|(id, ty)| {
+                        (!local_only || id.0 as usize > btf.base_type_count())
+                            && ty.kind() == BtfKind::Function
+                            && ty.name().is_some_and(|name| glob_matches(pattern, name))
+                    })
+                    .map(|(id, _)| id.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        if ids.is_empty() {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` has no tracing-multi targets",
+                self.name()
+            )));
+        }
+        let fd = sys::tracing_multi_link_create(
+            self.fd.as_raw_fd(),
+            attach_type.as_raw(),
+            &ids,
+            options.cookies,
+        )
+        .map_err(|source| Error::system("attach tracing-multi program", source))?;
         Ok(Link::bpf(fd))
     }
 
@@ -1856,15 +2021,18 @@ impl Program {
 
     /// Creates a BTF tracing, LSM, or iterator link.
     pub fn attach_btf(&self, attach_type: AttachType, target_btf_id: u32) -> Result<Link> {
-        let fd = sys::link_create(
-            self.fd.as_raw_fd(),
-            0,
-            attach_type.as_raw(),
-            0,
-            target_btf_id,
-            0,
-        )
-        .map_err(|source| Error::system("attach BTF tracing program", source))?;
+        if target_btf_id != 0
+            && self.spec.attach_btf_id != 0
+            && target_btf_id != self.spec.attach_btf_id
+        {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` was verified for BTF type {}, not {target_btf_id}",
+                self.name(),
+                self.spec.attach_btf_id
+            )));
+        }
+        let fd = sys::link_create(self.fd.as_raw_fd(), 0, attach_type.as_raw(), 0, 0, 0)
+            .map_err(|source| Error::system("attach BTF tracing program", source))?;
         Ok(Link::bpf(fd))
     }
 
@@ -2004,6 +2172,15 @@ impl Program {
                 attach_type: AttachType::TraceIterator,
                 ..
             } if self.spec.auto_attachable() => self.attach_iterator(IteratorOptions::None),
+            ProgramKind::Tracing {
+                attach_type:
+                    AttachType::TraceFunctionEntryMulti
+                    | AttachType::TraceFunctionExitMulti
+                    | AttachType::TraceFunctionSessionMulti,
+                target,
+            } if self.spec.auto_attachable() => {
+                self.attach_tracing_multi(TracingMultiOptions::pattern(target))
+            }
             ProgramKind::Tracing { attach_type, .. } if self.spec.auto_attachable() => {
                 if self.spec.attach_btf_id == 0 {
                     return Err(Error::InvalidObject(format!(
@@ -2023,6 +2200,33 @@ impl Program {
             ))),
         }
     }
+}
+
+fn glob_matches(pattern: &str, value: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let value = value.as_bytes();
+    let (mut pattern_index, mut value_index) = (0, 0);
+    let (mut star, mut retry_value) = (None, 0);
+    while value_index < value.len() {
+        if pattern
+            .get(pattern_index)
+            .is_some_and(|byte| *byte == b'?' || Some(byte) == value.get(value_index))
+        {
+            pattern_index += 1;
+            value_index += 1;
+        } else if pattern.get(pattern_index) == Some(&b'*') {
+            star = Some(pattern_index);
+            pattern_index += 1;
+            retry_value = value_index;
+        } else if let Some(star_index) = star {
+            pattern_index = star_index + 1;
+            retry_value += 1;
+            value_index = retry_value;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_index..].iter().all(|byte| *byte == b'*')
 }
 
 fn resolve_elf_symbols(path: &Path, symbols: &[&str]) -> Result<Vec<u64>> {
@@ -2229,7 +2433,7 @@ mod tests {
         .unwrap()
         .auto_attachable());
         assert!(
-            !ProgramSpec::new("entry", "fentry.multi/do_*", instructions.clone())
+            ProgramSpec::new("entry", "fentry.multi/do_*", instructions.clone())
                 .unwrap()
                 .auto_attachable()
         );
@@ -2243,6 +2447,15 @@ mod tests {
         assert_eq!(parse_cpu_set("0-2,5").unwrap(), [0, 1, 2, 5]);
         assert!(parse_cpu_set("").is_err());
         assert!(parse_cpu_set("2-1").is_err());
+    }
+
+    #[test]
+    fn tracing_multi_globs_match_kernel_symbol_names() {
+        assert!(glob_matches("tcp_*", "tcp_v4_connect"));
+        assert!(glob_matches("dummy_?mit", "dummy_xmit"));
+        assert!(glob_matches("*", "anything"));
+        assert!(!glob_matches("tcp_?", "tcp_v4_connect"));
+        assert!(!glob_matches("dummy_*", "net_dummy_xmit"));
     }
 
     #[test]

@@ -259,6 +259,7 @@ impl Object {
                 interface_index: 0,
                 attach_btf_id: 0,
                 attach_program: None,
+                attach_btf_object: None,
                 func_info: Vec::new(),
                 func_info_record_size: 0,
                 line_info: Vec::new(),
@@ -503,7 +504,7 @@ impl Object {
             &mut self.struct_ops,
         )?;
         resolve_kfunc_relocations(&mut self.programs, &self.kfunc_relocations)?;
-        resolve_attach_btf_ids(&mut self.programs)?;
+        resolve_attach_btf_ids(&mut self.programs, token.as_ref())?;
 
         let kernel_btf = self
             .btf
@@ -2408,7 +2409,10 @@ fn parse_kernel_version(release: &str) -> Option<u32> {
         .then(|| (major << 16) | (minor << 8) | patch.min(u32::from(u8::MAX)))
 }
 
-fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Result<()> {
+fn resolve_attach_btf_ids(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    token: Option<&BpfToken>,
+) -> Result<()> {
     let needs_resolution = programs.values().any(|program| {
         matches!(
             program.kind(),
@@ -2416,13 +2420,14 @@ fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Resul
                 attach_type,
                 target,
             } if !target.is_empty()
-                && !matches!(
-                    attach_type,
-                    crate::AttachType::TraceFunctionEntryMulti
-                        | crate::AttachType::TraceFunctionExitMulti
-                        | crate::AttachType::TraceFunctionSessionMulti
-                )
-                && program.attach_btf_id == 0
+                && (program.attach_btf_id == 0
+                    || (matches!(
+                        attach_type,
+                        crate::AttachType::TraceFunctionEntryMulti
+                            | crate::AttachType::TraceFunctionExitMulti
+                            | crate::AttachType::TraceFunctionSessionMulti
+                    ) && target.contains(':')
+                        && program.attach_btf_object.is_none()))
         )
     });
     if !needs_resolution {
@@ -2435,33 +2440,57 @@ fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Resul
     })?;
     let kernel_btf = Btf::parse(&bytes)?;
     for program in programs.values_mut() {
-        let ProgramKind::Tracing {
-            attach_type,
-            target,
-        } = program.kind()
-        else {
-            continue;
-        };
-        if target.is_empty()
-            || program.attach_btf_id != 0
-            || matches!(
+        let (attach_type, target) = match program.kind() {
+            ProgramKind::Tracing {
                 attach_type,
-                crate::AttachType::TraceFunctionEntryMulti
-                    | crate::AttachType::TraceFunctionExitMulti
-                    | crate::AttachType::TraceFunctionSessionMulti
-            )
-        {
+                target,
+            } => (*attach_type, target.clone()),
+            _ => continue,
+        };
+        if target.is_empty() {
             continue;
         }
-        let target = if let Some(target) = target.strip_prefix("vmlinux:") {
-            target
-        } else if target.contains(':') {
-            return Err(Error::Unsupported(format!(
-                "module BTF attachment target `{target}` is not yet supported"
-            )));
-        } else {
-            target
+        let tracing_multi = matches!(
+            attach_type,
+            crate::AttachType::TraceFunctionEntryMulti
+                | crate::AttachType::TraceFunctionExitMulti
+                | crate::AttachType::TraceFunctionSessionMulti
+        );
+        let (module_name, target_name) = match target.split_once(':') {
+            Some(("vmlinux", target)) => (None, target),
+            Some((module, target)) if !module.is_empty() && !target.is_empty() => {
+                (Some(module), target)
+            }
+            Some(_) => {
+                return Err(Error::InvalidObject(format!(
+                    "invalid module BTF attachment target `{target}`"
+                )));
+            }
+            None => (None, target.as_str()),
         };
+        if tracing_multi {
+            if let Some(module_name) = module_name {
+                let module = match token {
+                    Some(token) => {
+                        crate::BtfObject::from_kernel_module_with_token(module_name, token)?
+                    }
+                    None => crate::BtfObject::from_kernel_module(module_name)?,
+                };
+                program.attach_btf_object = Some(module);
+            }
+            continue;
+        }
+        if program.attach_btf_id != 0 {
+            continue;
+        }
+        let module = match module_name {
+            Some(module_name) => Some(match token {
+                Some(token) => crate::BtfObject::from_kernel_module_with_token(module_name, token)?,
+                None => crate::BtfObject::from_kernel_module(module_name)?,
+            }),
+            None => None,
+        };
+        let target_btf = module.as_ref().map_or(&kernel_btf, crate::BtfObject::btf);
         let (prefix, kind) = match attach_type {
             crate::AttachType::TraceRawTracepoint => ("btf_trace_", crate::BtfKind::Typedef),
             crate::AttachType::LsmMac | crate::AttachType::LsmCgroup => {
@@ -2470,14 +2499,21 @@ fn resolve_attach_btf_ids(programs: &mut BTreeMap<String, ProgramSpec>) -> Resul
             crate::AttachType::TraceIterator => ("bpf_iter_", crate::BtfKind::Function),
             _ => ("", crate::BtfKind::Function),
         };
-        let name = format!("{prefix}{target}");
-        let (id, _) = kernel_btf.find(kind, &name).ok_or_else(|| {
+        let name = format!("{prefix}{target_name}");
+        let (id, _) = if module.is_some() {
+            target_btf.find_local(kind, &name)
+        } else {
+            target_btf.find(kind, &name)
+        }
+        .ok_or_else(|| {
             Error::InvalidObject(format!(
-                "attachment target `{name}` for program `{}` is absent from kernel BTF",
-                program.name
+                "attachment target `{name}` for program `{}` is absent from {} BTF",
+                program.name,
+                module_name.unwrap_or("kernel")
             ))
         })?;
         program.attach_btf_id = id.0;
+        program.attach_btf_object = module;
     }
     Ok(())
 }

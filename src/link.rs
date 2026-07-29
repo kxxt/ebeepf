@@ -314,6 +314,8 @@ pub enum LinkType {
     Netkit,
     /// Socket map.
     SocketMap,
+    /// Multi-function BTF tracing.
+    TracingMulti,
     /// A type introduced after this crate version.
     Other(u32),
 }
@@ -337,6 +339,7 @@ impl LinkType {
             12 => Self::UprobeMulti,
             13 => Self::Netkit,
             14 => Self::SocketMap,
+            15 => Self::TracingMulti,
             value => Self::Other(value),
         }
     }
@@ -359,6 +362,7 @@ impl LinkType {
             Self::UprobeMulti => 12,
             Self::Netkit => 13,
             Self::SocketMap => 14,
+            Self::TracingMulti => 15,
             Self::Other(value) => value,
         }
     }

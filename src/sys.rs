@@ -101,6 +101,7 @@ pub(crate) struct ProgramLoad<'a> {
     pub line_info_record_size: u32,
     pub attach_btf_id: u32,
     pub attach_program_fd: Option<RawFd>,
+    pub attach_btf_object_fd: Option<RawFd>,
     pub log_level: u32,
     pub log_size: usize,
     pub token_fd: Option<RawFd>,
@@ -334,6 +335,19 @@ struct KprobeMultiLinkCreateAttr {
     symbols: u64,
     addresses: u64,
     cookies: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct TracingMultiLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    link_flags: u32,
+    ids: u64,
+    cookies: u64,
+    count: u32,
+    _padding: u32,
 }
 
 #[repr(C)]
@@ -907,6 +921,15 @@ pub(crate) fn load_btf_with_token(
 }
 
 pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Error, String)> {
+    if options.attach_program_fd.is_some() && options.attach_btf_object_fd.is_some() {
+        return Err((
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "program and BTF attachment descriptors are mutually exclusive",
+            ),
+            String::new(),
+        ));
+    }
     let mut log = vec![0_u8; options.log_size];
     let mut attr = ProgramLoadAttr {
         prog_type: options.program_type,
@@ -929,7 +952,8 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         line_info: slice_pointer(options.line_info),
         line_info_cnt: record_count(options.line_info, options.line_info_record_size),
         attach_btf_id: options.attach_btf_id,
-        attach_prog_fd: fd_u32(options.attach_program_fd).unwrap_or_default(),
+        attach_prog_fd: fd_u32(options.attach_program_fd.or(options.attach_btf_object_fd))
+            .unwrap_or_default(),
         program_token_fd: options.token_fd.unwrap_or_default(),
         ..Default::default()
     };
@@ -1054,6 +1078,7 @@ fn probe_program_load(
         line_info_record_size: 0,
         attach_btf_id: config.attach_btf_id,
         attach_program_fd: None,
+        attach_btf_object_fd: None,
         log_level: u32::from(log),
         log_size: if log { 4096 } else { 0 },
         token_fd: None,
@@ -1118,6 +1143,7 @@ fn probe_bpf_cookie() -> bool {
         line_info_record_size: 0,
         attach_btf_id: 0,
         attach_program_fd: None,
+        attach_btf_object_fd: None,
         log_level: 0,
         log_size: 0,
         token_fd: None,
@@ -1181,7 +1207,7 @@ pub(crate) fn link_info(fd: RawFd) -> io::Result<LinkInfoRaw> {
 pub(crate) fn btf_info(fd: RawFd) -> io::Result<(BtfInfoRaw, Vec<u8>, Vec<u8>)> {
     let mut info = object_info::<BtfInfoRaw>(fd)?;
     let btf_capacity = info.btf_size as usize;
-    let name_capacity = info.name_length as usize;
+    let name_capacity = (info.name_length as usize).max(256);
     let mut btf = vec![0_u8; btf_capacity];
     let mut name = vec![0_u8; name_capacity];
     info.btf = mut_slice_pointer(&mut btf);
@@ -1194,6 +1220,22 @@ pub(crate) fn btf_info(fd: RawFd) -> io::Result<(BtfInfoRaw, Vec<u8>, Vec<u8>)> 
     info.btf = 0;
     info.name = 0;
     Ok((info, btf, name))
+}
+
+pub(crate) fn btf_metadata(fd: RawFd) -> io::Result<(BtfInfoRaw, Vec<u8>)> {
+    let mut info = object_info::<BtfInfoRaw>(fd)?;
+    let btf_size = info.btf_size;
+    let mut name = vec![0_u8; (info.name_length as usize).max(256)];
+    info.btf = 0;
+    info.btf_size = 0;
+    info.name = mut_slice_pointer(&mut name);
+    info.name_length = u32::try_from(name.len()).unwrap_or(u32::MAX);
+    object_info_into(fd, &mut info)?;
+    name.truncate((info.name_length as usize).min(name.len()));
+    info.btf = 0;
+    info.btf_size = btf_size;
+    info.name = 0;
+    Ok((info, name))
 }
 
 pub(crate) struct ProgramQueryResult {
@@ -1668,6 +1710,30 @@ pub(crate) fn struct_ops_link_create(map_fd: RawFd) -> io::Result<OwnedFd> {
     command_fd(BPF_LINK_CREATE, &attr)
 }
 
+pub(crate) fn tracing_multi_link_create(
+    program_fd: RawFd,
+    attach_type: u32,
+    type_ids: &[u32],
+    cookies: Option<&[u64]>,
+) -> io::Result<OwnedFd> {
+    if type_ids.is_empty() || cookies.is_some_and(|cookies| cookies.len() != type_ids.len()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tracing-multi targets and cookies have incompatible lengths",
+        ));
+    }
+    let attr = TracingMultiLinkCreateAttr {
+        prog_fd: raw_fd_u32(program_fd)?,
+        attach_type,
+        ids: slice_pointer(type_ids),
+        cookies: cookies.map_or(0, slice_pointer),
+        count: u32::try_from(type_ids.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many BTF targets"))?,
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
 pub(crate) fn tracepoint_event(tracepoint_id: u64, cpu: i32) -> io::Result<OwnedFd> {
     let attr = PerfEventAttr {
         event_type: PERF_TYPE_TRACEPOINT,
@@ -2035,6 +2101,7 @@ mod tests {
         assert_eq!(mem::size_of::<LinkUpdateAttr>(), 16);
         assert_eq!(mem::size_of::<ProgramMapAttr>(), 12);
         assert_eq!(mem::size_of::<KprobeMultiLinkCreateAttr>(), 48);
+        assert_eq!(mem::size_of::<TracingMultiLinkCreateAttr>(), 40);
         assert_eq!(mem::size_of::<UprobeMultiLinkCreateAttr>(), 64);
         assert_eq!(mem::size_of::<IteratorLinkCreateAttr>(), 32);
         assert_eq!(mem::size_of::<NetfilterLinkCreateAttr>(), 32);

@@ -90,6 +90,8 @@ The crate currently provides:
   batch operations, and per-CPU values;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
+- vmlinux and kernel-module split-BTF parsing, owned module BTF lookup, and
+  module-qualified BTF tracing targets;
 - ELF-defined `.struct_ops` and `.struct_ops.link` implementations, including
   callback relocations, kernel-BTF wrapper layout translation, vmlinux value
   type metadata, modern link and legacy registration lifetimes, and
@@ -98,7 +100,8 @@ The crate currently provides:
   aliasable shared-memory slices; generated skeletons retain these mappings
   and expose live typed `.bss`, `.data`, and read-only `.rodata` accessors;
 - tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
-  socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
+  socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, multi-function
+  BTF tracing, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with
   RAII link lifetimes;
 - descriptor-targeted links for cgroups, network namespaces, and socket maps,
