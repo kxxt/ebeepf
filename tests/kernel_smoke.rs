@@ -21,9 +21,10 @@ use ebeepf::{
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, MsgFlags};
-use object::write::{Object as WriteObject, Symbol, SymbolSection};
+use object::write::{Object as WriteObject, Relocation, Symbol, SymbolSection};
 use object::{
-    Architecture, BinaryFormat, Endianness, SectionKind, SymbolFlags, SymbolKind, SymbolScope,
+    elf, Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+    SymbolKind, SymbolScope,
 };
 use probe::probe;
 
@@ -40,6 +41,92 @@ fn loadable_object() -> Vec<u8> {
 
 fn loadable_object_with_btf() -> Vec<u8> {
     make_loadable_object(true)
+}
+
+fn instruction_array_object() -> Vec<u8> {
+    let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+    let program = object.add_section(Vec::new(), b"socket".to_vec(), SectionKind::Text);
+    let entry_instructions = [
+        Instruction::new(0x85, 0, 0, 0, 0),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    object.append_section_data(program, &instruction_bytes(&entry_instructions), 8);
+    object.add_symbol(Symbol {
+        name: b"dispatch".to_vec(),
+        value: 0,
+        size: (entry_instructions.len() * Instruction::SIZE) as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(program),
+        flags: SymbolFlags::None,
+    });
+
+    let text = object.add_section(Vec::new(), b".text".to_vec(), SectionKind::Text);
+    let subprogram_instructions = [
+        Instruction::new(0x18, 1, 0, 0, 0),
+        Instruction::default(),
+        Instruction::new(0xb7, 0, 0, 0, 55),
+        Instruction::new(0x95, 0, 0, 0, 0),
+    ];
+    object.append_section_data(text, &instruction_bytes(&subprogram_instructions), 8);
+    let subprogram = object.add_symbol(Symbol {
+        name: b"dispatch_impl".to_vec(),
+        value: 0,
+        size: (subprogram_instructions.len() * Instruction::SIZE) as u64,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Compilation,
+        weak: false,
+        section: SymbolSection::Section(text),
+        flags: SymbolFlags::None,
+    });
+    object
+        .add_relocation(
+            program,
+            Relocation {
+                offset: 0,
+                symbol: subprogram,
+                addend: 0,
+                flags: RelocationFlags::Elf {
+                    r_type: elf::R_BPF_64_32,
+                },
+            },
+        )
+        .unwrap();
+
+    let tables = object.add_section(
+        Vec::new(),
+        b".jumptables".to_vec(),
+        SectionKind::ReadOnlyData,
+    );
+    object.append_section_data(tables, &16_u64.to_le_bytes(), 8);
+    let table = object.add_symbol(Symbol {
+        name: b".LJTI0_0".to_vec(),
+        value: 0,
+        size: 8,
+        kind: SymbolKind::Data,
+        scope: SymbolScope::Compilation,
+        weak: false,
+        section: SymbolSection::Section(tables),
+        flags: SymbolFlags::None,
+    });
+    object
+        .add_relocation(
+            text,
+            Relocation {
+                offset: 0,
+                symbol: table,
+                addend: 0,
+                flags: RelocationFlags::Elf {
+                    r_type: elf::R_BPF_64_64,
+                },
+            },
+        )
+        .unwrap();
+
+    let license = object.add_section(Vec::new(), b"license".to_vec(), SectionKind::Data);
+    object.append_section_data(license, b"GPL\0", 1);
+    object.write().unwrap()
 }
 
 fn make_loadable_object(include_btf: bool) -> Vec<u8> {
@@ -252,6 +339,36 @@ fn loads_and_mutates_arena_backed_globals() {
     assert!(offset < memory.len());
     memory.write(offset, &73_u32.to_ne_bytes()).unwrap();
     assert_eq!(program.test_run(input).unwrap().return_value, 73);
+}
+
+#[test]
+fn parses_llvm_instruction_array_relocations() {
+    let object = Object::parse(&instruction_array_object()).unwrap();
+    assert_eq!(object.maps().len(), 0);
+    assert_eq!(object.program("dispatch").unwrap().instructions().len(), 6);
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF and a kernel with instruction-array maps"]
+fn creates_and_populates_llvm_instruction_arrays() {
+    let object = Object::parse(&instruction_array_object()).unwrap();
+    assert_eq!(object.maps().len(), 0);
+    let loaded = object.load().unwrap();
+    let program = loaded.program("dispatch").unwrap();
+    let info = program.info().unwrap();
+    assert_eq!(info.map_ids.len(), 1);
+
+    let table = Map::from_id(info.map_ids[0]).unwrap();
+    let table_info = table.info().unwrap();
+    assert_eq!(table_info.map_type, MapType::InstructionArray);
+    assert_eq!(table_info.value_size, 16);
+    assert_eq!(table_info.max_entries, 1);
+    let value = table.lookup(&0_u32.to_ne_bytes()).unwrap().unwrap();
+    assert_eq!(u32::from_ne_bytes(value[..4].try_into().unwrap()), 4);
+    assert_eq!(u32::from_ne_bytes(value[4..8].try_into().unwrap()), 4);
+
+    let output = program.test_run(TestRunOptions::new(&[0_u8; 64])).unwrap();
+    assert_eq!(output.return_value, 55);
 }
 
 #[test]

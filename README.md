@@ -83,8 +83,9 @@ The crate currently provides:
 
 - owned ELF and BTF parsing, BTF-defined and legacy maps, global data and
   kconfig maps populated from real and virtual kernel configuration, subprogram
-  linking, arena-backed globals with full-width map offsets, BTF.ext metadata,
-  and every standard CO-RE relocation kind;
+  linking, arena-backed globals with full-width map offsets, LLVM jump-table
+  instruction arrays, BTF.ext metadata, and every standard CO-RE relocation
+  kind;
 - direct `bpf(2)` loading, standalone and reused maps, pinning, rich
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, type-accurate map/program/helper capability probes, map CRUD and

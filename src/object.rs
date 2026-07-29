@@ -22,8 +22,8 @@ use crate::program::{
 use crate::sys::{self, MapCreate};
 use crate::usdt::UsdtManager;
 use crate::{
-    BpfToken, Btf, BtfObject, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec,
-    ProgramType, Result, TypeId,
+    BpfToken, Btf, BtfObject, Error, Instruction, Map, MapCreateOptions, MapSpec, MapType, Program,
+    ProgramSpec, ProgramType, Result, TypeId, UpdateMode,
 };
 
 const R_BPF_64_64: u32 = 1;
@@ -45,6 +45,15 @@ struct MapRelocation {
     instruction_index: usize,
     map: String,
     value_offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InstructionArrayRelocation {
+    program: String,
+    instruction_index: usize,
+    source_placement: Placement,
+    table_offset: u64,
+    table_size: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +166,8 @@ pub struct Object {
     maps: BTreeMap<String, MapSpec>,
     programs: BTreeMap<String, ProgramSpec>,
     map_relocations: Vec<MapRelocation>,
+    instruction_array_relocations: Vec<InstructionArrayRelocation>,
+    jump_table_data: Option<Vec<u8>>,
     core_relocations: Vec<CoreRelocation>,
     kfunc_relocations: Vec<KfuncRelocation>,
     ksym_relocations: Vec<KsymRelocation>,
@@ -224,6 +235,10 @@ impl Object {
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let mut data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
         add_arena_data(&sections, btf.as_ref(), &mut maps, &mut data_sections)?;
+        let jump_table_section = sections.by_name(".jumptables").map(|(index, _)| index);
+        let jump_table_data = jump_table_section
+            .map(|index| sections.owned_data(index))
+            .transpose()?;
         let ksym_kinds = collect_ksym_kinds(btf.as_ref())?;
         let extern_data = add_kconfig_map(&name, &elf, btf.as_mut(), &mut maps)?;
         let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
@@ -231,6 +246,7 @@ impl Object {
 
         let mut programs = BTreeMap::new();
         let mut map_relocations = Vec::new();
+        let mut instruction_array_relocations = Vec::new();
         let mut core_relocations = Vec::new();
         let mut kfunc_relocations = Vec::new();
         let mut ksym_relocations = Vec::new();
@@ -310,11 +326,13 @@ impl Object {
                 &elf,
                 &placements,
                 &data_sections,
+                jump_table_section,
                 &extern_data,
                 &maps,
                 &program_name,
                 &mut spec.instructions,
                 &mut map_relocations,
+                &mut instruction_array_relocations,
                 &mut kfunc_relocations,
                 &mut ksym_relocations,
                 &ksym_kinds,
@@ -365,6 +383,8 @@ impl Object {
             maps,
             programs,
             map_relocations,
+            instruction_array_relocations,
+            jump_table_data,
             core_relocations,
             kfunc_relocations,
             ksym_relocations,
@@ -592,6 +612,12 @@ impl Object {
             &self.struct_ops,
         )?;
         relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
+        let instruction_arrays = load_instruction_arrays(
+            &mut self.programs,
+            &self.instruction_array_relocations,
+            self.jump_table_data.as_deref(),
+            token.as_ref(),
+        )?;
         let usdt_manager = UsdtManager::from_maps(&maps, self.btf.as_ref())?;
 
         let mut programs = BTreeMap::new();
@@ -609,6 +635,7 @@ impl Object {
             programs.insert(name, program);
         }
         finalize_struct_ops_values(&mut maps, &programs, &self.struct_ops)?;
+        drop(instruction_arrays);
 
         Ok(LoadedObject {
             name: self.name,
@@ -2299,11 +2326,13 @@ fn apply_program_relocations(
     elf: &Elf<'_>,
     placements: &Placements,
     data_sections: &HashMap<usize, String>,
+    jump_table_section: Option<usize>,
     extern_data: &HashMap<String, (String, u32)>,
     maps: &BTreeMap<String, MapSpec>,
     program_name: &str,
     instructions: &mut [Instruction],
     map_relocations: &mut Vec<MapRelocation>,
+    instruction_array_relocations: &mut Vec<InstructionArrayRelocation>,
     kfunc_relocations: &mut Vec<KfuncRelocation>,
     ksym_relocations: &mut Vec<KsymRelocation>,
     ksym_kinds: &HashMap<String, KsymKind>,
@@ -2414,6 +2443,50 @@ fn apply_program_relocations(
                         instruction.immediate = i32::try_from(delta).map_err(|_| {
                             Error::InvalidObject("function relocation does not fit i32".into())
                         })?;
+                        continue;
+                    }
+
+                    if Some(target_section) == jump_table_section {
+                        let source_placement = placements
+                            .get(&source_section)
+                            .and_then(|placements| {
+                                placements
+                                    .iter()
+                                    .find(|placement| placement.translate(local_index).is_some())
+                            })
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::InvalidObject(
+                                    "jump-table relocation has no source function placement".into(),
+                                )
+                            })?;
+                        let instruction = instructions.get(instruction_index).ok_or_else(|| {
+                            Error::InvalidObject("jump-table relocation is outside program".into())
+                        })?;
+                        if instruction.code != BPF_LD_IMM_DW
+                            || instructions.get(instruction_index + 1).is_none()
+                        {
+                            return Err(Error::InvalidObject(format!(
+                                "jump-table relocation in `{program_name}` does not target ldimm64"
+                            )));
+                        }
+                        let addend = relocation.r_addend.unwrap_or_default();
+                        let table_offset = i128::from(symbol.st_value)
+                            .checked_add(i128::from(addend))
+                            .ok_or_else(|| {
+                                Error::InvalidObject("jump-table offset overflow".into())
+                            })?;
+                        instruction_array_relocations.push(InstructionArrayRelocation {
+                            program: program_name.into(),
+                            instruction_index,
+                            source_placement,
+                            table_offset: u64::try_from(table_offset).map_err(|_| {
+                                Error::InvalidObject(
+                                    "jump-table offset is negative or too large".into(),
+                                )
+                            })?,
+                            table_size: symbol.st_size,
+                        });
                         continue;
                     }
 
@@ -2583,6 +2656,144 @@ fn relocate_maps(
         second.immediate = value_offset as i32;
     }
     Ok(())
+}
+
+fn load_instruction_arrays(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[InstructionArrayRelocation],
+    data: Option<&[u8]>,
+    token: Option<&BpfToken>,
+) -> Result<Vec<Map>> {
+    if relocations.is_empty() {
+        return Ok(Vec::new());
+    }
+    let data = data.ok_or_else(|| {
+        Error::InvalidObject("jump-table relocations require a `.jumptables` section".into())
+    })?;
+    let mut arrays = BTreeMap::<(String, u64), (Placement, u64, Map)>::new();
+    for relocation in relocations {
+        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "jump-table relocation references missing program `{}`",
+                relocation.program
+            ))
+        })?;
+        if !program.autoload {
+            continue;
+        }
+        let key = (relocation.program.clone(), relocation.table_offset);
+        if let Some((placement, table_size, _)) = arrays.get(&key) {
+            if *placement != relocation.source_placement {
+                return Err(Error::InvalidObject(format!(
+                    "jump table at offset {} is referenced from multiple functions in program `{}`",
+                    relocation.table_offset, relocation.program
+                )));
+            }
+            if *table_size != relocation.table_size {
+                return Err(Error::InvalidObject(format!(
+                    "jump table at offset {} has inconsistent symbol sizes in program `{}`",
+                    relocation.table_offset, relocation.program
+                )));
+            }
+        } else {
+            if relocation.table_offset % 8 != 0 || relocation.table_size % 8 != 0 {
+                return Err(Error::InvalidObject(format!(
+                    "jump table for program `{}` is not aligned to 8-byte entries",
+                    relocation.program
+                )));
+            }
+            let start = usize::try_from(relocation.table_offset)
+                .map_err(|_| Error::InvalidObject("jump-table offset does not fit usize".into()))?;
+            let size = usize::try_from(relocation.table_size)
+                .map_err(|_| Error::InvalidObject("jump-table size does not fit usize".into()))?;
+            if size == 0 {
+                return Err(Error::InvalidObject(format!(
+                    "jump table for program `{}` has no entries",
+                    relocation.program
+                )));
+            }
+            let end = start
+                .checked_add(size)
+                .ok_or_else(|| Error::InvalidObject("jump-table range overflow".into()))?;
+            let table = data.get(start..end).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "jump table for program `{}` lies outside `.jumptables`",
+                    relocation.program
+                ))
+            })?;
+            let count = u32::try_from(table.len() / 8).map_err(|_| {
+                Error::InvalidObject("jump table contains more than u32::MAX entries".into())
+            })?;
+            let spec = MapSpec::new(".jumptables", MapType::InstructionArray, 4, 16, count);
+            let options = token.map_or_else(MapCreateOptions::default, |token| {
+                MapCreateOptions::default().token(token)
+            });
+            let map = Map::create_with_options(spec, options)?;
+            for (index, entry) in table.chunks_exact(8).enumerate() {
+                let source_byte_offset = u64::from_ne_bytes(
+                    entry
+                        .try_into()
+                        .expect("jump-table chunks have exactly eight bytes"),
+                );
+                if source_byte_offset % Instruction::SIZE as u64 != 0 {
+                    return Err(Error::InvalidObject(format!(
+                        "jump-table entry {index} in program `{}` is not instruction-aligned",
+                        relocation.program
+                    )));
+                }
+                let source_instruction = usize::try_from(
+                    source_byte_offset / Instruction::SIZE as u64,
+                )
+                .map_err(|_| {
+                    Error::InvalidObject("jump-table instruction offset does not fit usize".into())
+                })?;
+                let translated = relocation
+                    .source_placement
+                    .translate(source_instruction)
+                    .ok_or_else(|| {
+                        Error::InvalidObject(format!(
+                            "jump-table entry {index} in program `{}` targets another function",
+                            relocation.program
+                        ))
+                    })?;
+                let original_offset = u32::try_from(translated).map_err(|_| {
+                    Error::InvalidObject(
+                        "translated jump-table instruction offset does not fit u32".into(),
+                    )
+                })?;
+                let mut value = [0_u8; 16];
+                value[..4].copy_from_slice(&original_offset.to_ne_bytes());
+                let index = u32::try_from(index).map_err(|_| {
+                    Error::InvalidObject("jump-table index does not fit u32".into())
+                })?;
+                map.update(&index.to_ne_bytes(), &value, UpdateMode::Any)?;
+            }
+            map.freeze()?;
+            arrays.insert(
+                key.clone(),
+                (relocation.source_placement, relocation.table_size, map),
+            );
+        }
+        let map = &arrays
+            .get(&key)
+            .expect("instruction array was inserted above")
+            .2;
+        let instruction = program
+            .instructions
+            .get_mut(relocation.instruction_index)
+            .ok_or_else(|| {
+                Error::InvalidObject("jump-table relocation is outside program".into())
+            })?;
+        instruction.set_source(BPF_PSEUDO_MAP_VALUE)?;
+        instruction.offset = 0;
+        instruction.immediate = map.as_fd().as_raw_fd();
+        let second = program
+            .instructions
+            .get_mut(relocation.instruction_index + 1)
+            .ok_or_else(|| Error::InvalidObject("jump-table ldimm64 is truncated".into()))?;
+        second.immediate = 0;
+    }
+    Ok(arrays.into_values().map(|(_, _, map)| map).collect())
 }
 
 fn prepare_struct_ops(
