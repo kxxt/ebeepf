@@ -11,7 +11,9 @@ use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfType, Endian};
 use crate::map::{possible_cpu_count, MapFlags, Pinning};
-use crate::program::{program_flags_from_section, ProgramKind, VerifierLog};
+use crate::program::{
+    kind_supports_auto_attach, program_flags_from_section, ProgramKind, VerifierLog,
+};
 use crate::sys::{self, MapCreate};
 use crate::usdt::UsdtManager;
 use crate::{
@@ -219,15 +221,19 @@ impl Object {
                 program_type: ProgramType::Unspecified,
                 attach_type: None,
             });
+            let auto_attach = kind_supports_auto_attach(&kind);
             let mut spec = ProgramSpec {
                 name: program_name.clone(),
                 section: entry_name.into(),
                 kind,
                 instructions,
                 autoload: true,
+                auto_attach,
                 flags: program_flags_from_section(entry_name),
                 kernel_version,
+                interface_index: 0,
                 attach_btf_id: 0,
+                attach_program: None,
                 func_info: Vec::new(),
                 func_info_record_size: 0,
                 line_info: Vec::new(),

@@ -352,15 +352,20 @@ pub struct Btf {
 }
 
 impl Btf {
-    /// Reads BTF for the running kernel from sysfs.
-    pub fn from_vmlinux() -> Result<Self> {
-        let path = Path::new("/sys/kernel/btf/vmlinux");
+    /// Reads and parses raw BTF from a filesystem path.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         let bytes = fs::read(path).map_err(|source| Error::File {
-            operation: "read running kernel BTF",
+            operation: "read BTF",
             path: path.into(),
             source,
         })?;
         Self::parse(&bytes)
+    }
+
+    /// Reads BTF for the running kernel from sysfs.
+    pub fn from_vmlinux() -> Result<Self> {
+        Self::from_path("/sys/kernel/btf/vmlinux")
     }
 
     /// Parses a `.BTF` section.
@@ -744,6 +749,18 @@ impl BtfObject {
         Self::from_fd(fd)
     }
 
+    /// Opens the BTF associated with a loaded eBPF program ID.
+    pub fn from_program_id(program_id: u32) -> Result<Self> {
+        let program = crate::Program::from_id(program_id)?;
+        let btf_id = program.info()?.btf_id;
+        if btf_id == 0 {
+            return Err(Error::InvalidObject(format!(
+                "program ID {program_id} has no BTF"
+            )));
+        }
+        Self::from_id(btf_id)
+    }
+
     fn from_fd(fd: OwnedFd) -> Result<Self> {
         let (raw, bytes, name) = sys::btf_info(fd.as_fd().as_raw_fd())
             .map_err(|source| Error::system("read BTF object metadata", source))?;
@@ -1060,6 +1077,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use super::*;
 
     fn u32_bytes(value: u32) -> [u8; 4] {
@@ -1125,6 +1144,14 @@ mod tests {
         };
         assert_eq!(members[1].name, "second");
         assert_eq!(members[1].bit_offset, 32);
+    }
+
+    #[test]
+    fn reads_raw_btf_from_a_path() {
+        let bytes = sample_btf();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        assert_eq!(Btf::from_path(file.path()).unwrap().as_bytes(), bytes);
     }
 
     #[test]

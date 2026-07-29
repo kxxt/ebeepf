@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use ebeepf::{
     BtfObject, HelperId, Instruction, LinkType, MapType, Object, ProgramType, RingBuffer,
-    TcAttachOptions, TcAttachPoint, TcHook, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions,
-    XdpFlags,
+    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions, Xdp,
+    XdpAttachOptions, XdpFlags,
 };
 use object::write::{Object as WriteObject, Symbol, SymbolSection};
 use object::{
@@ -133,6 +133,21 @@ impl Drop for TemporaryInterface {
     }
 }
 
+fn compile_bpf(source: &Path, output: &Path) {
+    let status = Command::new("clang")
+        .args(["-target", "bpfel", "-g", "-O2", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "failed to compile BPF fixture `{}`",
+        source.display()
+    );
+}
+
 #[test]
 #[ignore = "requires root or CAP_BPF and a kernel with eBPF enabled"]
 fn loads_program_and_exercises_map_crud() {
@@ -249,4 +264,55 @@ fn manages_legacy_xdp_and_tc_attachments() {
     );
     filter.detach().unwrap();
     hook.destroy_clsact().unwrap();
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and an eBPF-enabled kernel"]
+fn loads_and_attaches_freplace_program() {
+    let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
+    let build = tempfile::tempdir().unwrap();
+    let target_object = build.path().join("freplace-target.bpf.o");
+    let extension_object = build.path().join("freplace-extension.bpf.o");
+    compile_bpf(&source_root.join("freplace-target.bpf.c"), &target_object);
+    compile_bpf(
+        &source_root.join("freplace-extension.bpf.c"),
+        &extension_object,
+    );
+
+    let target = Object::open(&target_object).unwrap().load().unwrap();
+    let target_program = target.program("call_replaceable").unwrap();
+    let packet = [0_u8; 64];
+    assert_eq!(
+        target_program
+            .test_run(TestRunOptions::new(&packet))
+            .unwrap()
+            .return_value,
+        2
+    );
+
+    let mut extension = Object::open(&extension_object).unwrap();
+    extension
+        .program_mut("replacement")
+        .unwrap()
+        .set_attach_target_by_name(target_program, "replaceable")
+        .unwrap();
+    let extension = extension.load().unwrap();
+    let replacement = extension.program("replacement").unwrap();
+    let link = replacement.attach_freplace().unwrap();
+    assert_eq!(link.info().unwrap().link_type, LinkType::Tracing);
+    assert_eq!(
+        target_program
+            .test_run(TestRunOptions::new(&packet))
+            .unwrap()
+            .return_value,
+        3
+    );
+    drop(link);
+    assert_eq!(
+        target_program
+            .test_run(TestRunOptions::new(&packet))
+            .unwrap()
+            .return_value,
+        2
+    );
 }

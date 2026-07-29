@@ -13,7 +13,7 @@ use crate::link::{AttachType, Link};
 use crate::map::{kernel_name, Map};
 use crate::sys::{self, ProgramLoad};
 use crate::usdt::{UsdtManager, UsdtOptions};
-use crate::{Error, Instruction, Result};
+use crate::{BtfKind, BtfObject, Error, Instruction, Result, TypeId};
 
 /// A kernel eBPF program type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -660,6 +660,49 @@ impl Default for VerifierLog {
     }
 }
 
+pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind) -> bool {
+    match kind {
+        ProgramKind::Kprobe { .. }
+        | ProgramKind::Tracepoint { .. }
+        | ProgramKind::RawTracepoint { .. } => true,
+        ProgramKind::Tracing {
+            attach_type,
+            target,
+        } => {
+            !target.is_empty()
+                && !matches!(
+                    attach_type,
+                    AttachType::TraceFunctionEntryMulti
+                        | AttachType::TraceFunctionExitMulti
+                        | AttachType::TraceFunctionSessionMulti
+                )
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct AttachProgram {
+    fd: Arc<OwnedFd>,
+}
+
+impl fmt::Debug for AttachProgram {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AttachProgram")
+            .field("fd", &self.fd.as_raw_fd())
+            .finish()
+    }
+}
+
+impl PartialEq for AttachProgram {
+    fn eq(&self, other: &Self) -> bool {
+        self.fd.as_raw_fd() == other.fd.as_raw_fd()
+    }
+}
+
+impl Eq for AttachProgram {}
+
 /// A program's parsed and configurable definition.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramSpec {
@@ -668,9 +711,12 @@ pub struct ProgramSpec {
     pub(crate) kind: ProgramKind,
     pub(crate) instructions: Vec<Instruction>,
     pub(crate) autoload: bool,
+    pub(crate) auto_attach: bool,
     pub(crate) flags: u32,
     pub(crate) kernel_version: u32,
+    pub(crate) interface_index: u32,
     pub(crate) attach_btf_id: u32,
+    pub(crate) attach_program: Option<AttachProgram>,
     pub(crate) func_info: Vec<u8>,
     pub(crate) func_info_record_size: u32,
     pub(crate) line_info: Vec<u8>,
@@ -689,6 +735,7 @@ impl ProgramSpec {
     ) -> Result<Self> {
         let section = section.into();
         let kind = ProgramKind::from_section(&section)?;
+        let auto_attach = kind_supports_auto_attach(&kind);
         let flags = program_flags_from_section(&section);
         Ok(Self {
             name: name.into(),
@@ -696,9 +743,12 @@ impl ProgramSpec {
             kind,
             instructions,
             autoload: true,
+            auto_attach,
             flags,
             kernel_version: 0,
+            interface_index: 0,
             attach_btf_id: 0,
+            attach_program: None,
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),
@@ -739,6 +789,11 @@ impl ProgramSpec {
         self.autoload
     }
 
+    /// Whether generated skeletons should automatically attach this program.
+    pub const fn auto_attach(&self) -> bool {
+        self.auto_attach
+    }
+
     /// BTF ID of the resolved attachment target.
     ///
     /// This is populated while loading for BTF tracing, LSM, and iterator
@@ -748,32 +803,31 @@ impl ProgramSpec {
         self.attach_btf_id
     }
 
+    /// Network interface selected for hardware-offloaded loading, or zero.
+    pub const fn interface_index(&self) -> u32 {
+        self.interface_index
+    }
+
+    /// Borrows the target program descriptor used for extension or tracing.
+    pub fn attach_program(&self) -> Option<BorrowedFd<'_>> {
+        self.attach_program.as_ref().map(|target| target.fd.as_fd())
+    }
+
     /// Whether [`Program::attach`] can attach this program without additional
     /// runtime arguments.
     pub fn auto_attachable(&self) -> bool {
-        match &self.kind {
-            ProgramKind::Kprobe { .. }
-            | ProgramKind::Tracepoint { .. }
-            | ProgramKind::RawTracepoint { .. } => true,
-            ProgramKind::Tracing {
-                attach_type,
-                target,
-            } => {
-                !target.is_empty()
-                    && !matches!(
-                        attach_type,
-                        AttachType::TraceFunctionEntryMulti
-                            | AttachType::TraceFunctionExitMulti
-                            | AttachType::TraceFunctionSessionMulti
-                    )
-            }
-            _ => false,
-        }
+        self.auto_attach && kind_supports_auto_attach(&self.kind)
     }
 
     /// Enables or disables automatic loading.
     pub fn set_autoload(&mut self, autoload: bool) -> &mut Self {
         self.autoload = autoload;
+        self
+    }
+
+    /// Enables or disables skeleton automatic attachment.
+    pub fn set_auto_attach(&mut self, auto_attach: bool) -> &mut Self {
+        self.auto_attach = auto_attach;
         self
     }
 
@@ -786,6 +840,57 @@ impl ProgramSpec {
     /// Changes program load flags.
     pub fn set_flags(&mut self, flags: u32) -> &mut Self {
         self.flags = flags;
+        self
+    }
+
+    /// Selects a network interface for hardware-offloaded program loading.
+    ///
+    /// Zero restores normal host-kernel loading.
+    pub fn set_interface_index(&mut self, interface_index: u32) -> &mut Self {
+        self.interface_index = interface_index;
+        self
+    }
+
+    /// Targets a function type in an already loaded eBPF program.
+    ///
+    /// This supports `freplace` as well as BTF tracing of another eBPF
+    /// program. The target descriptor is owned by this definition, so it
+    /// remains valid through object loading.
+    pub fn set_attach_target(&mut self, program: &Program, function: TypeId) -> &mut Self {
+        self.attach_program = Some(AttachProgram {
+            fd: Arc::clone(&program.fd),
+        });
+        self.attach_btf_id = function.0;
+        self
+    }
+
+    /// Resolves and targets a named BTF function in a loaded eBPF program.
+    pub fn set_attach_target_by_name(
+        &mut self,
+        program: &Program,
+        function: &str,
+    ) -> Result<&mut Self> {
+        let btf_id = program.info()?.btf_id;
+        if btf_id == 0 {
+            return Err(Error::InvalidObject(format!(
+                "target program `{}` has no BTF",
+                program.name()
+            )));
+        }
+        let btf = BtfObject::from_id(btf_id)?;
+        let (function_id, _) = btf.btf().find(BtfKind::Function, function).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "target program `{}` has no BTF function `{function}`",
+                program.name()
+            ))
+        })?;
+        Ok(self.set_attach_target(program, function_id))
+    }
+
+    /// Clears a previously configured loaded-program attachment target.
+    pub fn clear_attach_target(&mut self) -> &mut Self {
+        self.attach_program = None;
+        self.attach_btf_id = 0;
         self
     }
 
@@ -802,6 +907,12 @@ impl ProgramSpec {
         if self.instructions.is_empty() {
             return Err(Error::InvalidObject(format!(
                 "program `{}` contains no instructions",
+                self.name
+            )));
+        }
+        if self.attach_program.is_some() && self.attach_btf_id == 0 {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` has an attachment program but no target BTF ID",
                 self.name
             )));
         }
@@ -1146,6 +1257,10 @@ impl Program {
     ) -> Result<Self> {
         spec.validate()?;
         let btf_fd = btf_fd.map(|fd| fd.as_raw_fd());
+        let attach_program_fd = spec
+            .attach_program
+            .as_ref()
+            .map(|target| target.fd.as_raw_fd());
         let (func_info, func_info_record_size, line_info, line_info_record_size) =
             if btf_fd.is_some() {
                 (
@@ -1165,13 +1280,14 @@ impl Program {
             license,
             kernel_version: spec.kernel_version,
             flags: spec.flags,
+            interface_index: spec.interface_index,
             btf_fd,
             func_info,
             func_info_record_size,
             line_info,
             line_info_record_size,
             attach_btf_id: spec.attach_btf_id,
-            attach_program_fd: None,
+            attach_program_fd,
             log_level: spec.verifier_log.level,
             log_size: spec.verifier_log.capacity,
         };
@@ -1218,9 +1334,12 @@ impl Program {
             },
             instructions: Vec::new(),
             autoload: false,
+            auto_attach: false,
             flags: 0,
             kernel_version: 0,
+            interface_index: raw.ifindex,
             attach_btf_id: 0,
+            attach_program: None,
             func_info: Vec::new(),
             func_info_record_size: 0,
             line_info: Vec::new(),
@@ -1624,6 +1743,34 @@ impl Program {
         Ok(Link::bpf(fd))
     }
 
+    /// Attaches an extension program to its configured loaded-program target.
+    pub fn attach_freplace(&self) -> Result<Link> {
+        if self.spec.program_type() != ProgramType::Extension {
+            return Err(Error::InvalidObject(format!(
+                "program `{}` is not an extension program",
+                self.name()
+            )));
+        }
+        let target = self.spec.attach_program.as_ref().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "extension program `{}` has no configured target program",
+                self.name()
+            ))
+        })?;
+        let target_fd = u32::try_from(target.fd.as_raw_fd())
+            .map_err(|_| Error::InvalidObject("target program descriptor is negative".into()))?;
+        let fd = sys::link_create(
+            self.fd.as_raw_fd(),
+            target_fd,
+            0,
+            0,
+            self.spec.attach_btf_id,
+            0,
+        )
+        .map_err(|source| Error::system("attach extension program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
     /// Creates a BPF iterator link with optional map, cgroup, or task scope.
     pub fn attach_iterator(&self, options: IteratorOptions<'_>) -> Result<Link> {
         if !matches!(
@@ -1713,6 +1860,10 @@ impl Program {
                 }
                 self.attach_btf(*attach_type, self.spec.attach_btf_id)
             }
+            ProgramKind::Other {
+                program_type: ProgramType::Extension,
+                ..
+            } if self.spec.auto_attach() => self.attach_freplace(),
             _ => Err(Error::Unsupported(format!(
                 "program section `{}` needs attachment arguments",
                 self.spec.section
@@ -1949,8 +2100,10 @@ mod tests {
             vec![Instruction::new(0x95, 0, 0, 0, 0)],
         )
         .unwrap();
-        spec.set_autoload(false).set_flags(4);
+        spec.set_autoload(false).set_auto_attach(false).set_flags(4);
         assert!(!spec.autoload());
+        assert!(!spec.auto_attach());
+        assert!(!spec.auto_attachable());
         assert_eq!(spec.program_type(), ProgramType::RawTracepoint);
     }
 

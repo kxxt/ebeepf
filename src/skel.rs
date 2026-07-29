@@ -575,7 +575,6 @@ fn object_stem(path: &Path) -> Result<String> {
 struct NamedItem {
     source: String,
     method: String,
-    auto_attach: bool,
 }
 
 #[derive(Debug)]
@@ -623,7 +622,6 @@ fn render_skeleton(
         .map(|map| NamedItem {
             source: map.name().to_owned(),
             method: unique_identifier(snake_identifier(map.name()), &mut map_names),
-            auto_attach: false,
         })
         .collect::<Vec<_>>();
     let mut program_names = HashSet::new();
@@ -632,7 +630,6 @@ fn render_skeleton(
         .map(|program| NamedItem {
             source: program.name().to_owned(),
             method: unique_identifier(snake_identifier(program.name()), &mut program_names),
-            auto_attach: program.auto_attachable(),
         })
         .collect::<Vec<_>>();
     let (data_sections, data_types) = collect_data_sections(object, &type_name, crate_path)?;
@@ -796,23 +793,23 @@ fn render_skeleton(
              /// Mutably borrows the underlying loaded object.\n\
              pub fn object_mut(&mut self) -> &mut {crate_path}::LoadedObject {{ &mut self.object }}\n\
              \n\
-             /// Attaches programs whose sections completely identify their targets.\n\
+             /// Attaches enabled programs which require no additional runtime arguments.\n\
              ///\n\
              /// Attachment is transactional: existing retained links are replaced only\n\
              /// after every new automatic attachment succeeds.\n\
              pub fn attach(&mut self) -> {crate_path}::Result<&mut Self> {{\n\
                  {} links = {links_name}::default();",
-        if programs.iter().any(|program| program.auto_attach) {
-            "let mut"
-        } else {
+        if programs.is_empty() {
             "let"
+        } else {
+            "let mut"
         }
     )
     .expect("String write");
-    for program in programs.iter().filter(|program| program.auto_attach) {
+    for program in &programs {
         writeln!(
             output,
-            "        if let Some(program) = self.object.programs().find(|program| program.name() == {:?}) {{\n\
+            "        if let Some(program) = self.object.programs().find(|program| program.name() == {:?} && program.spec().auto_attach()) {{\n\
                  links.{} = Some(program.attach()?);\n\
              }}",
             program.source, program.method
@@ -1759,6 +1756,7 @@ mod tests {
         assert!(source.contains("pub fn event_counts(&self)"));
         assert!(source.contains("pub fn type_(&self)"));
         assert!(source.contains("program.attach()?"));
+        assert!(source.contains("program.spec().auto_attach()"));
         assert!(source.contains("impl ::ebeepf::OpenSkeleton"));
         assert!(source.contains("pub fn rodata(&self)"));
         assert!(source.contains("pub fn setting(&self) -> ::ebeepf::Result<u32>"));
