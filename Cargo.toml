@@ -1,0 +1,24 @@
+[package]
+name = "ebeepf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "A pure Rust, safe and idiomatic eBPF loader and runtime"
+readme = "README.md"
+keywords = ["bpf", "ebpf", "linux", "tracing"]
+
+[dependencies]
+bitflags = "2.0"
+goblin = { version = "0.9.3", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
+libc = "0.2"
+thiserror = "2.0"
+
+[dev-dependencies]
+object = { version = "0.36.7", features = ["write"] }
+tempfile = "3.3"
+
+[lints]
+workspace = true

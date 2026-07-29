@@ -1,0 +1,2385 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::str;
+
+use goblin::elf::header::{EI_CLASS, ELFCLASS64, EM_BPF, ET_REL};
+use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
+use goblin::elf::sym::{STB_GLOBAL, STT_FUNC, STT_OBJECT};
+use goblin::elf::{Elf, SectionHeader, Sym};
+
+use crate::btf::{BtfType, Endian};
+use crate::map::{MapFlags, Pinning};
+use crate::program::{ProgramKind, VerifierLog};
+use crate::sys::{self, MapCreate};
+use crate::{
+    Btf, Error, Instruction, Map, MapSpec, MapType, Program, ProgramSpec, ProgramType, Result,
+    TypeId,
+};
+
+const R_BPF_64_64: u32 = 1;
+const R_BPF_64_32: u32 = 10;
+const R_BPF_64_ABS32: u32 = 3;
+const R_BPF_64_NODYLD32: u32 = 4;
+const BPF_LD_IMM_DW: u8 = 0x18;
+const BPF_PSEUDO_MAP_FD: u8 = 1;
+const BPF_PSEUDO_MAP_VALUE: u8 = 2;
+const BPF_PSEUDO_CALL: u8 = 1;
+const BPF_PSEUDO_FUNC: u8 = 4;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MapRelocation {
+    program: String,
+    instruction_index: usize,
+    map: String,
+    value_offset: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CoreRelocation {
+    program: String,
+    instruction_index: usize,
+    type_id: TypeId,
+    access: String,
+    kind: u32,
+}
+
+/// A parsed, configurable eBPF object that has not created kernel resources.
+#[derive(Clone, Debug)]
+pub struct Object {
+    name: String,
+    license: Vec<u8>,
+    btf: Option<Btf>,
+    maps: BTreeMap<String, MapSpec>,
+    programs: BTreeMap<String, ProgramSpec>,
+    map_relocations: Vec<MapRelocation>,
+    core_relocations: Vec<CoreRelocation>,
+    pin_root: PathBuf,
+}
+
+impl Object {
+    /// Reads and parses an eBPF ELF object.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let bytes = fs::read(path).map_err(|source| Error::File {
+            operation: "read eBPF object",
+            path: path.into(),
+            source,
+        })?;
+        let name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("bpf");
+        Self::parse_named(name, &bytes)
+    }
+
+    /// Parses an in-memory eBPF ELF object using `"bpf"` as its object name.
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_named("bpf", bytes)
+    }
+
+    /// Parses an in-memory eBPF ELF object with an explicit object name.
+    pub fn parse_named(name: impl Into<String>, bytes: &[u8]) -> Result<Self> {
+        let name = name.into();
+        let elf = Elf::parse(bytes).map_err(|error| Error::Elf(error.to_string()))?;
+        validate_elf(&elf)?;
+
+        let sections = Sections::new(&elf, bytes)?;
+        let btf = parse_btf(&elf, &sections)?;
+        let btf_ext = match (btf.as_ref(), sections.by_name(".BTF.ext")) {
+            (Some(btf), Some((index, _))) => {
+                let data = relocated_metadata_section(&elf, &sections, index)?;
+                Some(BtfExt::parse(&data, btf)?)
+            }
+            (None, Some(_)) => {
+                return Err(Error::InvalidObject(
+                    "object has .BTF.ext but no .BTF section".into(),
+                ));
+            }
+            (_, None) => None,
+        };
+
+        let license = sections
+            .by_name("license")
+            .map(|(_, data)| nul_terminated(data))
+            .unwrap_or_else(|| b"GPL\0".to_vec());
+        let kernel_version = sections
+            .by_name("version")
+            .map(|(_, data)| read_u32(data, 0, elf.little_endian, "kernel version"))
+            .transpose()?
+            .unwrap_or_default();
+
+        let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
+        let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
+        resolve_inner_maps(&elf, &sections, &mut maps)?;
+
+        let mut programs = BTreeMap::new();
+        let mut map_relocations = Vec::new();
+        let mut core_relocations = Vec::new();
+        let text = sections.by_name(".text").map(|(index, _)| index);
+
+        for entry_index in executable_entry_sections(&elf, &sections) {
+            let entry_name = sections.name(entry_index)?;
+            let entry_data = sections.data(entry_index)?;
+            let mut instructions = Instruction::decode(entry_data)?;
+            let entry_instruction_count = instructions.len();
+            let mut placements = HashMap::from([(entry_index, 0_usize)]);
+
+            if let Some(text_index) = text {
+                let text_data = sections.data(text_index)?;
+                if !text_data.is_empty() {
+                    placements.insert(text_index, instructions.len());
+                    instructions.extend(Instruction::decode(text_data)?);
+                }
+            }
+
+            let program_name =
+                program_symbol_name(&elf, entry_index).unwrap_or_else(|| sanitize_name(entry_name));
+            let kind = ProgramKind::from_section(entry_name).unwrap_or(ProgramKind::Other {
+                program_type: ProgramType::Unspecified,
+                attach_type: None,
+            });
+            let mut spec = ProgramSpec {
+                name: program_name.clone(),
+                section: entry_name.into(),
+                kind,
+                instructions,
+                autoload: true,
+                flags: 0,
+                kernel_version,
+                attach_btf_id: 0,
+                func_info: Vec::new(),
+                func_info_record_size: 0,
+                line_info: Vec::new(),
+                line_info_record_size: 0,
+                verifier_log: VerifierLog::default(),
+                section_index: entry_index,
+                section_offset: 0,
+            };
+
+            apply_program_relocations(
+                &elf,
+                &placements,
+                &data_sections,
+                &maps,
+                &program_name,
+                &mut spec.instructions,
+                &mut map_relocations,
+            )?;
+
+            if let Some(ext) = &btf_ext {
+                append_ext_info(
+                    &mut spec.func_info,
+                    &mut spec.func_info_record_size,
+                    &ext.function_info,
+                    &placements,
+                    &sections,
+                    btf.as_ref().expect("BTF.ext requires BTF").endian(),
+                )?;
+                append_ext_info(
+                    &mut spec.line_info,
+                    &mut spec.line_info_record_size,
+                    &ext.line_info,
+                    &placements,
+                    &sections,
+                    btf.as_ref().expect("BTF.ext requires BTF").endian(),
+                )?;
+                append_core_relocations(
+                    &program_name,
+                    &ext.core_relocations,
+                    &placements,
+                    &mut core_relocations,
+                    btf.as_ref().expect("BTF.ext requires BTF"),
+                    &sections,
+                )?;
+            }
+
+            // The entry section is always first; this field is useful to
+            // consumers inspecting the unrelocated ELF relationship.
+            debug_assert_eq!(
+                entry_instruction_count,
+                entry_data.len() / Instruction::SIZE
+            );
+            if programs.insert(program_name.clone(), spec).is_some() {
+                return Err(Error::InvalidObject(format!(
+                    "duplicate program name `{program_name}`"
+                )));
+            }
+        }
+
+        if programs.is_empty() {
+            return Err(Error::InvalidObject(
+                "ELF object contains no executable eBPF program sections".into(),
+            ));
+        }
+
+        Ok(Self {
+            name,
+            license,
+            btf,
+            maps,
+            programs,
+            map_relocations,
+            core_relocations,
+            pin_root: "/sys/fs/bpf".into(),
+        })
+    }
+
+    /// Object name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// License text without its trailing NUL byte.
+    pub fn license(&self) -> &str {
+        let end = self
+            .license
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.license.len());
+        str::from_utf8(&self.license[..end]).unwrap_or("")
+    }
+
+    /// Parsed BTF, when the object contains it.
+    pub fn btf(&self) -> Option<&Btf> {
+        self.btf.as_ref()
+    }
+
+    /// Iterates over map definitions in deterministic name order.
+    pub fn maps(&self) -> impl ExactSizeIterator<Item = &MapSpec> {
+        self.maps.values()
+    }
+
+    /// Iterates mutably over map definitions.
+    pub fn maps_mut(&mut self) -> impl ExactSizeIterator<Item = &mut MapSpec> {
+        self.maps.values_mut()
+    }
+
+    /// Gets a map definition.
+    pub fn map(&self, name: &str) -> Result<&MapSpec> {
+        self.maps
+            .get(name)
+            .ok_or_else(|| Error::MapNotFound(name.into()))
+    }
+
+    /// Gets a mutable map definition for pre-load configuration.
+    pub fn map_mut(&mut self, name: &str) -> Result<&mut MapSpec> {
+        self.maps
+            .get_mut(name)
+            .ok_or_else(|| Error::MapNotFound(name.into()))
+    }
+
+    /// Iterates over program definitions in deterministic name order.
+    pub fn programs(&self) -> impl ExactSizeIterator<Item = &ProgramSpec> {
+        self.programs.values()
+    }
+
+    /// Iterates mutably over program definitions.
+    pub fn programs_mut(&mut self) -> impl ExactSizeIterator<Item = &mut ProgramSpec> {
+        self.programs.values_mut()
+    }
+
+    /// Gets a program definition.
+    pub fn program(&self, name: &str) -> Result<&ProgramSpec> {
+        self.programs
+            .get(name)
+            .ok_or_else(|| Error::ProgramNotFound(name.into()))
+    }
+
+    /// Gets a mutable program definition for pre-load configuration.
+    pub fn program_mut(&mut self, name: &str) -> Result<&mut ProgramSpec> {
+        self.programs
+            .get_mut(name)
+            .ok_or_else(|| Error::ProgramNotFound(name.into()))
+    }
+
+    /// Sets the root used by maps whose BTF definition requests pin-by-name.
+    pub fn set_pin_root(&mut self, path: impl Into<PathBuf>) -> &mut Self {
+        self.pin_root = path.into();
+        self
+    }
+
+    /// Creates maps, applies relocations, and loads programs into the kernel.
+    ///
+    /// Loading is transactional with respect to process-owned resources: on
+    /// error, all descriptors created so far are closed. Maps pinned by policy
+    /// remain pinned, as requested by their definitions.
+    pub fn load(mut self) -> Result<LoadedObject> {
+        for map in self.maps.values() {
+            map.validate()?;
+        }
+        for program in self.programs.values().filter(|program| program.autoload) {
+            program.validate()?;
+        }
+
+        if !self.core_relocations.is_empty() {
+            apply_core_relocations(
+                self.btf
+                    .as_ref()
+                    .ok_or_else(|| Error::InvalidObject("CO-RE records require BTF".into()))?,
+                &mut self.programs,
+                &self.core_relocations,
+            )?;
+        }
+
+        let btf_fd = self
+            .btf
+            .as_ref()
+            .map(|btf| {
+                sys::load_btf(btf.as_bytes(), 256 * 1024).map_err(|(source, log)| {
+                    Error::InvalidObject(format!("kernel rejected object BTF: {source}\n{log}"))
+                })
+            })
+            .transpose()?;
+
+        let maps = load_maps(&self.maps, btf_fd.as_ref(), &self.pin_root)?;
+        relocate_maps(&mut self.programs, &self.map_relocations, &maps)?;
+
+        let mut programs = BTreeMap::new();
+        for (name, spec) in self.programs {
+            if !spec.autoload {
+                continue;
+            }
+            let program = Program::load(spec, &self.license, btf_fd.as_ref().map(OwnedFd::as_fd))?;
+            programs.insert(name, program);
+        }
+
+        Ok(LoadedObject {
+            name: self.name,
+            btf: self.btf,
+            btf_fd,
+            maps,
+            programs,
+        })
+    }
+}
+
+/// An eBPF object whose selected maps and programs are loaded in the kernel.
+#[derive(Debug)]
+pub struct LoadedObject {
+    name: String,
+    btf: Option<Btf>,
+    // Kept alive because maps and programs reference this kernel BTF object.
+    btf_fd: Option<OwnedFd>,
+    maps: BTreeMap<String, Map>,
+    programs: BTreeMap<String, Program>,
+}
+
+impl LoadedObject {
+    /// Object name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Parsed object BTF.
+    pub fn btf(&self) -> Option<&Btf> {
+        self.btf.as_ref()
+    }
+
+    /// Whether object BTF was loaded in the kernel.
+    pub fn has_kernel_btf(&self) -> bool {
+        self.btf_fd.is_some()
+    }
+
+    /// Iterates over loaded maps.
+    pub fn maps(&self) -> impl ExactSizeIterator<Item = &Map> {
+        self.maps.values()
+    }
+
+    /// Gets a loaded map.
+    pub fn map(&self, name: &str) -> Result<&Map> {
+        self.maps
+            .get(name)
+            .ok_or_else(|| Error::MapNotFound(name.into()))
+    }
+
+    /// Removes a map handle from the object.
+    pub fn take_map(&mut self, name: &str) -> Result<Map> {
+        self.maps
+            .remove(name)
+            .ok_or_else(|| Error::MapNotFound(name.into()))
+    }
+
+    /// Iterates over loaded programs.
+    pub fn programs(&self) -> impl ExactSizeIterator<Item = &Program> {
+        self.programs.values()
+    }
+
+    /// Gets a loaded program.
+    pub fn program(&self, name: &str) -> Result<&Program> {
+        self.programs
+            .get(name)
+            .ok_or_else(|| Error::ProgramNotFound(name.into()))
+    }
+
+    /// Removes a program handle from the object.
+    pub fn take_program(&mut self, name: &str) -> Result<Program> {
+        self.programs
+            .remove(name)
+            .ok_or_else(|| Error::ProgramNotFound(name.into()))
+    }
+}
+
+fn validate_elf(elf: &Elf<'_>) -> Result<()> {
+    if elf.header.e_ident[EI_CLASS] != ELFCLASS64 || !elf.is_64 {
+        return Err(Error::Elf(
+            "only 64-bit eBPF ELF objects are supported".into(),
+        ));
+    }
+    if elf.header.e_machine != EM_BPF {
+        return Err(Error::Elf(format!(
+            "ELF machine {} is not EM_BPF ({EM_BPF})",
+            elf.header.e_machine
+        )));
+    }
+    if elf.header.e_type != ET_REL {
+        return Err(Error::Elf("eBPF input must be a relocatable object".into()));
+    }
+    if elf.little_endian != cfg!(target_endian = "little") {
+        return Err(Error::Unsupported(
+            "loading an eBPF object with endianness different from the host".into(),
+        ));
+    }
+    Ok(())
+}
+
+struct Sections<'a> {
+    elf: &'a Elf<'a>,
+    bytes: &'a [u8],
+    names: Vec<&'a str>,
+}
+
+impl<'a> Sections<'a> {
+    fn new(elf: &'a Elf<'a>, bytes: &'a [u8]) -> Result<Self> {
+        let names = elf
+            .section_headers
+            .iter()
+            .map(|header| {
+                elf.shdr_strtab
+                    .get_at(header.sh_name)
+                    .ok_or_else(|| Error::Elf("section has an invalid name offset".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { elf, bytes, names })
+    }
+
+    fn name(&self, index: usize) -> Result<&'a str> {
+        self.names
+            .get(index)
+            .copied()
+            .ok_or_else(|| Error::Elf(format!("section index {index} is out of bounds")))
+    }
+
+    fn data(&self, index: usize) -> Result<&'a [u8]> {
+        let header = self
+            .elf
+            .section_headers
+            .get(index)
+            .ok_or_else(|| Error::Elf(format!("section index {index} is out of bounds")))?;
+        if header.sh_type == SHT_NOBITS {
+            return Ok(&[]);
+        }
+        let offset = usize::try_from(header.sh_offset)
+            .map_err(|_| Error::Elf("section offset does not fit usize".into()))?;
+        let size = usize::try_from(header.sh_size)
+            .map_err(|_| Error::Elf("section size does not fit usize".into()))?;
+        let name = self.name(index)?;
+        self.bytes
+            .get(offset..offset.saturating_add(size))
+            .ok_or_else(|| Error::Elf(format!("section `{name}` lies outside the file")))
+    }
+
+    fn owned_data(&self, index: usize) -> Result<Vec<u8>> {
+        let header = &self.elf.section_headers[index];
+        if header.sh_type == SHT_NOBITS {
+            let size = usize::try_from(header.sh_size)
+                .map_err(|_| Error::Elf("BSS section size does not fit usize".into()))?;
+            Ok(vec![0; size])
+        } else {
+            Ok(self.data(index)?.to_vec())
+        }
+    }
+
+    fn by_name(&self, name: &str) -> Option<(usize, &'a [u8])> {
+        self.names
+            .iter()
+            .position(|candidate| *candidate == name)
+            .and_then(|index| self.data(index).ok().map(|data| (index, data)))
+    }
+}
+
+fn parse_btf(elf: &Elf<'_>, sections: &Sections<'_>) -> Result<Option<Btf>> {
+    let Some((index, _)) = sections.by_name(".BTF") else {
+        return Ok(None);
+    };
+    let data = relocated_metadata_section(elf, sections, index)?;
+    Btf::parse(&data).map(Some)
+}
+
+fn relocated_metadata_section(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    target_index: usize,
+) -> Result<Vec<u8>> {
+    let mut data = sections.owned_data(target_index)?;
+    for (relocation_index, relocations) in &elf.shdr_relocs {
+        let header = &elf.section_headers[*relocation_index];
+        if header.sh_info as usize != target_index {
+            continue;
+        }
+        for relocation in relocations {
+            if !matches!(relocation.r_type, R_BPF_64_ABS32 | R_BPF_64_NODYLD32) {
+                return Err(Error::Unsupported(format!(
+                    "metadata section `{}` uses relocation type {}",
+                    sections.name(target_index)?,
+                    relocation.r_type
+                )));
+            }
+            let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
+                Error::Elf(format!(
+                    "relocation references missing symbol {}",
+                    relocation.r_sym
+                ))
+            })?;
+            let offset = usize::try_from(relocation.r_offset)
+                .map_err(|_| Error::Elf("metadata relocation offset is too large".into()))?;
+            let original = read_u32(
+                &data,
+                offset,
+                elf.little_endian,
+                "metadata relocation target",
+            )?;
+            let value = i128::from(original)
+                + i128::from(symbol.st_value)
+                + i128::from(relocation.r_addend.unwrap_or_default());
+            let value = u32::try_from(value).map_err(|_| {
+                Error::InvalidObject("metadata relocation result does not fit u32".into())
+            })?;
+            write_u32(&mut data, offset, value, elf.little_endian)?;
+        }
+    }
+    Ok(data)
+}
+
+fn parse_maps(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    btf: Option<&Btf>,
+) -> Result<BTreeMap<String, MapSpec>> {
+    let Some((map_section_index, map_data)) = sections.by_name(".maps") else {
+        return Ok(BTreeMap::new());
+    };
+    if let Some(btf) = btf {
+        if let Some((_, BtfType::DataSection { variables, .. })) =
+            btf.find(crate::BtfKind::DataSection, ".maps")
+        {
+            let mut definitions = BTreeMap::new();
+            let mut struct_names = HashMap::new();
+            for variable in variables {
+                let (name, struct_id, _) = map_variable(btf, variable.ty)?;
+                struct_names.insert(struct_id, name.to_owned());
+            }
+            for variable in variables {
+                let (name, struct_id, members) = map_variable(btf, variable.ty)?;
+                let mut values = HashMap::new();
+                for member in members {
+                    values.insert(member.name.as_str(), member.ty);
+                }
+                let map_type = btf_uint(btf, required_member(&values, "type", name)?)?;
+                let key_type = values
+                    .get("key")
+                    .copied()
+                    .map(|id| btf_pointee(btf, id))
+                    .transpose()?;
+                let value_type = values
+                    .get("value")
+                    .copied()
+                    .map(|id| btf_pointee(btf, id))
+                    .transpose()?;
+                let key_size = match values.get("key_size") {
+                    Some(id) => btf_uint(btf, *id)?,
+                    None => key_type.map(|id| btf.size_of(id)).transpose()?.unwrap_or(0) as u32,
+                };
+                let value_size = match values.get("value_size") {
+                    Some(id) => btf_uint(btf, *id)?,
+                    None => value_type
+                        .map(|id| btf.size_of(id))
+                        .transpose()?
+                        .unwrap_or(0) as u32,
+                };
+                let max_entries = values
+                    .get("max_entries")
+                    .map(|id| btf_uint(btf, *id))
+                    .transpose()?
+                    .unwrap_or_default();
+                let mut spec = MapSpec::new(
+                    name,
+                    MapType::from_raw(map_type),
+                    key_size,
+                    value_size,
+                    max_entries,
+                );
+                spec.flags = MapFlags::from_bits_retain(
+                    values
+                        .get("map_flags")
+                        .map(|id| btf_uint(btf, *id))
+                        .transpose()?
+                        .unwrap_or_default(),
+                );
+                spec.numa_node = values
+                    .get("numa_node")
+                    .map(|id| btf_uint(btf, *id))
+                    .transpose()?;
+                spec.map_extra = u64::from(
+                    values
+                        .get("map_extra")
+                        .map(|id| btf_uint(btf, *id))
+                        .transpose()?
+                        .unwrap_or_default(),
+                );
+                spec.pinning = match values
+                    .get("pinning")
+                    .map(|id| btf_uint(btf, *id))
+                    .transpose()?
+                    .unwrap_or_default()
+                {
+                    0 => Pinning::None,
+                    1 => Pinning::ByName,
+                    value => {
+                        return Err(Error::InvalidObject(format!(
+                            "map `{name}` has unknown pinning value {value}"
+                        )));
+                    }
+                };
+                spec.btf_key_type = key_type.unwrap_or(TypeId::VOID);
+                spec.btf_value_type = value_type.unwrap_or(TypeId::VOID);
+                spec.section_index = Some(map_section_index);
+                spec.section_offset = u64::from(variable.offset);
+                if let Some(values_type) = values.get("values") {
+                    let id = btf.resolve_type(*values_type)?;
+                    let BtfType::Array { element_type, .. } =
+                        btf.type_by_id(id).ok_or_else(|| {
+                            Error::Btf(format!("map `{name}` values type does not exist"))
+                        })?
+                    else {
+                        return Err(Error::InvalidObject(format!(
+                            "map `{name}` values member is not an array"
+                        )));
+                    };
+                    let inner_struct = btf.resolve_type(btf_pointee(btf, *element_type)?)?;
+                    spec.inner_map = struct_names.get(&inner_struct).cloned();
+                }
+                // `struct_id` is intentionally retained in `struct_names`; it
+                // also detects BTF emitters that reuse a map-definition type.
+                let _ = struct_id;
+                if definitions.insert(name.into(), spec).is_some() {
+                    return Err(Error::InvalidObject(format!(
+                        "duplicate map definition `{name}`"
+                    )));
+                }
+            }
+            return Ok(definitions);
+        }
+    }
+
+    parse_legacy_maps(elf, map_section_index, map_data)
+}
+
+fn map_variable(btf: &Btf, variable_id: TypeId) -> Result<(&str, TypeId, &[crate::BtfMember])> {
+    let BtfType::Variable { name, ty, .. } = btf.type_by_id(variable_id).ok_or_else(|| {
+        Error::Btf(format!(
+            ".maps references missing variable type {}",
+            variable_id.0
+        ))
+    })?
+    else {
+        return Err(Error::Btf(format!(
+            ".maps type {} is not a variable",
+            variable_id.0
+        )));
+    };
+    let struct_id = btf.resolve_type(*ty)?;
+    let BtfType::Struct { members, .. } = btf
+        .type_by_id(struct_id)
+        .ok_or_else(|| Error::Btf(format!("map `{name}` structure type is missing")))?
+    else {
+        return Err(Error::InvalidObject(format!(
+            "map `{name}` definition is not a struct"
+        )));
+    };
+    Ok((name, struct_id, members))
+}
+
+fn required_member(members: &HashMap<&str, TypeId>, field: &str, map: &str) -> Result<TypeId> {
+    members.get(field).copied().ok_or_else(|| {
+        Error::InvalidObject(format!("map `{map}` definition has no `{field}` member"))
+    })
+}
+
+fn btf_uint(btf: &Btf, id: TypeId) -> Result<u32> {
+    let id = btf.resolve_type(id)?;
+    let BtfType::Pointer { ty } = btf
+        .type_by_id(id)
+        .ok_or_else(|| Error::Btf(format!("type ID {} is missing", id.0)))?
+    else {
+        return Err(Error::InvalidObject(format!(
+            "map integer encoding type {} is not a pointer",
+            id.0
+        )));
+    };
+    let array_id = btf.resolve_type(*ty)?;
+    let BtfType::Array { count, .. } = btf
+        .type_by_id(array_id)
+        .ok_or_else(|| Error::Btf(format!("type ID {} is missing", array_id.0)))?
+    else {
+        return Err(Error::InvalidObject(format!(
+            "map integer encoding type {} does not point to an array",
+            id.0
+        )));
+    };
+    Ok(*count)
+}
+
+fn btf_pointee(btf: &Btf, id: TypeId) -> Result<TypeId> {
+    let id = btf.resolve_type(id)?;
+    let BtfType::Pointer { ty } = btf
+        .type_by_id(id)
+        .ok_or_else(|| Error::Btf(format!("type ID {} is missing", id.0)))?
+    else {
+        return Err(Error::InvalidObject(format!(
+            "map key/value encoding type {} is not a pointer",
+            id.0
+        )));
+    };
+    Ok(*ty)
+}
+
+fn parse_legacy_maps(
+    elf: &Elf<'_>,
+    section_index: usize,
+    data: &[u8],
+) -> Result<BTreeMap<String, MapSpec>> {
+    let mut maps = BTreeMap::new();
+    for symbol in elf
+        .syms
+        .iter()
+        .filter(|symbol| symbol.st_shndx == section_index && symbol.st_type() == STT_OBJECT)
+    {
+        let name = symbol_name(elf, &symbol)?.to_owned();
+        let offset = usize::try_from(symbol.st_value)
+            .map_err(|_| Error::Elf("legacy map offset does not fit usize".into()))?;
+        let size = usize::try_from(symbol.st_size)
+            .map_err(|_| Error::Elf("legacy map size does not fit usize".into()))?;
+        let definition = data
+            .get(offset..offset.saturating_add(size))
+            .ok_or_else(|| {
+                Error::InvalidObject(format!("legacy map `{name}` lies outside .maps"))
+            })?;
+        if definition.len() < 20 {
+            return Err(Error::InvalidObject(format!(
+                "legacy map `{name}` is shorter than 20 bytes"
+            )));
+        }
+        let mut spec = MapSpec::new(
+            &name,
+            MapType::from_raw(read_u32(definition, 0, elf.little_endian, "map type")?),
+            read_u32(definition, 4, elf.little_endian, "map key size")?,
+            read_u32(definition, 8, elf.little_endian, "map value size")?,
+            read_u32(definition, 12, elf.little_endian, "map maximum entries")?,
+        );
+        spec.flags =
+            MapFlags::from_bits_retain(read_u32(definition, 16, elf.little_endian, "map flags")?);
+        spec.section_index = Some(section_index);
+        spec.section_offset = symbol.st_value;
+        maps.insert(name, spec);
+    }
+    Ok(maps)
+}
+
+fn add_data_maps(
+    object_name: &str,
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    btf: Option<&Btf>,
+    maps: &mut BTreeMap<String, MapSpec>,
+) -> Result<HashMap<usize, String>> {
+    let mut result = HashMap::new();
+    for (index, header) in elf.section_headers.iter().enumerate() {
+        let section_name = sections.name(index)?;
+        if !is_data_section(section_name, header) {
+            continue;
+        }
+        let data = sections.owned_data(index)?;
+        if data.is_empty() {
+            continue;
+        }
+        let suffix = section_name.trim_start_matches('.');
+        let name = format!("{object_name}.{suffix}");
+        let mut spec = MapSpec::new(&name, MapType::Array, 4, data.len() as u32, 1);
+        spec.flags = MapFlags::MMAPABLE;
+        if section_name.starts_with(".rodata") || section_name == ".kconfig" {
+            spec.flags |= MapFlags::PROGRAM_READ_ONLY;
+            spec.freeze_after_init = true;
+        }
+        spec.initial_value = Some(data);
+        spec.section_index = Some(index);
+        if let Some(btf) = btf {
+            if let Some((id, _)) = btf.find(crate::BtfKind::DataSection, section_name) {
+                spec.btf_value_type = id;
+            }
+        }
+        if maps.insert(name.clone(), spec).is_some() {
+            return Err(Error::InvalidObject(format!(
+                "data map name `{name}` conflicts with a declared map"
+            )));
+        }
+        result.insert(index, name);
+    }
+    Ok(result)
+}
+
+fn is_data_section(name: &str, header: &SectionHeader) -> bool {
+    let conventional = name == ".data"
+        || name.starts_with(".data.")
+        || name == ".rodata"
+        || name.starts_with(".rodata.")
+        || name == ".bss"
+        || name.starts_with(".bss.")
+        || name == ".kconfig";
+    conventional && header.sh_size > 0
+}
+
+fn resolve_inner_maps(
+    elf: &Elf<'_>,
+    sections: &Sections<'_>,
+    maps: &mut BTreeMap<String, MapSpec>,
+) -> Result<()> {
+    let Some((maps_index, _)) = sections.by_name(".maps") else {
+        return Ok(());
+    };
+    for (relocation_index, relocations) in &elf.shdr_relocs {
+        if elf.section_headers[*relocation_index].sh_info as usize != maps_index {
+            continue;
+        }
+        for relocation in relocations {
+            if relocation.r_type != R_BPF_64_64 {
+                continue;
+            }
+            let Some(symbol) = elf.syms.get(relocation.r_sym) else {
+                continue;
+            };
+            let target_name = symbol_name(elf, &symbol)?;
+            if !maps.contains_key(target_name) {
+                continue;
+            }
+            let offset = relocation.r_offset;
+            if let Some(outer) = maps.values_mut().find(|map| {
+                map.section_offset <= offset
+                    && offset
+                        < map
+                            .section_offset
+                            .saturating_add(u64::from(map.value_size.max(1)))
+            }) {
+                if outer.map_type.is_map_of_maps() {
+                    outer.inner_map = Some(target_name.into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn executable_entry_sections(elf: &Elf<'_>, sections: &Sections<'_>) -> Vec<usize> {
+    elf.section_headers
+        .iter()
+        .enumerate()
+        .filter(|(index, header)| {
+            header.sh_flags & u64::from(SHF_EXECINSTR) != 0
+                && header.sh_size > 0
+                && sections.names[*index] != ".text"
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_program_relocations(
+    elf: &Elf<'_>,
+    placements: &HashMap<usize, usize>,
+    data_sections: &HashMap<usize, String>,
+    maps: &BTreeMap<String, MapSpec>,
+    program_name: &str,
+    instructions: &mut [Instruction],
+    map_relocations: &mut Vec<MapRelocation>,
+) -> Result<()> {
+    for (relocation_index, relocations) in &elf.shdr_relocs {
+        let source_section = elf.section_headers[*relocation_index].sh_info as usize;
+        let Some(source_base) = placements.get(&source_section).copied() else {
+            continue;
+        };
+        for relocation in relocations {
+            if relocation.r_offset % Instruction::SIZE as u64 != 0 {
+                return Err(Error::InvalidObject(format!(
+                    "program relocation offset {} is not instruction-aligned",
+                    relocation.r_offset
+                )));
+            }
+            let local_index = usize::try_from(relocation.r_offset / Instruction::SIZE as u64)
+                .map_err(|_| Error::InvalidObject("relocation offset is too large".into()))?;
+            let instruction_index = source_base
+                .checked_add(local_index)
+                .ok_or_else(|| Error::InvalidObject("relocation index overflow".into()))?;
+            let symbol = elf.syms.get(relocation.r_sym).ok_or_else(|| {
+                Error::Elf(format!(
+                    "program relocation references missing symbol {}",
+                    relocation.r_sym
+                ))
+            })?;
+            let target_section = symbol.st_shndx;
+
+            match relocation.r_type {
+                R_BPF_64_32 => {
+                    let target_base = placements.get(&target_section).ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "program `{program_name}` calls `{}` in a section that is not linked",
+                            symbol_name(elf, &symbol).unwrap_or("<unnamed>")
+                        ))
+                    })?;
+                    let target_local = usize::try_from(symbol.st_value / Instruction::SIZE as u64)
+                        .map_err(|_| Error::InvalidObject("call target is too large".into()))?;
+                    let target = target_base
+                        .checked_add(target_local)
+                        .ok_or_else(|| Error::InvalidObject("call target index overflow".into()))?;
+                    let delta = i64::try_from(target)
+                        .and_then(|target| {
+                            i64::try_from(instruction_index).map(|source| target - source - 1)
+                        })
+                        .map_err(|_| {
+                            Error::InvalidObject("call relocation does not fit i64".into())
+                        })?;
+                    let instruction = instructions.get_mut(instruction_index).ok_or_else(|| {
+                        Error::InvalidObject("call relocation is outside program".into())
+                    })?;
+                    instruction.set_source(BPF_PSEUDO_CALL)?;
+                    instruction.immediate = i32::try_from(delta).map_err(|_| {
+                        Error::InvalidObject("call relocation does not fit i32".into())
+                    })?;
+                }
+                R_BPF_64_64 => {
+                    if placements.contains_key(&target_section) {
+                        let target = placements[&target_section]
+                            + usize::try_from(symbol.st_value / Instruction::SIZE as u64).map_err(
+                                |_| Error::InvalidObject("function target too large".into()),
+                            )?;
+                        let delta = i64::try_from(target)
+                            .and_then(|target| {
+                                i64::try_from(instruction_index).map(|source| target - source - 1)
+                            })
+                            .map_err(|_| {
+                                Error::InvalidObject("function relocation too large".into())
+                            })?;
+                        let instruction =
+                            instructions.get_mut(instruction_index).ok_or_else(|| {
+                                Error::InvalidObject(
+                                    "function relocation is outside program".into(),
+                                )
+                            })?;
+                        instruction.set_source(BPF_PSEUDO_FUNC)?;
+                        instruction.immediate = i32::try_from(delta).map_err(|_| {
+                            Error::InvalidObject("function relocation does not fit i32".into())
+                        })?;
+                        continue;
+                    }
+
+                    let (map, value_offset) = if let Some(map) = data_sections.get(&target_section)
+                    {
+                        let addend = relocation.r_addend.unwrap_or_default();
+                        let embedded = instructions
+                            .get(instruction_index + 1)
+                            .map(|instruction| i64::from(instruction.immediate))
+                            .unwrap_or_default();
+                        let offset =
+                            i128::from(symbol.st_value) + i128::from(addend) + i128::from(embedded);
+                        let offset = u32::try_from(offset).map_err(|_| {
+                            Error::InvalidObject("data relocation offset does not fit u32".into())
+                        })?;
+                        (map.clone(), Some(offset))
+                    } else {
+                        let name = symbol_name(elf, &symbol)?;
+                        if maps.contains_key(name) {
+                            (name.into(), None)
+                        } else {
+                            let absolute = symbol.st_value.saturating_add(
+                                relocation.r_addend.unwrap_or_default().max(0) as u64,
+                            );
+                            let map = maps
+                                .values()
+                                .find(|map| {
+                                    map.section_index == Some(target_section)
+                                        && map.section_offset == absolute
+                                })
+                                .map(|map| map.name.clone())
+                                .ok_or_else(|| {
+                                    Error::Unsupported(format!(
+                                        "relocation references unresolved symbol `{name}`"
+                                    ))
+                                })?;
+                            (map, None)
+                        }
+                    };
+                    let instruction = instructions.get(instruction_index).ok_or_else(|| {
+                        Error::InvalidObject("map relocation is outside program".into())
+                    })?;
+                    if instruction.code != BPF_LD_IMM_DW
+                        || instructions.get(instruction_index + 1).is_none()
+                    {
+                        return Err(Error::InvalidObject(format!(
+                            "map relocation in `{program_name}` does not target ldimm64"
+                        )));
+                    }
+                    map_relocations.push(MapRelocation {
+                        program: program_name.into(),
+                        instruction_index,
+                        map,
+                        value_offset,
+                    });
+                }
+                0 => {}
+                kind => {
+                    return Err(Error::Unsupported(format!(
+                        "program `{program_name}` uses ELF relocation type {kind}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn relocate_maps(
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[MapRelocation],
+    maps: &BTreeMap<String, Map>,
+) -> Result<()> {
+    for relocation in relocations {
+        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "relocation references missing program `{}`",
+                relocation.program
+            ))
+        })?;
+        let map = maps.get(&relocation.map).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "relocation references missing map `{}`",
+                relocation.map
+            ))
+        })?;
+        let fd = map.fd.as_raw_fd();
+        let instruction = program
+            .instructions
+            .get_mut(relocation.instruction_index)
+            .ok_or_else(|| Error::InvalidObject("map relocation is outside program".into()))?;
+        instruction.set_source(if relocation.value_offset.is_some() {
+            BPF_PSEUDO_MAP_VALUE
+        } else {
+            BPF_PSEUDO_MAP_FD
+        })?;
+        instruction.immediate = fd;
+        let second = program
+            .instructions
+            .get_mut(relocation.instruction_index + 1)
+            .ok_or_else(|| Error::InvalidObject("map ldimm64 has no second instruction".into()))?;
+        second.immediate = relocation.value_offset.unwrap_or_default() as i32;
+    }
+    Ok(())
+}
+
+fn load_maps(
+    specs: &BTreeMap<String, MapSpec>,
+    btf_fd: Option<&OwnedFd>,
+    pin_root: &Path,
+) -> Result<BTreeMap<String, Map>> {
+    let mut loaded = BTreeMap::new();
+    let mut pending = specs.keys().cloned().collect::<HashSet<_>>();
+    while !pending.is_empty() {
+        let mut progress = false;
+        let names = pending.iter().cloned().collect::<Vec<_>>();
+        for name in names {
+            let spec = &specs[&name];
+            if spec
+                .inner_map
+                .as_ref()
+                .is_some_and(|inner| !loaded.contains_key(inner))
+            {
+                continue;
+            }
+            let pin_path = (spec.pinning == Pinning::ByName).then(|| pin_root.join(&name));
+            let existing = pin_path
+                .as_ref()
+                .filter(|path| path.exists())
+                .map(Map::open_pinned)
+                .transpose()?;
+            let map = if let Some(map) = existing {
+                ensure_map_compatible(spec, &map)?;
+                map
+            } else {
+                let inner_fd = spec
+                    .inner_map
+                    .as_ref()
+                    .and_then(|inner| loaded.get(inner))
+                    .map(|map: &Map| map.fd.as_raw_fd());
+                let fd = sys::map_create(&MapCreate {
+                    map_type: spec.map_type.as_raw(),
+                    name: &spec.name,
+                    key_size: spec.key_size,
+                    value_size: spec.value_size,
+                    max_entries: spec.max_entries,
+                    flags: spec.flags.bits(),
+                    inner_map_fd: inner_fd,
+                    numa_node: spec.numa_node,
+                    btf_fd: btf_fd.map(AsRawFd::as_raw_fd),
+                    btf_key_type_id: spec.btf_key_type.0,
+                    btf_value_type_id: spec.btf_value_type.0,
+                    map_extra: spec.map_extra,
+                })
+                .map_err(|source| Error::system("create eBPF map", source))?;
+                let map = Map::from_fd(fd, spec.clone());
+                if let Some(initial) = &spec.initial_value {
+                    sys::map_update(map.fd.as_raw_fd(), &0_u32.to_ne_bytes(), initial, 0)
+                        .map_err(|source| Error::system("initialize data map", source))?;
+                }
+                if spec.freeze_after_init {
+                    map.freeze()?;
+                }
+                if let Some(path) = &pin_path {
+                    map.pin(path)?;
+                }
+                map
+            };
+            loaded.insert(name.clone(), map);
+            pending.remove(&name);
+            progress = true;
+        }
+        if !progress {
+            return Err(Error::InvalidObject(format!(
+                "map dependency cycle among: {}",
+                pending.into_iter().collect::<Vec<_>>().join(", ")
+            )));
+        }
+    }
+    Ok(loaded)
+}
+
+fn ensure_map_compatible(spec: &MapSpec, map: &Map) -> Result<()> {
+    let info = map.info()?;
+    if info.map_type != spec.map_type
+        || info.key_size != spec.key_size
+        || info.value_size != spec.value_size
+        || info.max_entries != spec.max_entries
+        || info.flags != spec.flags
+    {
+        return Err(Error::InvalidObject(format!(
+            "pinned map `{}` is incompatible with the object definition",
+            spec.name
+        )));
+    }
+    Ok(())
+}
+
+fn program_symbol_name(elf: &Elf<'_>, section_index: usize) -> Option<String> {
+    elf.syms
+        .iter()
+        .filter(|symbol| {
+            symbol.st_shndx == section_index
+                && symbol.st_type() == STT_FUNC
+                && symbol.st_bind() == STB_GLOBAL
+                && symbol.st_value == 0
+        })
+        .find_map(|symbol| symbol_name(elf, &symbol).ok().map(str::to_owned))
+}
+
+fn symbol_name<'a>(elf: &'a Elf<'_>, symbol: &Sym) -> Result<&'a str> {
+    elf.strtab
+        .get_at(symbol.st_name)
+        .ok_or_else(|| Error::Elf(format!("symbol has invalid name offset {}", symbol.st_name)))
+}
+
+fn sanitize_name(section: &str) -> String {
+    section
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn nul_terminated(bytes: &[u8]) -> Vec<u8> {
+    let mut bytes = bytes.to_vec();
+    if bytes.last() != Some(&0) {
+        bytes.push(0);
+    }
+    bytes
+}
+
+fn read_u32(bytes: &[u8], offset: usize, little_endian: bool, what: &str) -> Result<u32> {
+    let bytes: [u8; 4] = bytes
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| Error::InvalidObject(format!("{what} lies outside its section")))?
+        .try_into()
+        .expect("four-byte slice");
+    Ok(if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    })
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32, little_endian: bool) -> Result<()> {
+    let target = bytes
+        .get_mut(offset..offset.saturating_add(4))
+        .ok_or_else(|| Error::InvalidObject("relocation target is outside its section".into()))?;
+    let value = if little_endian {
+        value.to_le_bytes()
+    } else {
+        value.to_be_bytes()
+    };
+    target.copy_from_slice(&value);
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default)]
+struct ExtSegment {
+    record_size: u32,
+    sections: HashMap<String, Vec<Vec<u8>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BtfExt {
+    function_info: ExtSegment,
+    line_info: ExtSegment,
+    core_relocations: ExtSegment,
+}
+
+impl BtfExt {
+    fn parse(bytes: &[u8], btf: &Btf) -> Result<Self> {
+        let endian = btf.endian();
+        if bytes.len() < 32 {
+            return Err(Error::Btf(".BTF.ext header is truncated".into()));
+        }
+        let magic = read_ext_u16(bytes, 0, endian)?;
+        if magic != 0xeb9f || bytes[2] != 1 {
+            return Err(Error::Btf("invalid .BTF.ext header".into()));
+        }
+        let header_len = read_ext_u32(bytes, 4, endian)? as usize;
+        if header_len < 24 || header_len > bytes.len() {
+            return Err(Error::Btf(format!(
+                "invalid .BTF.ext header length {header_len}"
+            )));
+        }
+        let func_offset = read_ext_u32(bytes, 8, endian)? as usize;
+        let func_len = read_ext_u32(bytes, 12, endian)? as usize;
+        let line_offset = read_ext_u32(bytes, 16, endian)? as usize;
+        let line_len = read_ext_u32(bytes, 20, endian)? as usize;
+        let (core_offset, core_len) = if header_len >= 32 {
+            (
+                read_ext_u32(bytes, 24, endian)? as usize,
+                read_ext_u32(bytes, 28, endian)? as usize,
+            )
+        } else {
+            (0, 0)
+        };
+        Ok(Self {
+            function_info: parse_ext_segment(
+                ext_slice(bytes, header_len, func_offset, func_len)?,
+                btf,
+                endian,
+            )?,
+            line_info: parse_ext_segment(
+                ext_slice(bytes, header_len, line_offset, line_len)?,
+                btf,
+                endian,
+            )?,
+            core_relocations: parse_ext_segment(
+                ext_slice(bytes, header_len, core_offset, core_len)?,
+                btf,
+                endian,
+            )?,
+        })
+    }
+}
+
+fn ext_slice(bytes: &[u8], header_len: usize, offset: usize, len: usize) -> Result<&[u8]> {
+    let start = header_len
+        .checked_add(offset)
+        .ok_or_else(|| Error::Btf(".BTF.ext section offset overflow".into()))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| Error::Btf(".BTF.ext section length overflow".into()))?;
+    bytes
+        .get(start..end)
+        .ok_or_else(|| Error::Btf(".BTF.ext subsection is out of bounds".into()))
+}
+
+fn parse_ext_segment(bytes: &[u8], btf: &Btf, endian: Endian) -> Result<ExtSegment> {
+    if bytes.is_empty() {
+        return Ok(ExtSegment::default());
+    }
+    let record_size = read_ext_u32(bytes, 0, endian)?;
+    if record_size < 4 {
+        return Err(Error::Btf(format!(
+            ".BTF.ext record size {record_size} is too small"
+        )));
+    }
+    let record_size_usize = record_size as usize;
+    let mut offset = 4;
+    let mut sections = HashMap::new();
+    while offset < bytes.len() {
+        let name_offset = read_ext_u32(bytes, offset, endian)?;
+        let count = read_ext_u32(bytes, offset + 4, endian)? as usize;
+        offset += 8;
+        let name = btf.string_at(name_offset)?.to_owned();
+        let byte_count = count
+            .checked_mul(record_size_usize)
+            .ok_or_else(|| Error::Btf(".BTF.ext record count overflow".into()))?;
+        let records = bytes
+            .get(offset..offset.saturating_add(byte_count))
+            .ok_or_else(|| Error::Btf(".BTF.ext records are truncated".into()))?
+            .chunks_exact(record_size_usize)
+            .map(<[u8]>::to_vec)
+            .collect();
+        offset += byte_count;
+        sections.insert(name, records);
+    }
+    Ok(ExtSegment {
+        record_size,
+        sections,
+    })
+}
+
+fn append_ext_info(
+    output: &mut Vec<u8>,
+    output_record_size: &mut u32,
+    segment: &ExtSegment,
+    placements: &HashMap<usize, usize>,
+    sections: &Sections<'_>,
+    endian: Endian,
+) -> Result<()> {
+    if segment.record_size == 0 {
+        return Ok(());
+    }
+    let mut ordered = placements.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, base)| **base);
+    for (section_index, base) in ordered {
+        let section_name = sections.name(*section_index)?;
+        let Some(records) = segment.sections.get(section_name) else {
+            continue;
+        };
+        for record in records {
+            let mut record = record.clone();
+            let byte_offset = read_ext_u32(&record, 0, endian)?;
+            if byte_offset % Instruction::SIZE as u32 != 0 {
+                return Err(Error::Btf(format!(
+                    ".BTF.ext record for `{section_name}` is not instruction-aligned"
+                )));
+            }
+            let instruction_offset = u32::try_from(*base)
+                .ok()
+                .and_then(|base| base.checked_add(byte_offset / Instruction::SIZE as u32))
+                .ok_or_else(|| Error::Btf(".BTF.ext instruction offset overflow".into()))?;
+            write_ext_u32(&mut record, 0, instruction_offset, endian)?;
+            output.extend(record);
+        }
+    }
+    if !output.is_empty() {
+        *output_record_size = segment.record_size;
+    }
+    Ok(())
+}
+
+fn append_core_relocations(
+    program_name: &str,
+    segment: &ExtSegment,
+    placements: &HashMap<usize, usize>,
+    output: &mut Vec<CoreRelocation>,
+    btf: &Btf,
+    sections: &Sections<'_>,
+) -> Result<()> {
+    if segment.record_size == 0 {
+        return Ok(());
+    }
+    if segment.record_size < 16 {
+        return Err(Error::Btf(format!(
+            "CO-RE record size {} is smaller than 16",
+            segment.record_size
+        )));
+    }
+    for (section_index, base) in placements {
+        let section_name = sections.name(*section_index)?;
+        let Some(records) = segment.sections.get(section_name) else {
+            continue;
+        };
+        for record in records {
+            let byte_offset = read_ext_u32(record, 0, btf.endian())?;
+            if byte_offset % Instruction::SIZE as u32 != 0 {
+                return Err(Error::Btf(format!(
+                    "CO-RE relocation for `{section_name}` is not instruction-aligned"
+                )));
+            }
+            let local_index = usize::try_from(byte_offset / Instruction::SIZE as u32)
+                .map_err(|_| Error::Btf("CO-RE instruction offset is too large".into()))?;
+            let instruction_index = base
+                .checked_add(local_index)
+                .ok_or_else(|| Error::Btf("CO-RE instruction offset overflow".into()))?;
+            let type_id = TypeId(read_ext_u32(record, 4, btf.endian())?);
+            let access_offset = read_ext_u32(record, 8, btf.endian())?;
+            let access = btf.string_at(access_offset)?.to_owned();
+            let kind = read_ext_u32(record, 12, btf.endian())?;
+            output.push(CoreRelocation {
+                program: program_name.into(),
+                instruction_index,
+                type_id,
+                access,
+                kind,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_core_relocations(
+    local_btf: &Btf,
+    programs: &mut BTreeMap<String, ProgramSpec>,
+    relocations: &[CoreRelocation],
+) -> Result<()> {
+    if relocations.is_empty() {
+        return Ok(());
+    }
+    let kernel_bytes = fs::read("/sys/kernel/btf/vmlinux").map_err(|source| Error::File {
+        operation: "read kernel BTF for CO-RE",
+        path: "/sys/kernel/btf/vmlinux".into(),
+        source,
+    })?;
+    let target_btf = Btf::parse(&kernel_bytes)?;
+    for relocation in relocations {
+        let value = evaluate_core_relocation(local_btf, &target_btf, relocation)?;
+        let program = programs.get_mut(&relocation.program).ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "CO-RE relocation references missing program `{}`",
+                relocation.program
+            ))
+        })?;
+        patch_core_instruction(
+            &mut program.instructions,
+            relocation.instruction_index,
+            value,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoreValue {
+    value: u64,
+    local_size: Option<usize>,
+    target_size: Option<usize>,
+    poison: bool,
+}
+
+impl CoreValue {
+    const fn plain(value: u64) -> Self {
+        Self {
+            value,
+            local_size: None,
+            target_size: None,
+            poison: false,
+        }
+    }
+
+    const fn poison() -> Self {
+        Self {
+            value: 0,
+            local_size: None,
+            target_size: None,
+            poison: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FieldDescriptor {
+    ty: TypeId,
+    bit_offset: u64,
+    bitfield_size: Option<u8>,
+}
+
+fn evaluate_core_relocation(
+    local: &Btf,
+    target: &Btf,
+    relocation: &CoreRelocation,
+) -> Result<CoreValue> {
+    let local_root = local.resolve_type(relocation.type_id)?;
+    match relocation.kind {
+        0..=5 => evaluate_field_relocation(local, target, local_root, relocation),
+        6 => Ok(CoreValue::plain(u64::from(relocation.type_id.0))),
+        7..=9 | 12 => evaluate_type_relocation(local, target, local_root, relocation.kind),
+        10 | 11 => evaluate_enum_relocation(local, target, local_root, relocation),
+        kind => Err(Error::Unsupported(format!(
+            "unknown CO-RE relocation kind {kind}"
+        ))),
+    }
+}
+
+fn evaluate_field_relocation(
+    local: &Btf,
+    target: &Btf,
+    local_root: TypeId,
+    relocation: &CoreRelocation,
+) -> Result<CoreValue> {
+    let accessors = parse_accessors(&relocation.access)?;
+    let local_field = resolve_local_field(local, local_root, &accessors)?;
+    let candidates = target_type_candidates(local, target, local_root)?;
+    let target_field = candidates.into_iter().find_map(|target_root| {
+        resolve_target_field(local, target, local_root, target_root, &accessors).ok()
+    });
+    if relocation.kind == 2 {
+        return Ok(CoreValue::plain(u64::from(target_field.is_some())));
+    }
+    let Some(target_field) = target_field else {
+        return Ok(CoreValue::poison());
+    };
+    let local_layout = field_layout(local, local_field)?;
+    let target_layout = field_layout(target, target_field)?;
+    let value = match relocation.kind {
+        0 => target_layout.byte_offset,
+        1 => target_layout.byte_size as u64,
+        3 => u64::from(type_is_signed(target, target_field.ty)?),
+        4 => target_layout.left_shift,
+        5 => 64 - u64::from(target_layout.bit_size),
+        _ => unreachable!(),
+    };
+    Ok(CoreValue {
+        value,
+        local_size: (relocation.kind == 0).then_some(local_layout.byte_size),
+        target_size: (relocation.kind == 0).then_some(target_layout.byte_size),
+        poison: false,
+    })
+}
+
+fn evaluate_type_relocation(
+    local: &Btf,
+    target: &Btf,
+    local_root: TypeId,
+    kind: u32,
+) -> Result<CoreValue> {
+    let candidate = target_type_candidates(local, target, local_root)?
+        .into_iter()
+        .next();
+    let value = match kind {
+        7 => candidate.map_or(0, |id| u64::from(id.0)),
+        8 | 12 => u64::from(candidate.is_some()),
+        9 => candidate
+            .map(|id| target.size_of(id).map(|size| size as u64))
+            .transpose()?
+            .unwrap_or(0),
+        _ => unreachable!(),
+    };
+    Ok(CoreValue::plain(value))
+}
+
+fn evaluate_enum_relocation(
+    local: &Btf,
+    target: &Btf,
+    local_root: TypeId,
+    relocation: &CoreRelocation,
+) -> Result<CoreValue> {
+    let index = relocation.access.parse::<usize>().map_err(|_| {
+        Error::Btf(format!(
+            "invalid enum CO-RE accessor `{}`",
+            relocation.access
+        ))
+    })?;
+    let local_name = enum_value(local, local_root, index)?.0;
+    let target_value = target_type_candidates(local, target, local_root)?
+        .into_iter()
+        .find_map(|id| enum_value_by_name(target, id, local_name));
+    match relocation.kind {
+        10 => Ok(CoreValue::plain(u64::from(target_value.is_some()))),
+        11 => {
+            Ok(target_value.map_or_else(CoreValue::poison, |value| CoreValue::plain(value as u64)))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn target_type_candidates(local: &Btf, target: &Btf, local_id: TypeId) -> Result<Vec<TypeId>> {
+    let local_ty = local
+        .type_by_id(local_id)
+        .ok_or_else(|| Error::Btf(format!("local type ID {} does not exist", local_id.0)))?;
+    let local_name = local_ty.name().unwrap_or("");
+    let essential = essential_name(local_name);
+    if essential.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(target
+        .types()
+        .filter(|(_, candidate)| {
+            core_kinds_compatible(local_ty, candidate)
+                && candidate
+                    .name()
+                    .is_some_and(|name| essential_name(name) == essential)
+        })
+        .map(|(id, _)| id)
+        .collect())
+}
+
+fn core_kinds_compatible(left: &BtfType, right: &BtfType) -> bool {
+    matches!(
+        (left, right),
+        (BtfType::Struct { .. }, BtfType::Struct { .. })
+            | (BtfType::Union { .. }, BtfType::Union { .. })
+            | (BtfType::Enum { .. }, BtfType::Enum { .. })
+            | (BtfType::Enum { .. }, BtfType::Enum64 { .. })
+            | (BtfType::Enum64 { .. }, BtfType::Enum { .. })
+            | (BtfType::Enum64 { .. }, BtfType::Enum64 { .. })
+            | (BtfType::Integer { .. }, BtfType::Integer { .. })
+            | (BtfType::Float { .. }, BtfType::Float { .. })
+    )
+}
+
+fn essential_name(name: &str) -> &str {
+    name.split_once("___").map_or(name, |(name, _)| name)
+}
+
+fn parse_accessors(access: &str) -> Result<Vec<usize>> {
+    let accessors = access
+        .split(':')
+        .map(|accessor| {
+            accessor
+                .parse::<usize>()
+                .map_err(|_| Error::Btf(format!("invalid CO-RE field accessor `{accessor}`")))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if accessors.is_empty() {
+        Err(Error::Btf("CO-RE field accessor is empty".into()))
+    } else {
+        Ok(accessors)
+    }
+}
+
+fn resolve_local_field(btf: &Btf, root: TypeId, accessors: &[usize]) -> Result<FieldDescriptor> {
+    let mut descriptor = FieldDescriptor {
+        ty: root,
+        bit_offset: 0,
+        bitfield_size: None,
+    };
+    for (position, accessor) in accessors.iter().copied().enumerate() {
+        if position == 0 && accessor == 0 {
+            continue;
+        }
+        descriptor = step_local_field(btf, descriptor, accessor)?;
+    }
+    Ok(descriptor)
+}
+
+fn step_local_field(
+    btf: &Btf,
+    mut descriptor: FieldDescriptor,
+    accessor: usize,
+) -> Result<FieldDescriptor> {
+    descriptor.ty = btf.resolve_type(descriptor.ty)?;
+    let ty = btf
+        .type_by_id(descriptor.ty)
+        .ok_or_else(|| Error::Btf(format!("type ID {} does not exist", descriptor.ty.0)))?;
+    match ty {
+        BtfType::Pointer { ty } => {
+            let stride = btf.size_of(*ty)? as u64;
+            descriptor.ty = *ty;
+            descriptor.bit_offset += accessor as u64 * stride * 8;
+            descriptor.bitfield_size = None;
+            Ok(descriptor)
+        }
+        BtfType::Array { element_type, .. } => {
+            let stride = btf.size_of(*element_type)? as u64;
+            descriptor.ty = *element_type;
+            descriptor.bit_offset += accessor as u64 * stride * 8;
+            descriptor.bitfield_size = None;
+            Ok(descriptor)
+        }
+        BtfType::Struct { members, .. } | BtfType::Union { members, .. } => {
+            let member = members.get(accessor).ok_or_else(|| {
+                Error::Btf(format!(
+                    "CO-RE member index {accessor} is outside type {}",
+                    descriptor.ty.0
+                ))
+            })?;
+            descriptor.ty = member.ty;
+            descriptor.bit_offset += u64::from(member.bit_offset);
+            descriptor.bitfield_size = member.bitfield_size.filter(|size| *size != 0);
+            Ok(descriptor)
+        }
+        _ => Err(Error::Btf(format!(
+            "CO-RE accessor indexes non-composite type {}",
+            descriptor.ty.0
+        ))),
+    }
+}
+
+fn resolve_target_field(
+    local: &Btf,
+    target: &Btf,
+    local_root: TypeId,
+    target_root: TypeId,
+    accessors: &[usize],
+) -> Result<FieldDescriptor> {
+    let mut local_descriptor = FieldDescriptor {
+        ty: local_root,
+        bit_offset: 0,
+        bitfield_size: None,
+    };
+    let mut target_descriptor = FieldDescriptor {
+        ty: target_root,
+        bit_offset: 0,
+        bitfield_size: None,
+    };
+    for (position, accessor) in accessors.iter().copied().enumerate() {
+        if position == 0 && accessor == 0 {
+            continue;
+        }
+        local_descriptor.ty = local.resolve_type(local_descriptor.ty)?;
+        target_descriptor.ty = target.resolve_type(target_descriptor.ty)?;
+        let local_ty = local
+            .type_by_id(local_descriptor.ty)
+            .ok_or_else(|| Error::Btf("local CO-RE type is missing".into()))?;
+        let target_ty = target
+            .type_by_id(target_descriptor.ty)
+            .ok_or_else(|| Error::Btf("target CO-RE type is missing".into()))?;
+        match (local_ty, target_ty) {
+            (
+                BtfType::Struct {
+                    members: local_members,
+                    ..
+                }
+                | BtfType::Union {
+                    members: local_members,
+                    ..
+                },
+                BtfType::Struct {
+                    members: target_members,
+                    ..
+                }
+                | BtfType::Union {
+                    members: target_members,
+                    ..
+                },
+            ) => {
+                let local_member = local_members
+                    .get(accessor)
+                    .ok_or_else(|| Error::Btf("local CO-RE member index is out of range".into()))?;
+                let target_member = target_members
+                    .iter()
+                    .find(|member| {
+                        !local_member.name.is_empty()
+                            && essential_name(&member.name) == essential_name(&local_member.name)
+                    })
+                    .or_else(|| {
+                        local_member
+                            .name
+                            .is_empty()
+                            .then(|| target_members.get(accessor))
+                            .flatten()
+                    })
+                    .ok_or_else(|| {
+                        Error::Btf(format!("target type has no member `{}`", local_member.name))
+                    })?;
+                local_descriptor.ty = local_member.ty;
+                local_descriptor.bit_offset += u64::from(local_member.bit_offset);
+                local_descriptor.bitfield_size =
+                    local_member.bitfield_size.filter(|size| *size != 0);
+                target_descriptor.ty = target_member.ty;
+                target_descriptor.bit_offset += u64::from(target_member.bit_offset);
+                target_descriptor.bitfield_size =
+                    target_member.bitfield_size.filter(|size| *size != 0);
+            }
+            (
+                BtfType::Array {
+                    element_type: local_element,
+                    ..
+                },
+                BtfType::Array {
+                    element_type: target_element,
+                    ..
+                },
+            ) => {
+                local_descriptor.bit_offset +=
+                    accessor as u64 * local.size_of(*local_element)? as u64 * 8;
+                target_descriptor.bit_offset +=
+                    accessor as u64 * target.size_of(*target_element)? as u64 * 8;
+                local_descriptor.ty = *local_element;
+                target_descriptor.ty = *target_element;
+            }
+            (BtfType::Pointer { ty: local_type }, BtfType::Pointer { ty: target_type }) => {
+                local_descriptor.bit_offset +=
+                    accessor as u64 * local.size_of(*local_type)? as u64 * 8;
+                target_descriptor.bit_offset +=
+                    accessor as u64 * target.size_of(*target_type)? as u64 * 8;
+                local_descriptor.ty = *local_type;
+                target_descriptor.ty = *target_type;
+            }
+            _ => {
+                return Err(Error::Btf(
+                    "local and target CO-RE access paths have incompatible kinds".into(),
+                ));
+            }
+        }
+    }
+    Ok(target_descriptor)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FieldLayout {
+    byte_offset: u64,
+    byte_size: usize,
+    bit_size: u8,
+    left_shift: u64,
+}
+
+fn field_layout(btf: &Btf, field: FieldDescriptor) -> Result<FieldLayout> {
+    let type_size = btf.size_of(field.ty)?;
+    if let Some(bit_size) = field.bitfield_size {
+        let mut byte_size = type_size;
+        if byte_size == 0 || byte_size > 8 {
+            return Err(Error::Btf("CO-RE bitfield has invalid storage size".into()));
+        }
+        let mut byte_offset = field.bit_offset / 8 / byte_size as u64 * byte_size as u64;
+        while field.bit_offset + u64::from(bit_size) > (byte_offset + byte_size as u64) * 8 {
+            byte_size = byte_size
+                .checked_mul(2)
+                .ok_or_else(|| Error::Btf("CO-RE bitfield storage overflow".into()))?;
+            if byte_size > 8 {
+                return Err(Error::Btf(
+                    "CO-RE bitfield cannot be read in 64 bits".into(),
+                ));
+            }
+            byte_offset = field.bit_offset / 8 / byte_size as u64 * byte_size as u64;
+        }
+        let left_shift = if cfg!(target_endian = "little") {
+            64 - (field.bit_offset + u64::from(bit_size) - byte_offset * 8)
+        } else {
+            (8 - byte_size as u64) * 8 + (field.bit_offset - byte_offset * 8)
+        };
+        Ok(FieldLayout {
+            byte_offset,
+            byte_size,
+            bit_size,
+            left_shift,
+        })
+    } else {
+        let bit_size = u8::try_from(type_size.saturating_mul(8)).unwrap_or(64);
+        Ok(FieldLayout {
+            byte_offset: field.bit_offset / 8,
+            byte_size: type_size,
+            bit_size,
+            left_shift: 0,
+        })
+    }
+}
+
+fn type_is_signed(btf: &Btf, id: TypeId) -> Result<bool> {
+    let id = btf.resolve_type(id)?;
+    match btf
+        .type_by_id(id)
+        .ok_or_else(|| Error::Btf(format!("type ID {} does not exist", id.0)))?
+    {
+        BtfType::Integer { encoding, .. } => Ok(encoding.signed),
+        BtfType::Enum { signed, .. } | BtfType::Enum64 { signed, .. } => Ok(*signed),
+        _ => Ok(false),
+    }
+}
+
+fn enum_value(btf: &Btf, id: TypeId, index: usize) -> Result<(&str, i64)> {
+    match btf
+        .type_by_id(id)
+        .ok_or_else(|| Error::Btf(format!("enum type ID {} does not exist", id.0)))?
+    {
+        BtfType::Enum { values, .. } | BtfType::Enum64 { values, .. } => values
+            .get(index)
+            .map(|value| (value.name.as_str(), value.value))
+            .ok_or_else(|| Error::Btf(format!("enum value index {index} is out of range"))),
+        _ => Err(Error::Btf(format!("type ID {} is not an enum", id.0))),
+    }
+}
+
+fn enum_value_by_name(btf: &Btf, id: TypeId, name: &str) -> Option<i64> {
+    match btf.type_by_id(id)? {
+        BtfType::Enum { values, .. } | BtfType::Enum64 { values, .. } => values
+            .iter()
+            .find(|value| essential_name(&value.name) == essential_name(name))
+            .map(|value| value.value),
+        _ => None,
+    }
+}
+
+fn patch_core_instruction(
+    instructions: &mut [Instruction],
+    index: usize,
+    value: CoreValue,
+) -> Result<()> {
+    let instruction = instructions
+        .get_mut(index)
+        .ok_or_else(|| Error::InvalidObject("CO-RE relocation is outside program".into()))?;
+    if value.poison {
+        let is_ldimm64 = instruction.code == BPF_LD_IMM_DW;
+        *instruction = Instruction::new(0x85, 0, 0, 0, 195_896_080);
+        if is_ldimm64 {
+            if let Some(second) = instructions.get_mut(index + 1) {
+                *second = Instruction::new(0x85, 0, 0, 0, 195_896_080);
+            }
+        }
+        return Ok(());
+    }
+    let class = instruction.code & 0x07;
+    match class {
+        0 if instruction.code == BPF_LD_IMM_DW => {
+            instruction.immediate = value.value as u32 as i32;
+            let second = instructions
+                .get_mut(index + 1)
+                .ok_or_else(|| Error::InvalidObject("CO-RE ldimm64 is truncated".into()))?;
+            second.immediate = (value.value >> 32) as u32 as i32;
+        }
+        1..=3 => {
+            instruction.offset = i16::try_from(value.value)
+                .map_err(|_| Error::InvalidObject("CO-RE memory offset does not fit i16".into()))?;
+            if let (Some(local_size), Some(target_size)) = (value.local_size, value.target_size) {
+                if local_size != target_size {
+                    let size_bits = match target_size {
+                        1 => 0x10,
+                        2 => 0x08,
+                        4 => 0x00,
+                        8 => 0x18,
+                        _ => {
+                            return Err(Error::Unsupported(format!(
+                                "CO-RE cannot encode a {target_size}-byte memory access"
+                            )));
+                        }
+                    };
+                    instruction.code = (instruction.code & !0x18) | size_bits;
+                }
+            }
+        }
+        4 | 7 => {
+            instruction.immediate = value.value as u32 as i32;
+        }
+        _ => {
+            return Err(Error::InvalidObject(format!(
+                "CO-RE relocation targets unsupported opcode 0x{:02x}",
+                instruction.code
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_ext_u16(bytes: &[u8], offset: usize, endian: Endian) -> Result<u16> {
+    let value: [u8; 2] = bytes
+        .get(offset..offset.saturating_add(2))
+        .ok_or_else(|| Error::Btf(".BTF.ext is truncated".into()))?
+        .try_into()
+        .expect("two-byte slice");
+    Ok(match endian {
+        Endian::Little => u16::from_le_bytes(value),
+        Endian::Big => u16::from_be_bytes(value),
+    })
+}
+
+fn read_ext_u32(bytes: &[u8], offset: usize, endian: Endian) -> Result<u32> {
+    let value: [u8; 4] = bytes
+        .get(offset..offset.saturating_add(4))
+        .ok_or_else(|| Error::Btf(".BTF.ext is truncated".into()))?
+        .try_into()
+        .expect("four-byte slice");
+    Ok(match endian {
+        Endian::Little => u32::from_le_bytes(value),
+        Endian::Big => u32::from_be_bytes(value),
+    })
+}
+
+fn write_ext_u32(bytes: &mut [u8], offset: usize, value: u32, endian: Endian) -> Result<()> {
+    let target = bytes
+        .get_mut(offset..offset.saturating_add(4))
+        .ok_or_else(|| Error::Btf(".BTF.ext record is truncated".into()))?;
+    let encoded = match endian {
+        Endian::Little => value.to_le_bytes(),
+        Endian::Big => value.to_be_bytes(),
+    };
+    target.copy_from_slice(&encoded);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object::write::{
+        Object as WriteObject, Relocation, StandardSection, Symbol, SymbolSection,
+    };
+    use object::{
+        Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
+        SymbolKind, SymbolScope,
+    };
+
+    fn instruction_bytes(instructions: &[Instruction]) -> Vec<u8> {
+        instructions
+            .iter()
+            .flat_map(|instruction| {
+                [
+                    instruction.code,
+                    instruction.destination() | (instruction.source() << 4),
+                    instruction.offset.to_ne_bytes()[0],
+                    instruction.offset.to_ne_bytes()[1],
+                    instruction.immediate.to_ne_bytes()[0],
+                    instruction.immediate.to_ne_bytes()[1],
+                    instruction.immediate.to_ne_bytes()[2],
+                    instruction.immediate.to_ne_bytes()[3],
+                ]
+            })
+            .collect()
+    }
+
+    fn legacy_object_fixture(with_subprogram: bool) -> Vec<u8> {
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let program_section = object.add_section(
+            Vec::new(),
+            b"raw_tracepoint/sys_enter".to_vec(),
+            SectionKind::Text,
+        );
+        let mut program = vec![
+            Instruction::new(BPF_LD_IMM_DW, 1, 0, 0, 0),
+            Instruction::default(),
+            Instruction::new(0x95, 0, 0, 0, 0),
+        ];
+        if with_subprogram {
+            program = vec![
+                Instruction::new(0x85, 0, 0, 0, 0),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ];
+        }
+        object.append_section_data(program_section, &instruction_bytes(&program), 8);
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: (program.len() * Instruction::SIZE) as u64,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(program_section),
+            flags: SymbolFlags::None,
+        });
+
+        let maps = object.add_section(Vec::new(), b".maps".to_vec(), SectionKind::Data);
+        let mut definition = Vec::new();
+        definition.extend(1_u32.to_le_bytes()); // hash
+        definition.extend(4_u32.to_le_bytes());
+        definition.extend(8_u32.to_le_bytes());
+        definition.extend(16_u32.to_le_bytes());
+        definition.extend(0_u32.to_le_bytes());
+        object.append_section_data(maps, &definition, 8);
+        let map_symbol = object.add_symbol(Symbol {
+            name: b"counts".to_vec(),
+            value: 0,
+            size: definition.len() as u64,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(maps),
+            flags: SymbolFlags::None,
+        });
+
+        if with_subprogram {
+            let text = object.section_id(StandardSection::Text);
+            object.append_section_data(
+                text,
+                &instruction_bytes(&[
+                    Instruction::new(0xb7, 0, 0, 0, 7),
+                    Instruction::new(0x95, 0, 0, 0, 0),
+                ]),
+                8,
+            );
+            let subprogram = object.add_symbol(Symbol {
+                name: b"subprogram".to_vec(),
+                value: 0,
+                size: 16,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Section(text),
+                flags: SymbolFlags::None,
+            });
+            object
+                .add_relocation(
+                    program_section,
+                    Relocation {
+                        offset: 0,
+                        symbol: subprogram,
+                        addend: 0,
+                        flags: RelocationFlags::Elf {
+                            r_type: R_BPF_64_32,
+                        },
+                    },
+                )
+                .unwrap();
+        } else {
+            object
+                .add_relocation(
+                    program_section,
+                    Relocation {
+                        offset: 0,
+                        symbol: map_symbol,
+                        addend: 0,
+                        flags: RelocationFlags::Elf {
+                            r_type: R_BPF_64_64,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        let license = object.add_section(Vec::new(), b"license".to_vec(), SectionKind::Data);
+        object.append_section_data(license, b"Dual BSD/GPL\0", 1);
+        object.write().unwrap()
+    }
+
+    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend(value.to_le_bytes());
+    }
+
+    fn btf_object_fixture() -> Vec<u8> {
+        let mut strings = vec![0];
+        let mut add_string = |value: &str| {
+            let offset = strings.len() as u32;
+            strings.extend(value.as_bytes());
+            strings.push(0);
+            offset
+        };
+        let u32_name = add_string("u32");
+        let u64_name = add_string("u64");
+        let type_name = add_string("type");
+        let max_entries_name = add_string("max_entries");
+        let key_name = add_string("key");
+        let value_name = add_string("value");
+        let counts_name = add_string("counts");
+        let maps_name = add_string(".maps");
+        let context_name = add_string("ctx");
+        let entry_name = add_string("entry");
+        let section_name = add_string("raw_tracepoint/sys_enter");
+
+        let mut types = Vec::new();
+        // 1: u32
+        push_u32(&mut types, u32_name);
+        push_u32(&mut types, 1 << 24);
+        push_u32(&mut types, 4);
+        push_u32(&mut types, 32);
+        // 2: [u32; 1], 3: pointer (map type = HASH)
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 3 << 24);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 2);
+        // 4: [u32; 16], 5: pointer (max entries)
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 3 << 24);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 16);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 4);
+        // 6: *u32 (key)
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 1);
+        // 7: u64, 8: *u64 (value)
+        push_u32(&mut types, u64_name);
+        push_u32(&mut types, 1 << 24);
+        push_u32(&mut types, 8);
+        push_u32(&mut types, 64);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 7);
+        // 9: anonymous map definition struct.
+        push_u32(&mut types, 0);
+        push_u32(&mut types, (4 << 24) | 4);
+        push_u32(&mut types, 32);
+        for (name, ty, offset) in [
+            (type_name, 3, 0),
+            (max_entries_name, 5, 64),
+            (key_name, 6, 128),
+            (value_name, 8, 192),
+        ] {
+            push_u32(&mut types, name);
+            push_u32(&mut types, ty);
+            push_u32(&mut types, offset);
+        }
+        // 10: counts variable, 11: .maps data section.
+        push_u32(&mut types, counts_name);
+        push_u32(&mut types, 14 << 24);
+        push_u32(&mut types, 9);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, maps_name);
+        push_u32(&mut types, (15 << 24) | 1);
+        push_u32(&mut types, 32);
+        push_u32(&mut types, 10);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 32);
+        // 12: void pointer, 13: int (void *) prototype, 14: entry function.
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 2 << 24);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, 0);
+        push_u32(&mut types, (13 << 24) | 1);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, context_name);
+        push_u32(&mut types, 12);
+        push_u32(&mut types, entry_name);
+        push_u32(&mut types, (12 << 24) | 1);
+        push_u32(&mut types, 13);
+
+        let mut btf = Vec::new();
+        btf.extend(0xeb9f_u16.to_le_bytes());
+        btf.extend([1, 0]);
+        push_u32(&mut btf, 24);
+        push_u32(&mut btf, 0);
+        push_u32(&mut btf, types.len() as u32);
+        push_u32(&mut btf, types.len() as u32);
+        push_u32(&mut btf, strings.len() as u32);
+        btf.extend(types);
+        btf.extend(strings);
+
+        let mut btf_ext = Vec::new();
+        btf_ext.extend(0xeb9f_u16.to_le_bytes());
+        btf_ext.extend([1, 0]);
+        push_u32(&mut btf_ext, 32);
+        push_u32(&mut btf_ext, 0);
+        push_u32(&mut btf_ext, 20);
+        push_u32(&mut btf_ext, 20);
+        push_u32(&mut btf_ext, 0);
+        push_u32(&mut btf_ext, 20);
+        push_u32(&mut btf_ext, 0);
+        push_u32(&mut btf_ext, 8);
+        push_u32(&mut btf_ext, section_name);
+        push_u32(&mut btf_ext, 1);
+        push_u32(&mut btf_ext, 0);
+        push_u32(&mut btf_ext, 14);
+
+        let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
+        let program = object.add_section(
+            Vec::new(),
+            b"raw_tracepoint/sys_enter".to_vec(),
+            SectionKind::Text,
+        );
+        object.append_section_data(
+            program,
+            &instruction_bytes(&[Instruction::new(0x95, 0, 0, 0, 0)]),
+            8,
+        );
+        object.add_symbol(Symbol {
+            name: b"entry".to_vec(),
+            value: 0,
+            size: 8,
+            kind: SymbolKind::Text,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(program),
+            flags: SymbolFlags::None,
+        });
+        let maps = object.add_section(Vec::new(), b".maps".to_vec(), SectionKind::Data);
+        object.append_section_data(maps, &[0; 32], 8);
+        object.add_symbol(Symbol {
+            name: b"counts".to_vec(),
+            value: 0,
+            size: 32,
+            kind: SymbolKind::Data,
+            scope: SymbolScope::Linkage,
+            weak: false,
+            section: SymbolSection::Section(maps),
+            flags: SymbolFlags::None,
+        });
+        let btf_section =
+            object.add_section(Vec::new(), b".BTF".to_vec(), SectionKind::ReadOnlyData);
+        object.append_section_data(btf_section, &btf, 4);
+        let ext_section =
+            object.add_section(Vec::new(), b".BTF.ext".to_vec(), SectionKind::ReadOnlyData);
+        object.append_section_data(ext_section, &btf_ext, 4);
+        object.write().unwrap()
+    }
+
+    #[test]
+    fn sanitizes_section_names_for_fallback_program_names() {
+        assert_eq!(
+            sanitize_name("tracepoint/syscalls/open"),
+            "tracepoint_syscalls_open"
+        );
+    }
+
+    #[test]
+    fn nul_termination_is_idempotent() {
+        assert_eq!(nul_terminated(b"GPL"), b"GPL\0");
+        assert_eq!(nul_terminated(b"GPL\0"), b"GPL\0");
+    }
+
+    #[test]
+    fn rejects_non_elf_input() {
+        assert!(Object::parse(b"not an ELF").is_err());
+    }
+
+    #[test]
+    fn parses_legacy_map_and_records_map_relocation() {
+        let object = Object::parse_named("fixture", &legacy_object_fixture(false)).unwrap();
+        let map = object.map("counts").unwrap();
+        assert_eq!(map.map_type(), MapType::Hash);
+        assert_eq!(map.key_size(), 4);
+        assert_eq!(map.value_size(), 8);
+        assert_eq!(map.max_entries(), 16);
+        assert_eq!(object.license(), "Dual BSD/GPL");
+        assert_eq!(object.map_relocations.len(), 1);
+        assert_eq!(object.map_relocations[0].map, "counts");
+        assert_eq!(object.program("entry").unwrap().instructions().len(), 3);
+    }
+
+    #[test]
+    fn links_text_subprogram_and_patches_relative_call() {
+        let object = Object::parse(&legacy_object_fixture(true)).unwrap();
+        let instructions = object.program("entry").unwrap().instructions();
+        assert_eq!(instructions.len(), 4);
+        assert_eq!(instructions[0].source(), BPF_PSEUDO_CALL);
+        assert_eq!(instructions[0].immediate, 1);
+        assert_eq!(instructions[2].immediate, 7);
+    }
+
+    #[test]
+    fn parses_btf_map_definitions_and_function_info() {
+        let object = Object::parse(&btf_object_fixture()).unwrap();
+        assert_eq!(object.btf().unwrap().len(), 14);
+        let map = object.map("counts").unwrap();
+        assert_eq!(map.map_type(), MapType::Hash);
+        assert_eq!(map.max_entries(), 16);
+        assert_eq!(map.btf_key_type(), TypeId(1));
+        assert_eq!(map.btf_value_type(), TypeId(7));
+
+        let program = object.program("entry").unwrap();
+        assert_eq!(program.func_info_record_size, 8);
+        assert_eq!(program.func_info.len(), 8);
+        assert_eq!(
+            u32::from_le_bytes(program.func_info[4..8].try_into().unwrap()),
+            14
+        );
+    }
+}
