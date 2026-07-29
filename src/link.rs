@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::sys;
-use crate::{Error, Program, Result};
+use crate::{Error, Map, MapType, Program, Result, UpdateMode};
 
 /// A Linux eBPF attachment type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -598,6 +598,40 @@ impl Link {
         .map_err(|source| Error::system("update eBPF link program", source))
     }
 
+    /// Replaces the struct-ops map backing this kernel link.
+    pub fn update_struct_ops(&self, map: &Map) -> Result<()> {
+        if map.spec().map_type() != MapType::StructOps {
+            return Err(Error::InvalidObject(format!(
+                "map `{}` is not a struct_ops map",
+                map.name()
+            )));
+        }
+        let fd = match &self.fd {
+            LinkFd::Bpf(fd) => fd,
+            _ => {
+                return Err(Error::Unsupported(
+                    "only a kernel struct_ops link can swap its backing map".into(),
+                ));
+            }
+        };
+        if self.info()?.link_type != LinkType::StructOps {
+            return Err(Error::InvalidObject("link is not a struct_ops link".into()));
+        }
+        let value = map.spec().initial_value().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "struct_ops map `{}` has no prepared implementation value",
+                map.name()
+            ))
+        })?;
+        match map.update(&0_u32.to_ne_bytes(), value, UpdateMode::Any) {
+            Ok(()) => {}
+            Err(Error::System { source, .. }) if source.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(error) => return Err(error),
+        }
+        sys::link_update_map(fd.as_raw_fd(), map.as_fd().as_raw_fd())
+            .map_err(|source| Error::system("update struct_ops link map", source))
+    }
+
     /// Reads current metadata for a kernel `bpf_link`.
     pub fn info(&self) -> Result<LinkInfo> {
         let fd = match &self.fd {
@@ -676,9 +710,11 @@ impl Link {
                 attach_type.as_raw(),
             )
             .map_err(|source| Error::system("detach legacy eBPF program", source)),
-            LinkFd::StructOpsLegacy(map) => sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes())
-                .map(drop)
-                .map_err(|source| Error::system("detach legacy struct_ops map", source)),
+            LinkFd::StructOpsLegacy(map) => {
+                sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes(), 0)
+                    .map(drop)
+                    .map_err(|source| Error::system("detach legacy struct_ops map", source))
+            }
             LinkFd::PerfEvents(_) | LinkFd::Detached => Ok(()),
         }
     }
@@ -702,7 +738,7 @@ impl Drop for Link {
                 drop(sys::perf_event_disable(event.as_raw_fd()));
             }
             LinkFd::StructOpsLegacy(map) => {
-                drop(sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes()));
+                drop(sys::map_delete(map.as_raw_fd(), &0_u32.to_ne_bytes(), 0));
             }
             LinkFd::Bpf(_) | LinkFd::PerfEvents(_) | LinkFd::Detached => {}
         }

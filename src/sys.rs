@@ -83,6 +83,7 @@ pub(crate) struct MapCreate<'a> {
     pub value_type_btf_obj_fd: Option<RawFd>,
     pub map_extra: u64,
     pub token_fd: Option<RawFd>,
+    pub exclusive_program_hash: Option<&'a [u8; 32]>,
 }
 
 #[derive(Debug)]
@@ -296,6 +297,18 @@ struct LinkCreateAttr {
     target_btf_id: u32,
     _padding: u32,
     cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct OrderedLinkCreateAttr {
+    prog_fd: u32,
+    target_fd_or_ifindex: u32,
+    attach_type: u32,
+    flags: u32,
+    relative_fd_or_id: u32,
+    _padding: u32,
+    expected_revision: u64,
 }
 
 #[repr(C)]
@@ -579,6 +592,14 @@ pub(crate) fn map_create(options: &MapCreate<'_>) -> io::Result<OwnedFd> {
         value_type_btf_obj_fd: options.value_type_btf_obj_fd.unwrap_or_default(),
         map_extra: options.map_extra,
         map_token_fd: options.token_fd.unwrap_or_default(),
+        excl_prog_hash: options
+            .exclusive_program_hash
+            .map_or(0, |hash| pointer(hash.as_ptr())),
+        excl_prog_hash_size: if options.exclusive_program_hash.is_some() {
+            32
+        } else {
+            0
+        },
         ..Default::default()
     };
     set_object_name(&mut attr.map_name, options.name);
@@ -670,6 +691,7 @@ pub(crate) fn probe_map_type(map_type: u32) -> io::Result<bool> {
             value_type_btf_obj_fd: None,
             map_extra: 0,
             token_fd: None,
+            exclusive_program_hash: None,
         }) {
             Ok(inner) => Some(inner),
             Err(_) => return Ok(false),
@@ -719,6 +741,7 @@ pub(crate) fn supports_full_range_map_value_offset(token_fd: Option<RawFd>) -> i
         value_type_btf_obj_fd: None,
         map_extra: 0,
         token_fd,
+        exclusive_program_hash: None,
     })?;
     let instructions = [
         Instruction::new(
@@ -840,10 +863,11 @@ pub(crate) fn map_update(fd: RawFd, key: &[u8], value: &[u8], flags: u64) -> io:
     command(BPF_MAP_UPDATE_ELEM, &attr).map(drop)
 }
 
-pub(crate) fn map_delete(fd: RawFd, key: &[u8]) -> io::Result<bool> {
+pub(crate) fn map_delete(fd: RawFd, key: &[u8], flags: u64) -> io::Result<bool> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
         key: slice_pointer(key),
+        flags,
         ..Default::default()
     };
     match command(BPF_MAP_DELETE_ELEM, &attr) {
@@ -871,11 +895,17 @@ pub(crate) fn map_next_key(
     }
 }
 
-pub(crate) fn map_lookup_and_delete(fd: RawFd, key: &[u8], value: &mut [u8]) -> io::Result<bool> {
+pub(crate) fn map_lookup_and_delete(
+    fd: RawFd,
+    key: &[u8],
+    value: &mut [u8],
+    flags: u64,
+) -> io::Result<bool> {
     let attr = MapElementAttr {
         map_fd: raw_fd_u32(fd)?,
         key: slice_pointer(key),
         value_or_next_key: mut_pointer(value.as_mut_ptr()),
+        flags,
         ..Default::default()
     };
     match command(BPF_MAP_LOOKUP_AND_DELETE_ELEM, &attr) {
@@ -901,6 +931,8 @@ pub(crate) struct BatchLookup<'a> {
     pub values: &'a mut [u8],
     pub count: u32,
     pub delete: bool,
+    pub element_flags: u64,
+    pub flags: u64,
 }
 
 pub(crate) struct BatchLookupResult {
@@ -916,7 +948,8 @@ pub(crate) fn map_lookup_batch(options: &mut BatchLookup<'_>) -> io::Result<Batc
         values: mut_pointer(options.values.as_mut_ptr()),
         count: options.count,
         map_fd: raw_fd_u32(options.fd)?,
-        ..Default::default()
+        element_flags: options.element_flags,
+        flags: options.flags,
     };
     let command_number = if options.delete {
         BPF_MAP_LOOKUP_AND_DELETE_BATCH
@@ -940,6 +973,7 @@ pub(crate) fn map_update_batch(
     values: &[u8],
     count: u32,
     element_flags: u64,
+    flags: u64,
 ) -> io::Result<u32> {
     let mut attr = MapBatchAttr {
         keys: pointer(keys.as_ptr()),
@@ -947,17 +981,26 @@ pub(crate) fn map_update_batch(
         count,
         map_fd: raw_fd_u32(fd)?,
         element_flags,
+        flags,
         ..Default::default()
     };
     command_mut(BPF_MAP_UPDATE_BATCH, &mut attr)?;
     Ok(attr.count)
 }
 
-pub(crate) fn map_delete_batch(fd: RawFd, keys: &[u8], count: u32) -> io::Result<u32> {
+pub(crate) fn map_delete_batch(
+    fd: RawFd,
+    keys: &[u8],
+    count: u32,
+    element_flags: u64,
+    flags: u64,
+) -> io::Result<u32> {
     let mut attr = MapBatchAttr {
         keys: pointer(keys.as_ptr()),
         count,
         map_fd: raw_fd_u32(fd)?,
+        element_flags,
+        flags,
         ..Default::default()
     };
     command_mut(BPF_MAP_DELETE_BATCH, &mut attr)?;
@@ -1488,6 +1531,26 @@ pub(crate) fn link_create(
     command_fd(BPF_LINK_CREATE, &attr)
 }
 
+pub(crate) fn ordered_link_create(
+    program_fd: RawFd,
+    target_fd_or_ifindex: u32,
+    attach_type: u32,
+    flags: u32,
+    relative_fd_or_id: u32,
+    expected_revision: u64,
+) -> io::Result<OwnedFd> {
+    let attr = OrderedLinkCreateAttr {
+        prog_fd: raw_fd_u32(program_fd)?,
+        target_fd_or_ifindex,
+        attach_type,
+        flags,
+        relative_fd_or_id,
+        expected_revision,
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
 pub(crate) fn perf_event_link_create(
     program_fd: RawFd,
     event_fd: RawFd,
@@ -1548,6 +1611,15 @@ pub(crate) fn link_update(
         new_prog_fd: raw_fd_u32(new_program_fd)?,
         flags: u32::from(old_program_fd.is_some()),
         old_prog_fd: fd_u32(old_program_fd)?,
+    };
+    command(BPF_LINK_UPDATE, &attr).map(drop)
+}
+
+pub(crate) fn link_update_map(link_fd: RawFd, new_map_fd: RawFd) -> io::Result<()> {
+    let attr = LinkUpdateAttr {
+        link_fd: raw_fd_u32(link_fd)?,
+        new_prog_fd: raw_fd_u32(new_map_fd)?,
+        ..Default::default()
     };
     command(BPF_LINK_UPDATE, &attr).map(drop)
 }

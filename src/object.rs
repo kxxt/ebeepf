@@ -17,7 +17,8 @@ use goblin::elf::{Elf, SectionHeader, Sym};
 use crate::btf::{BtfMember, BtfType, Endian};
 use crate::map::{arena_mmap_size, page_size, possible_cpu_count, MapFlags, Pinning};
 use crate::program::{
-    kind_supports_auto_attach, program_flags_from_section, ProgramKind, VerifierLog,
+    exclusive_map_hash, kind_supports_auto_attach, program_flags_from_section, ProgramKind,
+    VerifierLog,
 };
 use crate::sys::{self, MapCreate};
 use crate::usdt::UsdtManager;
@@ -665,6 +666,7 @@ impl Object {
 
         let mut maps = load_maps(
             &self.maps,
+            &self.programs,
             &self.reused_maps,
             btf_fd.as_ref(),
             &self.pin_root,
@@ -3473,6 +3475,7 @@ fn finalize_struct_ops_values(
 
 fn load_maps(
     specs: &BTreeMap<String, MapSpec>,
+    programs: &BTreeMap<String, ProgramSpec>,
     reused: &BTreeMap<String, Map>,
     btf_fd: Option<&OwnedFd>,
     pin_root: &Path,
@@ -3521,6 +3524,17 @@ fn load_maps(
                 ensure_map_compatible(spec, &map)?;
                 map
             } else {
+                let exclusive_program_hash = spec
+                    .exclusive_program
+                    .as_deref()
+                    .map(|program_name| {
+                        programs
+                            .get(program_name)
+                            .ok_or_else(|| Error::ProgramNotFound(program_name.to_owned()))
+                    })
+                    .transpose()?
+                    .map(exclusive_map_hash)
+                    .transpose()?;
                 let inner_fd = spec
                     .inner_map
                     .as_ref()
@@ -3554,6 +3568,7 @@ fn load_maps(
                             .map(|btf| btf.as_fd().as_raw_fd()),
                         map_extra: spec.map_extra,
                         token_fd,
+                        exclusive_program_hash: exclusive_program_hash.as_ref(),
                     })
                 };
                 let with_btf = accepts_btf

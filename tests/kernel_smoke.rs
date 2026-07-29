@@ -12,11 +12,13 @@ use std::process::{self, Command};
 use std::ptr;
 use std::time::Duration;
 
+use ebeepf::query::attached_programs_on_interface;
 use ebeepf::{
-    AttachType, BpfToken, Btf, BtfObject, BtfType, Error, HelperId, Instruction, LinkType, Map,
-    MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ObjectLinker,
-    ProgramType, RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook,
-    TestRunOptions, TypeId, UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
+    AttachAnchor, AttachOrder, AttachType, BpfToken, Btf, BtfObject, BtfType, Error, HelperId,
+    Instruction, LinkType, Map, MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut,
+    Object, ObjectLinker, OrderedLinkOptions, ProgramType, RingBuffer, SkeletonBuilder,
+    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, TypeId, UpdateMode, UsdtOptions, Xdp,
+    XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
@@ -197,9 +199,12 @@ fn make_loadable_object(include_btf: bool) -> Vec<u8> {
 
 fn networking_object() -> Vec<u8> {
     let mut object = WriteObject::new(BinaryFormat::Elf, Architecture::Bpf, Endianness::Little);
-    for (section_name, program_name, return_value) in
-        [("xdp", "pass_xdp", 2_i32), ("classifier", "pass_tc", 0_i32)]
-    {
+    for (section_name, program_name, return_value) in [
+        ("xdp", "pass_xdp", 2_i32),
+        ("classifier", "pass_tc", 0_i32),
+        ("tcx/ingress", "pass_tcx", 0_i32),
+        ("tcx/ingress", "pass_tcx_second", 0_i32),
+    ] {
         let section = object.add_section(
             Vec::new(),
             section_name.as_bytes().to_vec(),
@@ -956,7 +961,11 @@ fn loads_program_and_exercises_map_crud() {
         0xfeed_face_cafe_beef_u64.to_ne_bytes()
     );
 
-    let object = Object::parse_named("kernel-smoke", &loadable_object()).unwrap();
+    let mut object = Object::parse_named("kernel-smoke", &loadable_object()).unwrap();
+    object
+        .map_mut("values")
+        .unwrap()
+        .set_exclusive_program("drop_packet");
     let loaded = object.load().unwrap();
     let map = loaded.map("values").unwrap();
 
@@ -1052,6 +1061,36 @@ fn manages_legacy_xdp_and_tc_attachments() {
     );
     filter.detach().unwrap();
     hook.destroy_clsact().unwrap();
+
+    let tcx_program = loaded.program("pass_tcx").unwrap();
+    let first = tcx_program
+        .attach_tcx(xdp.interface_index(), AttachType::TcxIngress, 0)
+        .unwrap();
+    let first_id = first.info().unwrap().id;
+    let revision = attached_programs_on_interface(xdp.interface_index(), AttachType::TcxIngress)
+        .unwrap()
+        .revision;
+    let second = loaded
+        .program("pass_tcx_second")
+        .unwrap()
+        .attach_tcx_with_options(
+            xdp.interface_index(),
+            AttachType::TcxIngress,
+            OrderedLinkOptions::new()
+                .order(AttachOrder::Before(AttachAnchor::Link(&first)))
+                .expected_revision(revision),
+        )
+        .unwrap();
+    let attachments =
+        attached_programs_on_interface(xdp.interface_index(), AttachType::TcxIngress).unwrap();
+    assert_eq!(
+        attachments
+            .programs
+            .iter()
+            .map(|attachment| attachment.link_id)
+            .collect::<Vec<_>>(),
+        [second.info().unwrap().id, first_id]
+    );
 }
 
 #[test]
@@ -1160,6 +1199,13 @@ fn loads_and_attaches_elf_struct_ops() {
     let info = link.info().unwrap();
     assert_eq!(info.link_type, LinkType::StructOps);
     assert_eq!(info.map_id, Some(map.info().unwrap().id));
+    let replacement = Object::open(&object).unwrap().load().unwrap();
+    let replacement_map = replacement.map("ebeepf_ca").unwrap();
+    link.update_struct_ops(replacement_map).unwrap();
+    assert_eq!(
+        link.info().unwrap().map_id,
+        Some(replacement_map.info().unwrap().id)
+    );
     let legacy_link = loaded
         .map("ebeepf_legacy_ca")
         .unwrap()

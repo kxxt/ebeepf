@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use bitflags::bitflags;
 
+use crate::program::exclusive_map_hash;
 use crate::sys;
-use crate::{BpfToken, Error, Link, Result, TypeId};
+use crate::{BpfToken, Error, Link, ProgramSpec, Result, TypeId};
 
 bitflags! {
     /// Flags controlling map creation and access.
@@ -56,6 +57,16 @@ bitflags! {
         const NO_ARENA_USER_POINTER_CONVERSION = 1 << 18;
         /// Allow ring-buffer overwrite mode.
         const RING_BUFFER_OVERWRITE = 1 << 19;
+    }
+}
+
+bitflags! {
+    /// Flags controlling access to individual map elements.
+    #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+    pub struct MapElementFlags: u64 {
+        /// Copy or update a value containing a `bpf_spin_lock` while holding
+        /// the lock, without exposing the lock bytes to user space.
+        const LOCK = 1 << 2;
     }
 }
 
@@ -295,6 +306,7 @@ pub struct MapSpec {
     pub(crate) btf_key_type: TypeId,
     pub(crate) btf_value_type: TypeId,
     pub(crate) inner_map: Option<String>,
+    pub(crate) exclusive_program: Option<String>,
     pub(crate) autocreate: bool,
     pub(crate) auto_attach: bool,
     pub(crate) initial_value: Option<Vec<u8>>,
@@ -326,6 +338,7 @@ impl MapSpec {
             btf_key_type: TypeId::VOID,
             btf_value_type: TypeId::VOID,
             inner_map: None,
+            exclusive_program: None,
             autocreate: true,
             auto_attach: false,
             initial_value: None,
@@ -429,6 +442,11 @@ impl MapSpec {
         self.inner_map.as_deref()
     }
 
+    /// Program whose instruction identity has exclusive access to this map.
+    pub fn exclusive_program(&self) -> Option<&str> {
+        self.exclusive_program.as_deref()
+    }
+
     /// Whether object loading creates or reuses this map.
     pub const fn autocreate(&self) -> bool {
         self.autocreate
@@ -511,6 +529,18 @@ impl MapSpec {
     /// Names the map whose descriptor should be used as the inner-map template.
     pub fn set_inner_map(&mut self, name: Option<impl Into<String>>) -> &mut Self {
         self.inner_map = name.map(Into::into);
+        self
+    }
+
+    /// Restricts this map to one program from the same object.
+    pub fn set_exclusive_program(&mut self, name: impl Into<String>) -> &mut Self {
+        self.exclusive_program = Some(name.into());
+        self
+    }
+
+    /// Removes a previously configured exclusive program.
+    pub fn clear_exclusive_program(&mut self) -> &mut Self {
+        self.exclusive_program = None;
         self
     }
 
@@ -656,6 +686,37 @@ impl UpdateMode {
     }
 }
 
+/// Options shared by map batch syscalls.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MapBatchOptions {
+    /// Per-element access flags.
+    pub element_flags: MapElementFlags,
+    /// Command-level flags reserved by the kernel for current or future use.
+    pub flags: u64,
+}
+
+impl MapBatchOptions {
+    /// Creates zeroed batch options.
+    pub const fn new() -> Self {
+        Self {
+            element_flags: MapElementFlags::empty(),
+            flags: 0,
+        }
+    }
+
+    /// Sets per-element access flags.
+    pub const fn with_element_flags(mut self, flags: MapElementFlags) -> Self {
+        self.element_flags = flags;
+        self
+    }
+
+    /// Sets command-level kernel flags.
+    pub const fn with_flags(mut self, flags: u64) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
 /// Kernel metadata for a loaded map.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MapInfo {
@@ -709,6 +770,7 @@ pub struct MapBatch {
 pub struct MapCreateOptions<'a> {
     inner_map: Option<&'a Map>,
     token: Option<&'a BpfToken>,
+    exclusive_program: Option<&'a ProgramSpec>,
 }
 
 impl<'a> MapCreateOptions<'a> {
@@ -721,6 +783,12 @@ impl<'a> MapCreateOptions<'a> {
     /// Uses a delegated BPF token for map creation.
     pub const fn token(mut self, token: &'a BpfToken) -> Self {
         self.token = Some(token);
+        self
+    }
+
+    /// Restricts the map to the instruction identity of `program`.
+    pub const fn exclusive_program(mut self, program: &'a ProgramSpec) -> Self {
+        self.exclusive_program = Some(program);
         self
     }
 }
@@ -834,7 +902,29 @@ impl Map {
             spec.max_entries = u32::try_from(possible_cpu_count()?)
                 .map_err(|_| Error::InvalidObject("possible CPU count does not fit u32".into()))?;
         }
+        if let Some(program) = options.exclusive_program {
+            if spec
+                .exclusive_program
+                .as_deref()
+                .is_some_and(|name| name != program.name())
+            {
+                return Err(Error::InvalidObject(format!(
+                    "map `{}` names a different exclusive program",
+                    spec.name
+                )));
+            }
+            spec.exclusive_program = Some(program.name().to_owned());
+        } else if spec.exclusive_program.is_some() {
+            return Err(Error::InvalidObject(format!(
+                "standalone map `{}` requires MapCreateOptions::exclusive_program",
+                spec.name
+            )));
+        }
         spec.validate()?;
+        let exclusive_program_hash = options
+            .exclusive_program
+            .map(exclusive_map_hash)
+            .transpose()?;
         let fd = sys::map_create(&sys::MapCreate {
             map_type: spec.map_type.as_raw(),
             name: &spec.name,
@@ -851,6 +941,7 @@ impl Map {
             value_type_btf_obj_fd: None,
             map_extra: spec.map_extra,
             token_fd: options.token.map(|token| token.as_fd().as_raw_fd()),
+            exclusive_program_hash: exclusive_program_hash.as_ref(),
         })
         .map_err(|source| Error::MapCreate {
             map: spec.name.clone(),
@@ -1031,19 +1122,40 @@ impl Map {
 
     /// Looks up a key, returning `None` when it is absent.
     pub fn lookup(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.lookup_with_flags(key, MapElementFlags::empty())
+    }
+
+    /// Looks up a key with element access flags.
+    pub fn lookup_with_flags(&self, key: &[u8], flags: MapElementFlags) -> Result<Option<Vec<u8>>> {
         self.validate_key(key)?;
         let mut value = vec![0; self.storage_value_size()?];
-        let found = sys::map_lookup(self.fd.as_raw_fd(), key, &mut value, 0)
+        let found = sys::map_lookup(self.fd.as_raw_fd(), key, &mut value, flags.bits())
             .map_err(|source| Error::system("look up map element", source))?;
         Ok(found.then_some(value))
     }
 
     /// Inserts or updates a key/value pair.
     pub fn update(&self, key: &[u8], value: &[u8], mode: UpdateMode) -> Result<()> {
+        self.update_with_flags(key, value, mode, MapElementFlags::empty())
+    }
+
+    /// Inserts or updates a key/value pair with element access flags.
+    pub fn update_with_flags(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        mode: UpdateMode,
+        flags: MapElementFlags,
+    ) -> Result<()> {
         self.validate_key(key)?;
         self.validate_value(value)?;
-        sys::map_update(self.fd.as_raw_fd(), key, value, mode.as_raw())
-            .map_err(|source| Error::system("update map element", source))
+        sys::map_update(
+            self.fd.as_raw_fd(),
+            key,
+            value,
+            mode.as_raw() | flags.bits(),
+        )
+        .map_err(|source| Error::system("update map element", source))
     }
 
     /// Stores a file descriptor in a program, perf-event, cgroup, or map array.
@@ -1054,16 +1166,30 @@ impl Map {
 
     /// Deletes a key. Returns whether it existed.
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
+        self.delete_with_flags(key, MapElementFlags::empty())
+    }
+
+    /// Deletes a key with element access flags.
+    pub fn delete_with_flags(&self, key: &[u8], flags: MapElementFlags) -> Result<bool> {
         self.validate_key(key)?;
-        sys::map_delete(self.fd.as_raw_fd(), key)
+        sys::map_delete(self.fd.as_raw_fd(), key, flags.bits())
             .map_err(|source| Error::system("delete map element", source))
     }
 
     /// Looks up and atomically deletes a key.
     pub fn lookup_and_delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.lookup_and_delete_with_flags(key, MapElementFlags::empty())
+    }
+
+    /// Looks up and atomically deletes a key with element access flags.
+    pub fn lookup_and_delete_with_flags(
+        &self,
+        key: &[u8],
+        flags: MapElementFlags,
+    ) -> Result<Option<Vec<u8>>> {
         self.validate_key(key)?;
         let mut value = vec![0; self.storage_value_size()?];
-        let found = sys::map_lookup_and_delete(self.fd.as_raw_fd(), key, &mut value)
+        let found = sys::map_lookup_and_delete(self.fd.as_raw_fd(), key, &mut value, flags.bits())
             .map_err(|source| Error::system("look up and delete map element", source))?;
         Ok(found.then_some(value))
     }
@@ -1200,7 +1326,17 @@ impl Map {
         cursor: Option<&BatchCursor>,
         maximum_count: u32,
     ) -> Result<MapBatch> {
-        self.lookup_batch_impl(cursor, maximum_count, false)
+        self.lookup_batch_with_options(cursor, maximum_count, MapBatchOptions::default())
+    }
+
+    /// Looks up a batch with element and command flags.
+    pub fn lookup_batch_with_options(
+        &self,
+        cursor: Option<&BatchCursor>,
+        maximum_count: u32,
+        options: MapBatchOptions,
+    ) -> Result<MapBatch> {
+        self.lookup_batch_impl(cursor, maximum_count, false, options)
     }
 
     /// Looks up and atomically deletes up to `maximum_count` entries.
@@ -1209,13 +1345,33 @@ impl Map {
         cursor: Option<&BatchCursor>,
         maximum_count: u32,
     ) -> Result<MapBatch> {
-        self.lookup_batch_impl(cursor, maximum_count, true)
+        self.lookup_and_delete_batch_with_options(cursor, maximum_count, MapBatchOptions::default())
+    }
+
+    /// Looks up and deletes a batch with element and command flags.
+    pub fn lookup_and_delete_batch_with_options(
+        &self,
+        cursor: Option<&BatchCursor>,
+        maximum_count: u32,
+        options: MapBatchOptions,
+    ) -> Result<MapBatch> {
+        self.lookup_batch_impl(cursor, maximum_count, true, options)
     }
 
     /// Updates a group of entries in one syscall.
     ///
     /// Returns the number of entries processed by the kernel.
     pub fn update_batch(&self, entries: &[(&[u8], &[u8])], mode: UpdateMode) -> Result<u32> {
+        self.update_batch_with_options(entries, mode, MapBatchOptions::default())
+    }
+
+    /// Updates a group of entries with element and command flags.
+    pub fn update_batch_with_options(
+        &self,
+        entries: &[(&[u8], &[u8])],
+        mode: UpdateMode,
+        options: MapBatchOptions,
+    ) -> Result<u32> {
         let count = u32::try_from(entries.len()).map_err(|_| {
             Error::InvalidObject("batch contains more than u32::MAX entries".into())
         })?;
@@ -1246,14 +1402,30 @@ impl Map {
             keys.extend_from_slice(key);
             values.extend_from_slice(value);
         }
-        sys::map_update_batch(self.fd.as_raw_fd(), &keys, &values, count, mode.as_raw())
-            .map_err(|source| Error::system("batch-update map elements", source))
+        sys::map_update_batch(
+            self.fd.as_raw_fd(),
+            &keys,
+            &values,
+            count,
+            mode.as_raw() | options.element_flags.bits(),
+            options.flags,
+        )
+        .map_err(|source| Error::system("batch-update map elements", source))
     }
 
     /// Deletes a group of keys in one syscall.
     ///
     /// Returns the number of keys processed by the kernel.
     pub fn delete_batch(&self, keys: &[&[u8]]) -> Result<u32> {
+        self.delete_batch_with_options(keys, MapBatchOptions::default())
+    }
+
+    /// Deletes a group of keys with element and command flags.
+    pub fn delete_batch_with_options(
+        &self,
+        keys: &[&[u8]],
+        options: MapBatchOptions,
+    ) -> Result<u32> {
         let count = u32::try_from(keys.len())
             .map_err(|_| Error::InvalidObject("batch contains more than u32::MAX keys".into()))?;
         if keys.is_empty() {
@@ -1275,8 +1447,14 @@ impl Map {
             self.validate_key(key)?;
             flattened.extend_from_slice(key);
         }
-        sys::map_delete_batch(self.fd.as_raw_fd(), &flattened, count)
-            .map_err(|source| Error::system("batch-delete map elements", source))
+        sys::map_delete_batch(
+            self.fd.as_raw_fd(),
+            &flattened,
+            count,
+            options.element_flags.bits(),
+            options.flags,
+        )
+        .map_err(|source| Error::system("batch-delete map elements", source))
     }
 
     fn lookup_batch_impl(
@@ -1284,6 +1462,7 @@ impl Map {
         cursor: Option<&BatchCursor>,
         maximum_count: u32,
         delete: bool,
+        options: MapBatchOptions,
     ) -> Result<MapBatch> {
         if maximum_count == 0 {
             return Err(Error::InvalidObject(
@@ -1330,6 +1509,8 @@ impl Map {
             values: &mut values,
             count: maximum_count,
             delete,
+            element_flags: options.element_flags.bits(),
+            flags: options.flags,
         })
         .map_err(|source| Error::system("batch-lookup map elements", source))?;
         let actual = result.count as usize;

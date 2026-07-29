@@ -77,12 +77,42 @@ impl RingBuffer {
     ///
     /// Discarded samples are advanced past but are not passed to the callback.
     /// Returns the number of delivered samples.
-    pub fn consume(&mut self, mut callback: impl FnMut(&[u8])) -> Result<usize> {
+    pub fn consume(&mut self, callback: impl FnMut(&[u8])) -> Result<usize> {
+        self.consume_up_to(usize::MAX, callback)
+    }
+
+    /// Consumes at most `maximum` delivered samples without waiting.
+    ///
+    /// Discarded records are advanced past but do not count toward the limit.
+    pub fn consume_up_to(
+        &mut self,
+        maximum: usize,
+        mut callback: impl FnMut(&[u8]),
+    ) -> Result<usize> {
         let mut count = 0;
         for ring in &mut self.rings {
-            count += ring.consume(&mut callback)?;
+            let remaining = maximum.saturating_sub(count);
+            if remaining == 0 {
+                break;
+            }
+            count += ring.consume(&mut callback, remaining)?;
         }
         Ok(count)
+    }
+
+    /// Number of mapped ring-buffer maps.
+    pub fn len(&self) -> usize {
+        self.rings.len()
+    }
+
+    /// Whether no ring-buffer maps are configured.
+    pub fn is_empty(&self) -> bool {
+        self.rings.is_empty()
+    }
+
+    /// Iterates over the maps backing this consumer.
+    pub fn maps(&self) -> impl ExactSizeIterator<Item = &Map> {
+        self.rings.iter().map(|ring| &ring.map)
     }
 
     /// Waits for data and consumes all currently available samples.
@@ -179,14 +209,14 @@ impl MappedRing {
         })
     }
 
-    fn consume(&mut self, callback: &mut impl FnMut(&[u8])) -> Result<usize> {
+    fn consume(&mut self, callback: &mut impl FnMut(&[u8]), maximum: usize) -> Result<usize> {
         let consumer_position = self.consumer.atomic_u64(0)?;
         let producer_position = self.producer.atomic_u64(0)?;
         let mut consumer = consumer_position.load(Ordering::Relaxed);
         let producer = producer_position.load(Ordering::Acquire);
         let mut count = 0;
 
-        while consumer < producer {
+        while consumer < producer && count < maximum {
             let offset = usize::try_from(consumer & (self.capacity as u64 - 1))
                 .map_err(|_| Error::InvalidObject("ring position does not fit usize".into()))?;
             let header_offset = self

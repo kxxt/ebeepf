@@ -108,8 +108,8 @@ The crate currently provides:
   map/program/link/BTF metadata, attachment queries, verifier logs, program
   test runs, standard `Read` access to program output streams, type-accurate
   map/program/helper capability probes, map CRUD and batch operations, per-CPU
-  values, and dynamically resized hash maps with checked initial-capacity
-  hints;
+  values, spin-lock-aware element access, exclusive-program map identities,
+  and dynamically resized hash maps with checked initial-capacity hints;
 - delegated BPF tokens across BTF, map, and program loading, including token
   capability metadata and retained authorization for later BTF lookup;
 - vmlinux and kernel-module split-BTF parsing, owned module BTF lookup, and
@@ -119,16 +119,18 @@ The crate currently provides:
 - ELF-defined `.struct_ops` and `.struct_ops.link` implementations, including
   callback relocations, kernel-BTF wrapper layout translation, vmlinux and
   module-owned value-type metadata, modern link and legacy registration
-  lifetimes, and transactional skeleton auto-attachment;
+  lifetimes, live backing-map replacement, and transactional skeleton
+  auto-attachment;
 - safe mmapable array and arena views using volatile snapshots/writes instead
   of aliasable shared-memory slices and non-replacing fixed mappings; generated
   skeletons retain these mappings and expose live typed `.bss`, `.data`,
   `.rodata`, and address-space global accessors;
-- tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netfilter,
-  socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, multi-function
-  BTF tracing, USDT,
+- tracepoint, kprobe, uprobe, raw tracepoint, cgroup, XDP, TCX, netkit,
+  netfilter, socket, perf-event, BTF-based, multi-kprobe, multi-uprobe,
+  multi-function BTF tracing, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with
-  RAII link lifetimes;
+  RAII link lifetimes, including before/after anchors and optimistic hook
+  revision checks for ordered cgroup and device links;
 - descriptor-targeted links for cgroups, network namespaces, and socket maps,
   plus correctly laid-out perf-event cookies and retained perf-event
   lifetimes;

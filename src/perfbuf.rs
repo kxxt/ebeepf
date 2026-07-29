@@ -1,7 +1,7 @@
 use std::io;
 use std::mem;
 use std::num::NonZeroUsize;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::ptr::{self, NonNull};
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -123,6 +123,45 @@ impl PerfBuffer {
             count += buffer.consume(&mut callback)?;
         }
         Ok(count)
+    }
+
+    /// Consumes records currently available for one CPU.
+    pub fn consume_cpu(
+        &mut self,
+        cpu: u32,
+        mut callback: impl FnMut(PerfEvent<'_>),
+    ) -> Result<usize> {
+        let buffer = self
+            .buffers
+            .iter_mut()
+            .find(|buffer| buffer.cpu == cpu)
+            .ok_or_else(|| {
+                Error::InvalidObject(format!("perf buffer has no event for CPU {cpu}"))
+            })?;
+        buffer.consume(&mut callback)
+    }
+
+    /// Number of per-CPU perf-event rings.
+    pub fn len(&self) -> usize {
+        self.buffers.len()
+    }
+
+    /// Whether no per-CPU rings are configured.
+    pub fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
+    }
+
+    /// Iterates over CPUs with an active perf-event ring.
+    pub fn cpus(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.buffers.iter().map(|buffer| buffer.cpu)
+    }
+
+    /// Borrows the perf-event descriptor for one CPU.
+    pub fn event_fd(&self, cpu: u32) -> Option<BorrowedFd<'_>> {
+        self.buffers
+            .iter()
+            .find(|buffer| buffer.cpu == cpu)
+            .map(|buffer| buffer.fd.as_fd())
     }
 
     /// Waits for records and consumes all currently available data.

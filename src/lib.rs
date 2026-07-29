@@ -30,23 +30,23 @@ mod usdt;
 mod user_ringbuf;
 mod xdp;
 
-pub use crate::btf::{Btf, BtfInfo, BtfKind, BtfMember, BtfObject, BtfType, TypeId};
+pub use crate::btf::{Btf, BtfEndianness, BtfInfo, BtfKind, BtfMember, BtfObject, BtfType, TypeId};
 pub use crate::error::{Error, Result};
 pub use crate::instruction::Instruction;
 pub use crate::iter::BpfIterator;
 pub use crate::link::{AttachType, Link, LinkInfo, LinkType};
 pub use crate::linker::{LinkedObject, ObjectLinker};
 pub use crate::map::{
-    BatchCursor, KeyIterator, Map, MapBatch, MapCreateOptions, MapFlags, MapInfo, MapMemory,
-    MapMemoryMut, MapSpec, MapType, Pinning, UpdateMode,
+    BatchCursor, KeyIterator, Map, MapBatch, MapBatchOptions, MapCreateOptions, MapElementFlags,
+    MapFlags, MapInfo, MapMemory, MapMemoryMut, MapSpec, MapType, Pinning, UpdateMode,
 };
 pub use crate::object::{LoadedObject, Object};
 pub use crate::perfbuf::{PerfBuffer, PerfBufferBuilder, PerfEvent};
 pub use crate::program::{
-    CgroupIteratorOrder, HelperId, IteratorOptions, KprobeMultiOptions, KprobeMultiTargets,
-    LinkOptions, Program, ProgramInfo, ProgramKind, ProgramSpec, ProgramStream, ProgramType,
-    TestRunOptions, TestRunOutput, TracingMultiOptions, TracingMultiTargets, UprobeMultiOptions,
-    UprobeMultiTargets, VerifierLog,
+    AttachAnchor, AttachOrder, CgroupIteratorOrder, HelperId, IteratorOptions, KprobeMultiOptions,
+    KprobeMultiTargets, LinkOptions, OrderedLinkOptions, Program, ProgramInfo, ProgramKind,
+    ProgramSpec, ProgramStream, ProgramType, TestRunOptions, TestRunOutput, TracingMultiOptions,
+    TracingMultiTargets, UprobeMultiOptions, UprobeMultiTargets, VerifierLog,
 };
 pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
 pub use crate::skel::{

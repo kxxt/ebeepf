@@ -65,6 +65,15 @@ pub enum BtfKind {
     Enum64,
 }
 
+/// Byte order of an encoded BTF table.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum BtfEndianness {
+    /// Least-significant byte first.
+    Little,
+    /// Most-significant byte first.
+    Big,
+}
+
 /// Integer encoding attributes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IntegerEncoding {
@@ -485,6 +494,19 @@ impl Btf {
         self.types.is_empty()
     }
 
+    /// Byte order used by the encoded table.
+    pub const fn endianness(&self) -> BtfEndianness {
+        match self.endian {
+            Endian::Little => BtfEndianness::Little,
+            Endian::Big => BtfEndianness::Big,
+        }
+    }
+
+    /// Pointer size used by eBPF BTF.
+    pub const fn pointer_size(&self) -> usize {
+        8
+    }
+
     /// Number of type IDs inherited from a split BTF base table.
     ///
     /// This is zero for standalone BTF and the vmlinux type count for kernel
@@ -553,6 +575,86 @@ impl Btf {
     /// declaration types do not have a size.
     pub fn size_of(&self, id: TypeId) -> Result<usize> {
         self.size_of_inner(id, &mut HashSet::new())
+    }
+
+    /// Computes a type's ABI alignment.
+    ///
+    /// Packed structures return an alignment of one when their member offsets
+    /// or total size violate their members' natural alignment.
+    pub fn alignment_of(&self, id: TypeId) -> Result<usize> {
+        self.alignment_of_inner(id, &mut HashSet::new())
+    }
+
+    fn alignment_of_inner(&self, id: TypeId, seen: &mut HashSet<TypeId>) -> Result<usize> {
+        if id == TypeId::VOID {
+            return Err(Error::Btf("void has no alignment".into()));
+        }
+        let id = self.resolve_type(id)?;
+        if !seen.insert(id) {
+            return Err(Error::Btf(format!(
+                "type alignment cycle at type ID {}",
+                id.0
+            )));
+        }
+        let ty = self
+            .type_by_id(id)
+            .ok_or_else(|| Error::Btf(format!("type ID {} does not exist", id.0)))?;
+        let alignment = match ty {
+            BtfType::Integer { size, .. }
+            | BtfType::Enum { size, .. }
+            | BtfType::Float { size, .. }
+            | BtfType::Enum64 { size, .. } => {
+                usize_from(*size, "type size")?.min(self.pointer_size())
+            }
+            BtfType::Pointer { .. } => self.pointer_size(),
+            BtfType::Array { element_type, .. } => self.alignment_of_inner(*element_type, seen)?,
+            BtfType::Struct { size, members, .. } | BtfType::Union { size, members, .. } => {
+                let mut maximum = 1;
+                let mut packed = false;
+                for member in members {
+                    let member_alignment = self.alignment_of_inner(member.ty, seen)?;
+                    maximum = maximum.max(member_alignment);
+                    if member.bitfield_size.is_none()
+                        && u64::from(member.bit_offset) % (8 * member_alignment as u64) != 0
+                    {
+                        packed = true;
+                    }
+                }
+                let size = usize_from(*size, "composite size")?;
+                if packed || size % maximum != 0 {
+                    1
+                } else {
+                    maximum
+                }
+            }
+            BtfType::Variable { ty, .. } => self.alignment_of_inner(*ty, seen)?,
+            BtfType::Typedef { .. }
+            | BtfType::Volatile { .. }
+            | BtfType::Const { .. }
+            | BtfType::Restrict { .. }
+            | BtfType::TypeTag { .. } => unreachable!("resolve_type strips BTF modifiers"),
+            BtfType::Forward { .. }
+            | BtfType::Function { .. }
+            | BtfType::FunctionPrototype { .. }
+            | BtfType::DataSection { .. }
+            | BtfType::DeclarationTag { .. } => {
+                return Err(Error::Btf(format!(
+                    "{:?} type ID {} has no alignment",
+                    ty.kind(),
+                    id.0
+                )));
+            }
+        };
+        seen.remove(&id);
+        if alignment == 0 {
+            Err(Error::Btf(format!(
+                "{:?} type ID {} has zero alignment",
+                ty.kind(),
+                id.0
+            )))
+        } else {
+            Ok(alignment)
+        }
     }
 
     fn size_of_inner(&self, id: TypeId, seen: &mut HashSet<TypeId>) -> Result<usize> {
@@ -1435,6 +1537,12 @@ mod tests {
         assert_eq!(btf.size_of(TypeId(2)).unwrap(), 8);
         assert_eq!(btf.size_of(TypeId(3)).unwrap(), 12);
         assert_eq!(btf.size_of(TypeId(4)).unwrap(), 16);
+        assert_eq!(btf.pointer_size(), 8);
+        assert_eq!(btf.endianness(), BtfEndianness::Little);
+        assert_eq!(btf.alignment_of(TypeId(1)).unwrap(), 4);
+        assert_eq!(btf.alignment_of(TypeId(2)).unwrap(), 8);
+        assert_eq!(btf.alignment_of(TypeId(3)).unwrap(), 4);
+        assert_eq!(btf.alignment_of(TypeId(4)).unwrap(), 4);
         assert_eq!(btf.find(BtfKind::Struct, "pair").unwrap().0, TypeId(4));
 
         let BtfType::Struct { members, .. } = btf.type_by_id(TypeId(4)).unwrap() else {
@@ -1520,6 +1628,7 @@ mod tests {
 
         let btf = Btf::parse(&bytes).unwrap();
         assert_eq!(btf.size_of(TypeId(1)).unwrap(), 1);
+        assert_eq!(btf.endianness(), BtfEndianness::Big);
     }
 
     #[test]

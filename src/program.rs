@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use goblin::elf::sym::STT_FUNC;
 use goblin::elf::Elf;
+use sha2::{Digest, Sha256};
 
 use crate::link::{AttachType, Link};
 use crate::map::{kernel_name, Map};
@@ -691,6 +692,135 @@ impl LinkOptions {
     }
 }
 
+const BPF_F_BEFORE: u32 = 1 << 3;
+const BPF_F_AFTER: u32 = 1 << 4;
+const BPF_F_ID: u32 = 1 << 5;
+const BPF_F_LINK: u32 = 1 << 13;
+const ORDERED_LINK_FLAGS: u32 = BPF_F_BEFORE | BPF_F_AFTER | BPF_F_ID | BPF_F_LINK;
+
+/// An existing attachment used to position a new ordered link.
+#[derive(Clone, Copy, Debug)]
+pub enum AttachAnchor<'target> {
+    /// A loaded program descriptor.
+    Program(&'target Program),
+    /// A kernel link descriptor.
+    Link(&'target Link),
+    /// A kernel program ID.
+    ProgramId(u32),
+    /// A kernel link ID.
+    LinkId(u32),
+}
+
+/// Position of a new program in an ordered hook.
+#[derive(Clone, Copy, Debug)]
+pub enum AttachOrder<'target> {
+    /// Insert before every existing attachment.
+    First,
+    /// Insert after every existing attachment.
+    Last,
+    /// Insert immediately before an existing program or link.
+    Before(AttachAnchor<'target>),
+    /// Insert immediately after an existing program or link.
+    After(AttachAnchor<'target>),
+}
+
+/// Options shared by ordered cgroup, TCX, and netkit links.
+///
+/// Ordering is represented with [`AttachOrder`] instead of exposing the
+/// overlapping `BPF_F_BEFORE`, `BPF_F_AFTER`, `BPF_F_ID`, and `BPF_F_LINK`
+/// flag protocol directly.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrderedLinkOptions<'target> {
+    flags: u32,
+    order: Option<AttachOrder<'target>>,
+    expected_revision: u64,
+}
+
+impl<'target> OrderedLinkOptions<'target> {
+    /// Creates options with kernel-default ordering.
+    pub const fn new() -> Self {
+        Self {
+            flags: 0,
+            order: None,
+            expected_revision: 0,
+        }
+    }
+
+    /// Sets hook-specific flags, such as cgroup multi-attach flags.
+    ///
+    /// The ordering flag bits are reserved for [`Self::order`].
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Selects the new attachment's position.
+    pub const fn order(mut self, order: AttachOrder<'target>) -> Self {
+        self.order = Some(order);
+        self
+    }
+
+    /// Requires the hook to have this revision before the link is inserted.
+    pub const fn expected_revision(mut self, revision: u64) -> Self {
+        self.expected_revision = revision;
+        self
+    }
+
+    fn encode(self) -> Result<(u32, u32, u64)> {
+        if self.flags & ORDERED_LINK_FLAGS != 0 {
+            return Err(Error::InvalidObject(
+                "ordered-link flags must be expressed through AttachOrder".into(),
+            ));
+        }
+        let Some(order) = self.order else {
+            return Ok((self.flags, 0, self.expected_revision));
+        };
+        let (mut flags, anchor) = match order {
+            AttachOrder::First => (BPF_F_BEFORE, None),
+            AttachOrder::Last => (BPF_F_AFTER, None),
+            AttachOrder::Before(anchor) => (BPF_F_BEFORE, Some(anchor)),
+            AttachOrder::After(anchor) => (BPF_F_AFTER, Some(anchor)),
+        };
+        let relative = match anchor {
+            None => 0,
+            Some(AttachAnchor::Program(program)) => u32::try_from(program.as_fd().as_raw_fd())
+                .map_err(|_| {
+                    Error::InvalidObject("relative program descriptor is negative".into())
+                })?,
+            Some(AttachAnchor::Link(link)) => {
+                flags |= BPF_F_LINK;
+                let fd = link.as_fd().ok_or_else(|| {
+                    Error::Unsupported(
+                        "relative attachment is not represented by one kernel bpf_link".into(),
+                    )
+                })?;
+                u32::try_from(fd.as_raw_fd()).map_err(|_| {
+                    Error::InvalidObject("relative link descriptor is negative".into())
+                })?
+            }
+            Some(AttachAnchor::ProgramId(id)) => {
+                if id == 0 {
+                    return Err(Error::InvalidObject(
+                        "relative program ID cannot be zero".into(),
+                    ));
+                }
+                flags |= BPF_F_ID;
+                id
+            }
+            Some(AttachAnchor::LinkId(id)) => {
+                if id == 0 {
+                    return Err(Error::InvalidObject(
+                        "relative link ID cannot be zero".into(),
+                    ));
+                }
+                flags |= BPF_F_ID | BPF_F_LINK;
+                id
+            }
+        };
+        Ok((self.flags | flags, relative, self.expected_revision))
+    }
+}
+
 pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind) -> bool {
     match kind {
         ProgramKind::Kprobe { .. }
@@ -1001,6 +1131,41 @@ impl ProgramSpec {
         }
         Ok(())
     }
+}
+
+pub(crate) fn exclusive_map_hash(program: &ProgramSpec) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut index = 0;
+    while index < program.instructions.len() {
+        let mut instruction = program.instructions[index];
+        if instruction.code == 0x18 && matches!(instruction.source(), 1 | 2) {
+            instruction.immediate = 0;
+            hasher.update(instruction.to_bytes());
+            index += 1;
+            let mut second = *program.instructions.get(index).ok_or_else(|| {
+                Error::InvalidObject(format!(
+                    "program `{}` ends inside a map-reference instruction",
+                    program.name
+                ))
+            })?;
+            if second.code != 0
+                || second.destination() != 0
+                || second.source() != 0
+                || second.offset != 0
+            {
+                return Err(Error::InvalidObject(format!(
+                    "program `{}` has a malformed map-reference instruction",
+                    program.name
+                )));
+            }
+            second.immediate = 0;
+            hasher.update(second.to_bytes());
+        } else {
+            hasher.update(instruction.to_bytes());
+        }
+        index += 1;
+    }
+    Ok(hasher.finalize().into())
 }
 
 /// Kernel metadata for a loaded program.
@@ -1939,7 +2104,19 @@ impl Program {
 
     /// Creates a cgroup link.
     pub fn attach_cgroup(&self, cgroup: impl AsFd, attach_type: AttachType) -> Result<Link> {
-        self.attach_link(cgroup, attach_type, LinkOptions::default())
+        self.attach_cgroup_with_options(cgroup, attach_type, OrderedLinkOptions::default())
+    }
+
+    /// Creates an ordered cgroup link.
+    pub fn attach_cgroup_with_options(
+        &self,
+        cgroup: impl AsFd,
+        attach_type: AttachType,
+        options: OrderedLinkOptions<'_>,
+    ) -> Result<Link> {
+        let target = u32::try_from(cgroup.as_fd().as_raw_fd())
+            .map_err(|_| Error::InvalidObject("cgroup descriptor is negative".into()))?;
+        self.attach_ordered(target, attach_type, options, "attach cgroup program")
     }
 
     /// Creates a descriptor-targeted kernel link.
@@ -2043,21 +2220,73 @@ impl Program {
         attach_type: AttachType,
         flags: u32,
     ) -> Result<Link> {
+        self.attach_tcx_with_options(
+            interface_index,
+            attach_type,
+            OrderedLinkOptions::new().with_flags(flags),
+        )
+    }
+
+    /// Creates an ordered TCX ingress or egress link on a network interface.
+    pub fn attach_tcx_with_options(
+        &self,
+        interface_index: u32,
+        attach_type: AttachType,
+        options: OrderedLinkOptions<'_>,
+    ) -> Result<Link> {
         if !matches!(attach_type, AttachType::TcxIngress | AttachType::TcxEgress) {
             return Err(Error::InvalidObject(format!(
                 "{attach_type:?} is not a TCX attachment type"
             )));
         }
-        let fd = sys::link_create(
-            self.fd.as_raw_fd(),
+        if interface_index == 0 {
+            return Err(Error::InvalidObject(
+                "TCX interface index cannot be zero".into(),
+            ));
+        }
+        self.attach_ordered(interface_index, attach_type, options, "attach TCX program")
+    }
+
+    /// Creates a netkit primary or peer link on a network interface.
+    pub fn attach_netkit(
+        &self,
+        interface_index: u32,
+        attach_type: AttachType,
+        flags: u32,
+    ) -> Result<Link> {
+        self.attach_netkit_with_options(
             interface_index,
-            attach_type.as_raw(),
-            flags,
-            0,
-            0,
+            attach_type,
+            OrderedLinkOptions::new().with_flags(flags),
         )
-        .map_err(|source| Error::system("attach TCX program", source))?;
-        Ok(Link::bpf(fd))
+    }
+
+    /// Creates an ordered netkit primary or peer link.
+    pub fn attach_netkit_with_options(
+        &self,
+        interface_index: u32,
+        attach_type: AttachType,
+        options: OrderedLinkOptions<'_>,
+    ) -> Result<Link> {
+        if !matches!(
+            attach_type,
+            AttachType::NetkitPrimary | AttachType::NetkitPeer
+        ) {
+            return Err(Error::InvalidObject(format!(
+                "{attach_type:?} is not a netkit attachment type"
+            )));
+        }
+        if interface_index == 0 {
+            return Err(Error::InvalidObject(
+                "netkit interface index cannot be zero".into(),
+            ));
+        }
+        self.attach_ordered(
+            interface_index,
+            attach_type,
+            options,
+            "attach netkit program",
+        )
     }
 
     /// Creates a netfilter link.
@@ -2076,6 +2305,26 @@ impl Program {
             flags,
         })
         .map_err(|source| Error::system("attach netfilter program", source))?;
+        Ok(Link::bpf(fd))
+    }
+
+    fn attach_ordered(
+        &self,
+        target_fd_or_ifindex: u32,
+        attach_type: AttachType,
+        options: OrderedLinkOptions<'_>,
+        operation: &'static str,
+    ) -> Result<Link> {
+        let (flags, relative, expected_revision) = options.encode()?;
+        let fd = sys::ordered_link_create(
+            self.fd.as_raw_fd(),
+            target_fd_or_ifindex,
+            attach_type.as_raw(),
+            flags,
+            relative,
+            expected_revision,
+        )
+        .map_err(|source| Error::system(operation, source))?;
         Ok(Link::bpf(fd))
     }
 
@@ -2562,5 +2811,71 @@ mod tests {
         assert_eq!(program_flags_from_section("syscall"), 1 << 4);
         assert_eq!(program_flags_from_section("xdp.frags/devmap"), 1 << 5);
         assert_eq!(program_flags_from_section("xdp"), 0);
+    }
+
+    #[test]
+    fn ordered_link_options_encode_safe_anchors() {
+        assert_eq!(
+            OrderedLinkOptions::new()
+                .order(AttachOrder::First)
+                .expected_revision(7)
+                .encode()
+                .unwrap(),
+            (BPF_F_BEFORE, 0, 7)
+        );
+        assert_eq!(
+            OrderedLinkOptions::new()
+                .order(AttachOrder::After(AttachAnchor::ProgramId(42)))
+                .encode()
+                .unwrap(),
+            (BPF_F_AFTER | BPF_F_ID, 42, 0)
+        );
+        assert_eq!(
+            OrderedLinkOptions::new()
+                .order(AttachOrder::Before(AttachAnchor::LinkId(73)))
+                .encode()
+                .unwrap(),
+            (BPF_F_BEFORE | BPF_F_ID | BPF_F_LINK, 73, 0)
+        );
+        assert!(OrderedLinkOptions::new()
+            .order(AttachOrder::After(AttachAnchor::ProgramId(0)))
+            .encode()
+            .is_err());
+        assert!(OrderedLinkOptions::new()
+            .with_flags(BPF_F_AFTER)
+            .encode()
+            .is_err());
+    }
+
+    #[test]
+    fn exclusive_map_hash_ignores_relocated_map_descriptors() {
+        let first = ProgramSpec::new(
+            "owner",
+            "socket",
+            vec![
+                Instruction::new(0x18, 1, 1, 0, 17),
+                Instruction::new(0, 0, 0, 0, 29),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ],
+        )
+        .unwrap();
+        let second = ProgramSpec::new(
+            "owner",
+            "socket",
+            vec![
+                Instruction::new(0x18, 1, 1, 0, 91),
+                Instruction::new(0, 0, 0, 0, 73),
+                Instruction::new(0x95, 0, 0, 0, 0),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            exclusive_map_hash(&first).unwrap(),
+            exclusive_map_hash(&second).unwrap()
+        );
+
+        let malformed =
+            ProgramSpec::new("owner", "socket", vec![Instruction::new(0x18, 1, 1, 0, 17)]).unwrap();
+        assert!(exclusive_map_hash(&malformed).is_err());
     }
 }
