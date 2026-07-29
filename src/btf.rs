@@ -797,6 +797,12 @@ impl BtfObject {
     }
 }
 
+impl AsFd for BtfObject {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 fn parse_type(reader: &mut Reader<'_>, strings: &[u8]) -> Result<BtfType> {
     let name_offset = reader.u32()?;
     let info = reader.u32()?;

@@ -73,6 +73,9 @@ The crate currently provides:
   socket, perf-event, BTF-based, multi-kprobe, multi-uprobe, USDT,
   `freplace`, `struct_ops`, legacy program, and iterator attachments with
   RAII link lifetimes;
+- descriptor-targeted links for cgroups, network namespaces, and socket maps,
+  plus correctly laid-out perf-event cookies and retained perf-event
+  lifetimes;
 - persistent legacy XDP and classic TC `clsact` management through a private
   pure Rust netlink transport, including mode queries, driver features,
   compare-and-replace, and RAII-owned TC filters;

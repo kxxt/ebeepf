@@ -57,6 +57,7 @@ const PERF_TYPE_SOFTWARE: u32 = 1;
 const PERF_COUNT_SW_BPF_OUTPUT: u64 = 10;
 const PERF_SAMPLE_RAW: u64 = 1 << 10;
 const PERF_EVENT_IOC_ENABLE: libc::c_ulong = 0x2400;
+const PERF_EVENT_IOC_DISABLE: libc::c_ulong = 0x2401;
 const PERF_EVENT_IOC_SET_BPF: libc::c_ulong = 0x4004_2408;
 const PERF_FLAG_FD_CLOEXEC: libc::c_ulong = 1 << 3;
 
@@ -256,6 +257,16 @@ struct LinkCreateAttr {
     flags: u32,
     target_btf_id: u32,
     _padding: u32,
+    cookie: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct PerfEventLinkCreateAttr {
+    prog_fd: u32,
+    target_fd: u32,
+    attach_type: u32,
+    flags: u32,
     cookie: u64,
 }
 
@@ -1262,6 +1273,21 @@ pub(crate) fn link_create(
     command_fd(BPF_LINK_CREATE, &attr)
 }
 
+pub(crate) fn perf_event_link_create(
+    program_fd: RawFd,
+    event_fd: RawFd,
+    cookie: u64,
+) -> io::Result<OwnedFd> {
+    let attr = PerfEventLinkCreateAttr {
+        prog_fd: raw_fd_u32(program_fd)?,
+        target_fd: raw_fd_u32(event_fd)?,
+        attach_type: 41, // BPF_PERF_EVENT
+        cookie,
+        ..Default::default()
+    };
+    command_fd(BPF_LINK_CREATE, &attr)
+}
+
 pub(crate) struct NetfilterLink {
     pub program_fd: RawFd,
     pub protocol_family: u32,
@@ -1529,11 +1555,7 @@ pub(crate) fn struct_ops_link_create(map_fd: RawFd) -> io::Result<OwnedFd> {
     command_fd(BPF_LINK_CREATE, &attr)
 }
 
-pub(crate) fn tracepoint_perf_event(
-    tracepoint_id: u64,
-    cpu: i32,
-    program_fd: RawFd,
-) -> io::Result<OwnedFd> {
+pub(crate) fn tracepoint_event(tracepoint_id: u64, cpu: i32) -> io::Result<OwnedFd> {
     let attr = PerfEventAttr {
         event_type: PERF_TYPE_TRACEPOINT,
         size: mem::size_of::<PerfEventAttr>() as u32,
@@ -1543,7 +1565,7 @@ pub(crate) fn tracepoint_perf_event(
         wakeup_events: 1,
         ..Default::default()
     };
-    perf_event_attach(&attr, -1, cpu, program_fd)
+    perf_event_open(&attr, -1, cpu)
 }
 
 pub(crate) fn kprobe_perf_event(
@@ -1623,6 +1645,26 @@ pub(crate) fn perf_event_enable(fd: RawFd) -> io::Result<()> {
     }
 }
 
+pub(crate) fn perf_event_disable(fd: RawFd) -> io::Result<()> {
+    // SAFETY: PERF_EVENT_IOC_DISABLE takes an ignored integer argument and
+    // `fd` is expected to be a perf-event descriptor.
+    if unsafe { libc::ioctl(fd, PERF_EVENT_IOC_DISABLE, 0) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn perf_event_set_bpf(fd: RawFd, program_fd: RawFd) -> io::Result<()> {
+    // SAFETY: This ioctl command takes an integer program descriptor and `fd`
+    // is a perf-event descriptor.
+    if unsafe { libc::ioctl(fd, PERF_EVENT_IOC_SET_BPF, program_fd) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn socket_attach_bpf(socket_fd: RawFd, program_fd: RawFd) -> io::Result<()> {
     let program_fd = raw_fd_u32(program_fd)?;
     // SAFETY: The option value points to a live `u32` program descriptor and
@@ -1670,11 +1712,7 @@ fn perf_event_attach(
     program_fd: RawFd,
 ) -> io::Result<OwnedFd> {
     let fd = perf_event_open(attr, pid, cpu)?;
-    // SAFETY: This ioctl command takes an integer program descriptor and `fd`
-    // is a perf-event descriptor.
-    if unsafe { libc::ioctl(fd.as_raw_fd(), PERF_EVENT_IOC_SET_BPF, program_fd) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    perf_event_set_bpf(fd.as_raw_fd(), program_fd)?;
     perf_event_enable(fd.as_raw_fd())?;
     Ok(fd)
 }
@@ -1875,6 +1913,9 @@ mod tests {
         assert_eq!(mem::size_of::<ProgramAttachAttr>(), 32);
         assert_eq!(mem::size_of::<ProgramQueryAttr>(), 64);
         assert_eq!(mem::size_of::<LinkCreateAttr>(), 32);
+        assert_eq!(mem::offset_of!(LinkCreateAttr, cookie), 24);
+        assert_eq!(mem::size_of::<PerfEventLinkCreateAttr>(), 24);
+        assert_eq!(mem::offset_of!(PerfEventLinkCreateAttr, cookie), 16);
         assert_eq!(mem::size_of::<LinkUpdateAttr>(), 16);
         assert_eq!(mem::size_of::<KprobeMultiLinkCreateAttr>(), 48);
         assert_eq!(mem::size_of::<UprobeMultiLinkCreateAttr>(), 64);

@@ -6,9 +6,9 @@ use std::process::{self, Command};
 use std::time::Duration;
 
 use ebeepf::{
-    BtfObject, HelperId, Instruction, LinkType, MapType, Object, ProgramType, RingBuffer,
-    TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions, Xdp,
-    XdpAttachOptions, XdpFlags,
+    AttachType, BtfObject, HelperId, Instruction, LinkType, MapType, Object, ProgramType,
+    RingBuffer, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, UpdateMode, UsdtOptions,
+    Xdp, XdpAttachOptions, XdpFlags,
 };
 use object::write::{Object as WriteObject, Symbol, SymbolSection};
 use object::{
@@ -40,6 +40,23 @@ fn loadable_object() -> Vec<u8> {
         scope: SymbolScope::Linkage,
         weak: false,
         section: SymbolSection::Section(program),
+        flags: SymbolFlags::None,
+    });
+
+    let tracepoint = object.add_section(
+        Vec::new(),
+        b"tracepoint/sched/sched_switch".to_vec(),
+        SectionKind::Text,
+    );
+    object.append_section_data(tracepoint, &instruction_bytes(&instructions), 8);
+    object.add_symbol(Symbol {
+        name: b"track_switch".to_vec(),
+        value: 0,
+        size: 16,
+        kind: SymbolKind::Text,
+        scope: SymbolScope::Linkage,
+        weak: false,
+        section: SymbolSection::Section(tracepoint),
         flags: SymbolFlags::None,
     });
 
@@ -186,6 +203,12 @@ fn loads_program_and_exercises_map_crud() {
         loaded.program("drop_packet").unwrap().info().unwrap().name,
         "drop_packet"
     );
+    let link = loaded
+        .program("track_switch")
+        .unwrap()
+        .attach_tracepoint_with_cookie("sched", "sched_switch", 0xfeed)
+        .unwrap();
+    drop(link);
 }
 
 #[test]
@@ -315,4 +338,23 @@ fn loads_and_attaches_freplace_program() {
             .return_value,
         2
     );
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and socket-map bpf_link support"]
+fn loads_and_attaches_sockmap_program() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/sockmap.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object = build.path().join("sockmap.bpf.o");
+    compile_bpf(&source, &object);
+
+    let loaded = Object::open(&object).unwrap().load().unwrap();
+    let map = loaded.map("sockets").unwrap();
+    let program = loaded.program("parse_message").unwrap();
+    let link = program
+        .attach_sockmap(map, AttachType::StreamParser)
+        .unwrap();
+    let info = link.info().unwrap();
+    assert_eq!(info.link_type, LinkType::SocketMap);
+    assert_eq!(info.map_id, Some(map.info().unwrap().id));
 }

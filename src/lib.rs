@@ -41,8 +41,8 @@ pub use crate::object::{LoadedObject, Object};
 pub use crate::perfbuf::{PerfBuffer, PerfBufferBuilder, PerfEvent};
 pub use crate::program::{
     CgroupIteratorOrder, HelperId, IteratorOptions, KprobeMultiOptions, KprobeMultiTargets,
-    Program, ProgramInfo, ProgramKind, ProgramSpec, ProgramType, TestRunOptions, TestRunOutput,
-    UprobeMultiOptions, UprobeMultiTargets, VerifierLog,
+    LinkOptions, Program, ProgramInfo, ProgramKind, ProgramSpec, ProgramType, TestRunOptions,
+    TestRunOutput, UprobeMultiOptions, UprobeMultiTargets, VerifierLog,
 };
 pub use crate::ringbuf::{RingBuffer, RingBufferBuilder};
 pub use crate::skel::{

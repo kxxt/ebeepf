@@ -624,6 +624,12 @@ impl fmt::Debug for Map {
     }
 }
 
+impl AsFd for Map {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 impl Map {
     pub(crate) fn from_fd(fd: OwnedFd, spec: MapSpec) -> Self {
         Self {

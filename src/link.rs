@@ -388,6 +388,10 @@ pub struct LinkInfo {
 
 enum LinkFd {
     Bpf(OwnedFd),
+    BpfPerfEvent {
+        link: OwnedFd,
+        event: OwnedFd,
+    },
     PerfEvents(Vec<OwnedFd>),
     Socket(OwnedFd),
     Legacy {
@@ -413,6 +417,11 @@ impl fmt::Debug for Link {
             LinkFd::Bpf(fd) => formatter
                 .debug_struct("Link")
                 .field("bpf_fd", &fd.as_raw_fd())
+                .finish(),
+            LinkFd::BpfPerfEvent { link, event } => formatter
+                .debug_struct("Link")
+                .field("bpf_fd", &link.as_raw_fd())
+                .field("perf_event_fd", &event.as_raw_fd())
                 .finish(),
             LinkFd::PerfEvents(fds) => formatter
                 .debug_struct("Link")
@@ -451,6 +460,13 @@ impl Link {
     pub(crate) fn perf_events(fds: Vec<OwnedFd>) -> Self {
         Self {
             fd: LinkFd::PerfEvents(fds),
+            cleanup: None,
+        }
+    }
+
+    pub(crate) fn bpf_perf_event(link: OwnedFd, event: OwnedFd) -> Self {
+        Self {
+            fd: LinkFd::BpfPerfEvent { link, event },
             cleanup: None,
         }
     }
@@ -503,6 +519,7 @@ impl Link {
     pub fn as_fd(&self) -> Option<BorrowedFd<'_>> {
         match &self.fd {
             LinkFd::Bpf(fd) => Some(fd.as_fd()),
+            LinkFd::BpfPerfEvent { link, .. } => Some(link.as_fd()),
             LinkFd::PerfEvents(_)
             | LinkFd::Socket(_)
             | LinkFd::Legacy { .. }
@@ -513,10 +530,14 @@ impl Link {
     /// Pins a kernel link in bpffs so it outlives this process.
     pub fn pin(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
-        let LinkFd::Bpf(fd) = &self.fd else {
-            return Err(Error::Unsupported(
-                "this attachment is not represented by a pinnable bpf_link".into(),
-            ));
+        let fd = match &self.fd {
+            LinkFd::Bpf(fd) => fd,
+            LinkFd::BpfPerfEvent { link, .. } => link,
+            _ => {
+                return Err(Error::Unsupported(
+                    "this attachment is not represented by one pinnable bpf_link".into(),
+                ));
+            }
         };
         sys::object_pin(fd.as_raw_fd(), path).map_err(|source| Error::File {
             operation: "pin link",
@@ -542,10 +563,14 @@ impl Link {
 
     /// Atomically changes a kernel link only if it still runs `expected`.
     pub fn update_if(&self, program: &Program, expected: Option<&Program>) -> Result<()> {
-        let LinkFd::Bpf(fd) = &self.fd else {
-            return Err(Error::Unsupported(
-                "only kernel bpf_link attachments support program updates".into(),
-            ));
+        let fd = match &self.fd {
+            LinkFd::Bpf(fd) => fd,
+            LinkFd::BpfPerfEvent { link, .. } => link,
+            _ => {
+                return Err(Error::Unsupported(
+                    "only individual kernel bpf_link attachments support program updates".into(),
+                ));
+            }
         };
         sys::link_update(
             fd.as_raw_fd(),
@@ -557,10 +582,14 @@ impl Link {
 
     /// Reads current metadata for a kernel `bpf_link`.
     pub fn info(&self) -> Result<LinkInfo> {
-        let LinkFd::Bpf(fd) = &self.fd else {
-            return Err(Error::Unsupported(
-                "this attachment is not represented by a kernel bpf_link".into(),
-            ));
+        let fd = match &self.fd {
+            LinkFd::Bpf(fd) => fd,
+            LinkFd::BpfPerfEvent { link, .. } => link,
+            _ => {
+                return Err(Error::Unsupported(
+                    "this attachment is not represented by one kernel bpf_link".into(),
+                ));
+            }
         };
         let raw = sys::link_info(fd.as_raw_fd())
             .map_err(|source| Error::system("read eBPF link metadata", source))?;
@@ -611,6 +640,12 @@ impl Link {
         match fd {
             LinkFd::Bpf(fd) => sys::link_detach(fd.as_raw_fd())
                 .map_err(|source| Error::system("detach eBPF link", source)),
+            LinkFd::BpfPerfEvent { link, event } => {
+                sys::perf_event_disable(event.as_raw_fd())
+                    .map_err(|source| Error::system("disable perf event", source))?;
+                sys::link_detach(link.as_raw_fd())
+                    .map_err(|source| Error::system("detach eBPF link", source))
+            }
             LinkFd::Socket(fd) => sys::socket_detach_bpf(fd.as_raw_fd())
                 .map_err(|source| Error::system("detach socket filter", source)),
             LinkFd::Legacy {
@@ -642,6 +677,9 @@ impl Drop for Link {
                 target.as_raw_fd(),
                 attach_type.as_raw(),
             )),
+            LinkFd::BpfPerfEvent { event, .. } => {
+                drop(sys::perf_event_disable(event.as_raw_fd()));
+            }
             LinkFd::Bpf(_) | LinkFd::PerfEvents(_) | LinkFd::Detached => {}
         }
         // Close attachment descriptors before releasing any auxiliary state

@@ -660,6 +660,37 @@ impl Default for VerifierLog {
     }
 }
 
+/// Common options for descriptor-targeted `bpf_link` attachments.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkOptions {
+    /// Kernel attachment flags.
+    pub flags: u32,
+    /// Optional target BTF type ID.
+    pub target_btf_id: u32,
+}
+
+impl LinkOptions {
+    /// Creates zeroed link options.
+    pub const fn new() -> Self {
+        Self {
+            flags: 0,
+            target_btf_id: 0,
+        }
+    }
+
+    /// Sets kernel attachment flags.
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Selects a target BTF type.
+    pub const fn with_target_btf(mut self, target: TypeId) -> Self {
+        self.target_btf_id = target.0;
+        self
+    }
+}
+
 pub(crate) fn kind_supports_auto_attach(kind: &ProgramKind) -> bool {
     match kind {
         ProgramKind::Kprobe { .. }
@@ -1249,6 +1280,12 @@ impl fmt::Debug for Program {
     }
 }
 
+impl AsFd for Program {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+
 impl Program {
     pub(crate) fn load(
         spec: ProgramSpec,
@@ -1468,15 +1505,22 @@ impl Program {
         Ok(Link::socket(socket))
     }
 
-    /// Attaches to a tracepoint on every online CPU.
+    /// Attaches to a tracepoint.
     pub fn attach_tracepoint(&self, category: &str, event: &str) -> Result<Link> {
+        self.attach_tracepoint_with_cookie(category, event, 0)
+    }
+
+    /// Attaches to a tracepoint with an attachment cookie.
+    pub fn attach_tracepoint_with_cookie(
+        &self,
+        category: &str,
+        event: &str,
+        cookie: u64,
+    ) -> Result<Link> {
         let id = tracepoint_id(category, event)?;
-        let fds = online_cpus()?
-            .into_iter()
-            .map(|cpu| sys::tracepoint_perf_event(id, cpu, self.fd.as_raw_fd()))
-            .collect::<StdResult<Vec<_>, _>>()
-            .map_err(|source| Error::system("attach tracepoint perf event", source))?;
-        Ok(Link::perf_events(fds))
+        let event = sys::tracepoint_event(id, 0)
+            .map_err(|source| Error::system("open tracepoint perf event", source))?;
+        self.attach_owned_perf_event(event, cookie)
     }
 
     /// Attaches to a kernel function on every online CPU.
@@ -1620,11 +1664,58 @@ impl Program {
 
     /// Creates a cgroup link.
     pub fn attach_cgroup(&self, cgroup: impl AsFd, attach_type: AttachType) -> Result<Link> {
-        let target = u32::try_from(cgroup.as_fd().as_raw_fd())
-            .map_err(|_| Error::InvalidObject("cgroup descriptor is negative".into()))?;
-        let fd = sys::link_create(self.fd.as_raw_fd(), target, attach_type.as_raw(), 0, 0, 0)
-            .map_err(|source| Error::system("attach cgroup program", source))?;
+        self.attach_link(cgroup, attach_type, LinkOptions::default())
+    }
+
+    /// Creates a descriptor-targeted kernel link.
+    ///
+    /// This is the common safe primitive for cgroup, network-namespace,
+    /// socket-map, and other FD-targeted hooks.
+    pub fn attach_link(
+        &self,
+        target: impl AsFd,
+        attach_type: AttachType,
+        options: LinkOptions,
+    ) -> Result<Link> {
+        let target = u32::try_from(target.as_fd().as_raw_fd())
+            .map_err(|_| Error::InvalidObject("attachment descriptor is negative".into()))?;
+        let fd = sys::link_create(
+            self.fd.as_raw_fd(),
+            target,
+            attach_type.as_raw(),
+            options.flags,
+            options.target_btf_id,
+            0,
+        )
+        .map_err(|source| Error::system("create descriptor-targeted eBPF link", source))?;
         Ok(Link::bpf(fd))
+    }
+
+    /// Attaches to a network namespace using the program's inferred hook type.
+    pub fn attach_netns(&self, namespace: impl AsFd) -> Result<Link> {
+        let attach_type = self.spec.kind.attach_type().ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "program `{}` has no inferred network-namespace attachment type",
+                self.name()
+            ))
+        })?;
+        self.attach_link(namespace, attach_type, LinkOptions::default())
+    }
+
+    /// Attaches a parser or verdict program to a socket map with a kernel link.
+    pub fn attach_sockmap(&self, map: &Map, attach_type: AttachType) -> Result<Link> {
+        if !matches!(
+            attach_type,
+            AttachType::StreamParser
+                | AttachType::StreamVerdict
+                | AttachType::SocketVerdict
+                | AttachType::SocketMessageVerdict
+        ) {
+            return Err(Error::InvalidObject(format!(
+                "{attach_type:?} is not a socket-map attachment type"
+            )));
+        }
+        self.attach_link(map, attach_type, LinkOptions::default())
     }
 
     /// Attaches through the generic `BPF_PROG_ATTACH` API.
@@ -1715,18 +1806,11 @@ impl Program {
 
     /// Links the program to an already-open perf event.
     pub fn attach_perf_event(&self, event: impl AsFd, cookie: u64) -> Result<Link> {
-        let target = u32::try_from(event.as_fd().as_raw_fd())
-            .map_err(|_| Error::InvalidObject("perf-event descriptor is negative".into()))?;
-        let fd = sys::link_create(
-            self.fd.as_raw_fd(),
-            target,
-            AttachType::PerfEvent.as_raw(),
-            0,
-            0,
-            cookie,
-        )
-        .map_err(|source| Error::system("attach program to perf event", source))?;
-        Ok(Link::bpf(fd))
+        let event = event
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|source| Error::system("duplicate perf-event descriptor", source))?;
+        self.attach_owned_perf_event(event, cookie)
     }
 
     /// Creates a BTF tracing, LSM, or iterator link.
@@ -1769,6 +1853,34 @@ impl Program {
         )
         .map_err(|source| Error::system("attach extension program", source))?;
         Ok(Link::bpf(fd))
+    }
+
+    fn attach_owned_perf_event(&self, event: OwnedFd, cookie: u64) -> Result<Link> {
+        match sys::perf_event_link_create(self.fd.as_raw_fd(), event.as_raw_fd(), cookie) {
+            Ok(link) => {
+                sys::perf_event_enable(event.as_raw_fd())
+                    .map_err(|source| Error::system("enable perf event", source))?;
+                Ok(Link::bpf_perf_event(link, event))
+            }
+            Err(error)
+                if cookie == 0
+                    && matches!(
+                        error.raw_os_error(),
+                        Some(code)
+                            if code == libc::EINVAL
+                                || code == libc::EOPNOTSUPP
+                                || code == libc::ENOSYS
+                    ) =>
+            {
+                sys::perf_event_set_bpf(event.as_raw_fd(), self.fd.as_raw_fd()).map_err(
+                    |source| Error::system("attach program through perf-event ioctl", source),
+                )?;
+                sys::perf_event_enable(event.as_raw_fd())
+                    .map_err(|source| Error::system("enable perf event", source))?;
+                Ok(Link::perf_events(vec![event]))
+            }
+            Err(source) => Err(Error::system("attach program to perf event", source)),
+        }
     }
 
     /// Creates a BPF iterator link with optional map, cgroup, or task scope.
