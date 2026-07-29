@@ -13,9 +13,9 @@ use std::ptr;
 use std::time::Duration;
 
 use ebeepf::{
-    AttachType, BpfToken, Btf, BtfObject, Error, HelperId, Instruction, LinkType, Map,
+    AttachType, BpfToken, Btf, BtfObject, BtfType, Error, HelperId, Instruction, LinkType, Map,
     MapCreateOptions, MapFlags, MapSpec, MapType, MappedDataSectionMut, Object, ProgramType,
-    RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions,
+    RingBuffer, SkeletonBuilder, TcAttachOptions, TcAttachPoint, TcHook, TestRunOptions, TypeId,
     UpdateMode, UsdtOptions, Xdp, XdpAttachOptions, XdpFlags,
 };
 use nix::errno::Errno;
@@ -324,6 +324,63 @@ fn relocates_typed_and_typeless_kernel_symbols() {
     assert!(typeless.spec().instructions().iter().any(|instruction| {
         instruction.code == 0x18 && instruction.source() == 0 && instruction.immediate != 0
     }));
+}
+
+#[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and a visible kernel config"]
+fn populates_real_and_virtual_kconfig_externs() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/kconfig.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("kconfig.bpf.o");
+    compile_bpf(&source, &object_path);
+
+    let object = Object::open(&object_path).unwrap();
+    let btf = object.btf().unwrap();
+    let map = object
+        .maps()
+        .find(|map| map.name().ends_with(".kconfig"))
+        .unwrap();
+    let initial = map.initial_value().unwrap();
+    let value = |name: &str| -> (&[u8], TypeId) {
+        let (_, BtfType::DataSection { variables, .. }) =
+            btf.find(ebeepf::BtfKind::DataSection, ".kconfig").unwrap()
+        else {
+            unreachable!()
+        };
+        let variable = variables
+            .iter()
+            .find(|variable| {
+                matches!(
+                    btf.type_by_id(variable.ty),
+                    Some(BtfType::Variable { name: candidate, .. }) if candidate == name
+                )
+            })
+            .unwrap();
+        let BtfType::Variable { ty, .. } = btf.type_by_id(variable.ty).unwrap() else {
+            unreachable!()
+        };
+        let start = variable.offset as usize;
+        (&initial[start..start + variable.size as usize], *ty)
+    };
+    assert_eq!(
+        u32::from_ne_bytes(value("CONFIG_HZ").0.try_into().unwrap()),
+        1000
+    );
+    assert_eq!(value("CONFIG_PREEMPT_DYNAMIC").0, [1]);
+    assert_eq!(
+        u32::from_ne_bytes(value("CONFIG_VFAT_FS").0.try_into().unwrap()),
+        1
+    );
+    assert_eq!(value("CONFIG_LOCALVERSION").0[0], 0);
+    assert_ne!(
+        u32::from_ne_bytes(value("LINUX_KERNEL_VERSION").0.try_into().unwrap()),
+        0
+    );
+    assert!(btf.resolve_type(value("CONFIG_HZ").1).unwrap().0 > 0);
+
+    let loaded = object.load().unwrap();
+    assert!(loaded.has_kernel_btf());
+    assert!(loaded.program("consume_kernel_configuration").is_ok());
 }
 
 #[test]

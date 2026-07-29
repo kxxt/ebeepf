@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::Path;
@@ -731,6 +731,90 @@ impl Btf {
             Endian::Big => size.to_be_bytes(),
         };
         target.copy_from_slice(&encoded);
+        Ok(true)
+    }
+
+    pub(crate) fn set_data_section_layout(
+        &mut self,
+        name: &str,
+        size: u32,
+        offsets: &HashMap<TypeId, u32>,
+    ) -> Result<bool> {
+        let Some(index) = self
+            .types
+            .iter()
+            .enumerate()
+            .skip(self.raw_type_id_base)
+            .find_map(|(index, ty)| {
+                matches!(ty, BtfType::DataSection { name: candidate, .. } if candidate == name)
+                    .then_some(index)
+            })
+        else {
+            return Ok(false);
+        };
+        let variables = match &self.types[index] {
+            BtfType::DataSection { variables, .. } => variables.clone(),
+            _ => unreachable!(),
+        };
+        if variables.len() != offsets.len()
+            || variables
+                .iter()
+                .any(|variable| !offsets.contains_key(&variable.ty))
+        {
+            return Err(Error::Btf(format!(
+                "data-section `{name}` layout does not cover every variable"
+            )));
+        }
+
+        let record_offset = self
+            .type_section_offset
+            .checked_add(self.type_offsets[index])
+            .ok_or_else(|| Error::Btf("data-section record offset overflow".into()))?;
+        for (variable_index, variable) in variables.iter().enumerate() {
+            let offset = offsets[&variable.ty];
+            let entry_offset = variable_index
+                .checked_mul(12)
+                .and_then(|offset| offset.checked_add(4))
+                .ok_or_else(|| Error::Btf("data-section entry offset overflow".into()))?;
+            let raw_offset = record_offset
+                .checked_add(12)
+                .and_then(|offset| offset.checked_add(entry_offset))
+                .ok_or_else(|| Error::Btf("data-section variable offset overflow".into()))?;
+            let target = self
+                .raw
+                .get_mut(raw_offset..raw_offset.saturating_add(4))
+                .ok_or_else(|| Error::Btf("data-section variable lies outside raw BTF".into()))?;
+            let encoded = match self.endian {
+                Endian::Little => offset.to_le_bytes(),
+                Endian::Big => offset.to_be_bytes(),
+            };
+            target.copy_from_slice(&encoded);
+        }
+        let size_offset = record_offset
+            .checked_add(8)
+            .ok_or_else(|| Error::Btf("data-section size offset overflow".into()))?;
+        let target = self
+            .raw
+            .get_mut(size_offset..size_offset.saturating_add(4))
+            .ok_or_else(|| Error::Btf("data-section size lies outside raw BTF".into()))?;
+        let encoded = match self.endian {
+            Endian::Little => size.to_le_bytes(),
+            Endian::Big => size.to_be_bytes(),
+        };
+        target.copy_from_slice(&encoded);
+
+        let BtfType::DataSection {
+            size: current_size,
+            variables,
+            ..
+        } = &mut self.types[index]
+        else {
+            unreachable!();
+        };
+        *current_size = size;
+        for variable in variables {
+            variable.offset = offsets[&variable.ty];
+        }
         Ok(true)
     }
 

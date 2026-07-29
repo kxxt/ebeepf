@@ -1,11 +1,14 @@
 use std::collections::hash_map::Entry as HashMapEntry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::fs::File;
+use std::io::{ErrorKind, Read};
 use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::str;
 
+use flate2::read::GzDecoder;
 use goblin::elf::header::{EI_CLASS, ELFCLASS64, EM_BPF, ET_REL};
 use goblin::elf::section_header::{SHF_EXECINSTR, SHT_NOBITS};
 use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT, STV_HIDDEN};
@@ -75,6 +78,17 @@ struct KsymRelocation {
     name: String,
     kind: KsymKind,
     weak: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KconfigEntry {
+    variable_id: TypeId,
+    name: String,
+    offset: u32,
+    size: u32,
+    value_type: TypeId,
+    weak: bool,
+    alignment: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -210,7 +224,7 @@ impl Object {
         let mut maps = parse_maps(&elf, &sections, btf.as_ref())?;
         let data_sections = add_data_maps(&name, &elf, &sections, btf.as_ref(), &mut maps)?;
         let ksym_kinds = collect_ksym_kinds(btf.as_ref())?;
-        let extern_data = add_kconfig_map(&name, btf.as_mut(), &mut maps)?;
+        let extern_data = add_kconfig_map(&name, &elf, btf.as_mut(), &mut maps)?;
         let mut struct_ops = add_struct_ops_maps(&elf, &sections, btf.as_ref(), &mut maps)?;
         resolve_inner_maps(&elf, &sections, &mut maps)?;
 
@@ -1353,6 +1367,7 @@ fn collect_struct_ops_relocations(
 
 fn add_kconfig_map(
     object_name: &str,
+    elf: &Elf<'_>,
     btf: Option<&mut Btf>,
     maps: &mut BTreeMap<String, MapSpec>,
 ) -> Result<HashMap<String, (String, u32)>> {
@@ -1365,23 +1380,12 @@ fn add_kconfig_map(
         return Ok(HashMap::new());
     };
     let variables = variables.clone();
-    let size = variables.iter().try_fold(0_u32, |size, variable| {
-        variable
-            .offset
-            .checked_add(variable.size)
-            .map(|end| size.max(end))
-            .ok_or_else(|| Error::InvalidObject(".kconfig data size overflow".into()))
-    })?;
-    if size == 0 {
-        return Ok(HashMap::new());
-    }
-
     let name = format!("{}.kconfig", sanitize_kernel_name(object_name));
-    let mut symbols = HashMap::new();
-    let mut initial_value = vec![0; size as usize];
+    let mut entries = Vec::with_capacity(variables.len());
     for variable in &variables {
         let BtfType::Variable {
             name: variable_name,
+            ty,
             ..
         } = btf.type_by_id(variable.ty).ok_or_else(|| {
             Error::Btf(format!(
@@ -1395,31 +1399,106 @@ fn add_kconfig_map(
                 variable.ty.0
             )));
         };
-        symbols.insert(variable_name.clone(), (name.clone(), variable.offset));
-        let virtual_value = match variable_name.as_str() {
+        entries.push(KconfigEntry {
+            variable_id: variable.ty,
+            name: variable_name.clone(),
+            offset: 0,
+            size: variable.size,
+            value_type: *ty,
+            weak: extern_symbol_is_weak(elf, variable_name)?,
+            alignment: kconfig_alignment(btf, *ty)?,
+        });
+    }
+
+    let mut size = 0_u32;
+    for entry in &mut entries {
+        size = round_up_u32(size, entry.alignment)?;
+        entry.offset = size;
+        size = size
+            .checked_add(entry.size)
+            .ok_or_else(|| Error::InvalidObject(".kconfig data size overflow".into()))?;
+    }
+    if size == 0 {
+        return Ok(HashMap::new());
+    }
+    let layout = entries
+        .iter()
+        .map(|entry| (entry.variable_id, entry.offset))
+        .collect::<HashMap<_, _>>();
+    btf.set_data_section_layout(".kconfig", size, &layout)?;
+
+    let mut symbols = HashMap::new();
+    for entry in &entries {
+        symbols.insert(entry.name.clone(), (name.clone(), entry.offset));
+    }
+    let mut initial_value = vec![0; size as usize];
+    let needs_kernel_config = entries
+        .iter()
+        .any(|entry| entry.name.starts_with("CONFIG_"));
+    let kernel_config = needs_kernel_config
+        .then(read_kernel_config)
+        .transpose()?
+        .flatten();
+
+    for entry in entries {
+        if let Some(value) = match entry.name.as_str() {
             "LINUX_KERNEL_VERSION" => Some(u64::from(running_kernel_version())),
             "LINUX_HAS_BPF_COOKIE" => Some(u64::from(sys::supports_bpf_cookie())),
+            "LINUX_HAS_SYSCALL_WRAPPER" => Some(u64::from(kernel_has_syscall_wrapper()?)),
             _ => None,
-        };
-        if let Some(value) = virtual_value {
-            write_kconfig_integer(
+        } {
+            write_kconfig_numeric(
                 &mut initial_value,
-                variable.offset,
-                variable.size,
+                entry.offset,
+                entry.size,
+                entry.value_type,
                 value,
-                btf.endian(),
+                btf,
             )?;
+            continue;
+        }
+        if entry.name.starts_with("LINUX_") {
+            if entry.weak {
+                continue;
+            }
+            return Err(Error::Unsupported(format!(
+                "unrecognized virtual kconfig extern `{}`",
+                entry.name
+            )));
+        }
+        if !entry.name.starts_with("CONFIG_") {
+            return Err(Error::Unsupported(format!(
+                "kconfig extern `{}` has no CONFIG_ or LINUX_ prefix",
+                entry.name
+            )));
+        }
+        let value = kernel_config
+            .as_ref()
+            .and_then(|config| config.get(&entry.name));
+        match value {
+            Some(value) => write_kconfig_value(
+                &mut initial_value,
+                entry.offset,
+                entry.size,
+                entry.value_type,
+                value,
+                btf,
+            )?,
+            None if entry.weak => {}
+            None => {
+                return Err(Error::InvalidObject(format!(
+                    "strong kconfig extern `{}` is absent from the running kernel configuration",
+                    entry.name
+                )));
+            }
         }
     }
 
-    // Unsupported weak virtual externs and CONFIG_ externs default
-    // conservatively to zero. Known virtual values are detected above.
     let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
     spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
     spec.initial_value = Some(initial_value);
     spec.freeze_after_init = true;
     spec.btf_value_type = data_section_id;
-    btf.set_data_section_size(".kconfig", size)?;
     if maps.insert(name.clone(), spec).is_some() {
         return Err(Error::InvalidObject(format!(
             "kconfig map name `{name}` conflicts with a declared map"
@@ -1468,6 +1547,333 @@ fn collect_ksym_kinds(btf: Option<&Btf>) -> Result<HashMap<String, KsymKind>> {
         }
     }
     Ok(symbols)
+}
+
+fn kconfig_alignment(btf: &Btf, type_id: TypeId) -> Result<u32> {
+    let resolved = btf.resolve_type(type_id)?;
+    match btf.type_by_id(resolved).ok_or_else(|| {
+        Error::Btf(format!(
+            "kconfig extern references missing type {}",
+            resolved.0
+        ))
+    })? {
+        BtfType::Integer { size, .. }
+        | BtfType::Enum { size, .. }
+        | BtfType::Enum64 { size, .. } => match *size {
+            1 | 2 | 4 | 8 => Ok(*size),
+            size => Err(Error::Unsupported(format!(
+                "kconfig scalar has unsupported alignment {size}"
+            ))),
+        },
+        BtfType::Array { element_type, .. } => kconfig_alignment(btf, *element_type),
+        _ => Err(Error::Unsupported(
+            "kconfig extern is not an integer, tristate, or character array".into(),
+        )),
+    }
+}
+
+fn round_up_u32(value: u32, alignment: u32) -> Result<u32> {
+    let mask = alignment
+        .checked_sub(1)
+        .ok_or_else(|| Error::InvalidObject("zero .kconfig alignment".into()))?;
+    value
+        .checked_add(mask)
+        .map(|value| value & !mask)
+        .ok_or_else(|| Error::InvalidObject(".kconfig alignment overflow".into()))
+}
+
+fn extern_symbol_is_weak(elf: &Elf<'_>, name: &str) -> Result<bool> {
+    for symbol in elf.syms.iter().filter(|symbol| symbol.st_shndx == 0) {
+        if symbol_name(elf, &symbol)? == name {
+            return Ok(symbol.st_bind() == STB_WEAK);
+        }
+    }
+    Err(Error::InvalidObject(format!(
+        "BTF extern `{name}` has no undefined ELF symbol"
+    )))
+}
+
+fn read_kernel_config() -> Result<Option<HashMap<String, String>>> {
+    let release =
+        fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|source| Error::File {
+            operation: "read kernel release",
+            path: "/proc/sys/kernel/osrelease".into(),
+            source,
+        })?;
+    let release = release.trim();
+    let paths = [
+        PathBuf::from(format!("/boot/config-{release}")),
+        PathBuf::from(format!("/lib/modules/{release}/config")),
+    ];
+    for path in paths {
+        match fs::read_to_string(&path) {
+            Ok(contents) => return Ok(Some(parse_kernel_config(&contents))),
+            Err(source) if source.kind() == ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(Error::File {
+                    operation: "read kernel configuration",
+                    path,
+                    source,
+                });
+            }
+        }
+    }
+
+    let path = Path::new("/proc/config.gz");
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(Error::File {
+                operation: "open compressed kernel configuration",
+                path: path.into(),
+                source,
+            });
+        }
+    };
+    let mut contents = String::new();
+    GzDecoder::new(file)
+        .read_to_string(&mut contents)
+        .map_err(|source| Error::File {
+            operation: "decompress kernel configuration",
+            path: path.into(),
+            source,
+        })?;
+    Ok(Some(parse_kernel_config(&contents)))
+}
+
+fn parse_kernel_config(contents: &str) -> HashMap<String, String> {
+    let mut config = HashMap::new();
+    for line in contents.lines() {
+        if let Some((name, value)) = line
+            .strip_prefix("CONFIG_")
+            .and_then(|line| line.split_once('='))
+        {
+            config.insert(format!("CONFIG_{name}"), value.trim().into());
+            continue;
+        }
+        if let Some(name) = line
+            .strip_prefix("# CONFIG_")
+            .and_then(|line| line.strip_suffix(" is not set"))
+        {
+            config.insert(format!("CONFIG_{name}"), "n".into());
+        }
+    }
+    config
+}
+
+fn kernel_has_syscall_wrapper() -> Result<bool> {
+    let btf = Btf::from_vmlinux()?;
+    let supported = btf.types().any(|(_, ty)| {
+        ty.kind() == crate::BtfKind::Function
+            && ty
+                .name()
+                .is_some_and(|name| name.starts_with("__") && name.ends_with("_sys_bpf"))
+    });
+    Ok(supported)
+}
+
+fn write_kconfig_value(
+    bytes: &mut [u8],
+    offset: u32,
+    size: u32,
+    type_id: TypeId,
+    value: &str,
+    btf: &Btf,
+) -> Result<()> {
+    let resolved = btf.resolve_type(type_id)?;
+    let ty = btf.type_by_id(resolved).ok_or_else(|| {
+        Error::Btf(format!(
+            "kconfig extern references missing type {}",
+            resolved.0
+        ))
+    })?;
+    if matches!(value, "y" | "m" | "n") {
+        let encoded = match ty {
+            BtfType::Integer {
+                size: 1, encoding, ..
+            } if encoding.boolean => match value {
+                "y" => 1,
+                "n" => 0,
+                "m" => {
+                    return Err(Error::InvalidObject(
+                        "module kconfig value cannot initialize a boolean extern".into(),
+                    ));
+                }
+                _ => unreachable!(),
+            },
+            BtfType::Integer { size: 1, .. } => u64::from(value.as_bytes()[0]),
+            BtfType::Enum {
+                name,
+                values,
+                size: enum_size,
+                ..
+            }
+            | BtfType::Enum64 {
+                name,
+                values,
+                size: enum_size,
+                ..
+            } if name == "libbpf_tristate" => {
+                let expected = match value {
+                    "n" => "TRI_NO",
+                    "m" => "TRI_MODULE",
+                    "y" => "TRI_YES",
+                    _ => unreachable!(),
+                };
+                let fallback = match value {
+                    "n" => 0,
+                    "m" => 1,
+                    "y" => 2,
+                    _ => unreachable!(),
+                };
+                if *enum_size != size {
+                    return Err(Error::InvalidObject(
+                        "tristate kconfig extern has inconsistent size".into(),
+                    ));
+                }
+                values
+                    .iter()
+                    .find(|candidate| candidate.name == expected)
+                    .map_or(fallback, |candidate| candidate.value as u64)
+            }
+            _ => {
+                return Err(Error::InvalidObject(format!(
+                    "kconfig value `{value}` is incompatible with its extern type"
+                )));
+            }
+        };
+        return write_kconfig_integer(bytes, offset, size, encoded, btf.endian());
+    }
+
+    if value.starts_with('"') {
+        let BtfType::Array {
+            element_type,
+            count,
+            ..
+        } = ty
+        else {
+            return Err(Error::InvalidObject(
+                "string kconfig value requires a character-array extern".into(),
+            ));
+        };
+        let element = btf.resolve_type(*element_type)?;
+        let Some(BtfType::Integer { size: 1, .. }) = btf.type_by_id(element) else {
+            return Err(Error::InvalidObject(
+                "string kconfig extern does not contain characters".into(),
+            ));
+        };
+        let Some(contents) = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            return Err(Error::InvalidObject(format!(
+                "unterminated string kconfig value `{value}`"
+            )));
+        };
+        let capacity = usize::try_from(size.min(*count))
+            .map_err(|_| Error::InvalidObject("kconfig string size is too large".into()))?;
+        if capacity == 0 {
+            return Err(Error::InvalidObject(
+                "kconfig string extern has zero capacity".into(),
+            ));
+        }
+        let offset = usize::try_from(offset)
+            .map_err(|_| Error::InvalidObject("kconfig offset does not fit usize".into()))?;
+        let target = bytes
+            .get_mut(offset..offset.saturating_add(capacity))
+            .ok_or_else(|| Error::InvalidObject("kconfig string lies outside its map".into()))?;
+        let length = contents.len().min(capacity - 1);
+        target[..length].copy_from_slice(&contents.as_bytes()[..length]);
+        target[length] = 0;
+        return Ok(());
+    }
+
+    let numeric = parse_kconfig_integer(value)?;
+    write_kconfig_numeric(bytes, offset, size, type_id, numeric, btf)
+}
+
+fn write_kconfig_numeric(
+    bytes: &mut [u8],
+    offset: u32,
+    size: u32,
+    type_id: TypeId,
+    value: u64,
+    btf: &Btf,
+) -> Result<()> {
+    let resolved = btf.resolve_type(type_id)?;
+    let ty = btf.type_by_id(resolved).ok_or_else(|| {
+        Error::Btf(format!(
+            "kconfig extern references missing type {}",
+            resolved.0
+        ))
+    })?;
+    let (type_size, signed, boolean) = match ty {
+        BtfType::Integer { size, encoding, .. } => (*size, encoding.signed, encoding.boolean),
+        _ => {
+            return Err(Error::InvalidObject(
+                "numeric kconfig value requires an integer extern".into(),
+            ));
+        }
+    };
+    if type_size != size {
+        return Err(Error::InvalidObject(
+            "numeric kconfig extern has inconsistent size".into(),
+        ));
+    }
+    if boolean && value > 1 {
+        return Err(Error::InvalidObject(format!(
+            "kconfig value {value} is not boolean"
+        )));
+    }
+    let bits = size
+        .checked_mul(8)
+        .ok_or_else(|| Error::InvalidObject("kconfig integer width overflows".into()))?;
+    if !matches!(bits, 8 | 16 | 32 | 64) {
+        return Err(Error::InvalidObject(format!(
+            "kconfig integer has unsupported width {bits}"
+        )));
+    }
+    let fits = if bits == 64 {
+        true
+    } else if signed {
+        let sign = 1_u64 << (bits - 1);
+        value.wrapping_add(sign) < (1_u64 << bits)
+    } else {
+        value >> bits == 0
+    };
+    if !fits {
+        return Err(Error::InvalidObject(format!(
+            "kconfig value {value} does not fit in {bits} bits"
+        )));
+    }
+    write_kconfig_integer(bytes, offset, size, value, btf.endian())
+}
+
+fn parse_kconfig_integer(value: &str) -> Result<u64> {
+    let (negative, magnitude) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let (radix, digits) = magnitude
+        .strip_prefix("0x")
+        .or_else(|| magnitude.strip_prefix("0X"))
+        .map_or_else(
+            || {
+                if magnitude.len() > 1 && magnitude.starts_with('0') {
+                    (8, &magnitude[1..])
+                } else {
+                    (10, magnitude)
+                }
+            },
+            |digits| (16, digits),
+        );
+    let magnitude = u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::InvalidObject(format!("invalid integer kconfig value `{value}`")))?;
+    Ok(if negative {
+        0_u64.wrapping_sub(magnitude)
+    } else {
+        magnitude
+    })
 }
 
 fn mark_hidden_subprograms_static(
@@ -4470,5 +4876,25 @@ mod tests {
         assert!(!symbols.contains_key("hidden"));
         assert_eq!(symbols.get("unique"), Some(&Some(0x10)));
         assert_eq!(symbols.get("duplicate"), Some(&None));
+    }
+
+    #[test]
+    fn kernel_config_parser_handles_values_disabled_options_and_c_integers() {
+        let config = parse_kernel_config(
+            "CONFIG_ENABLED=y\n\
+             # CONFIG_DISABLED is not set\n\
+             CONFIG_TEXT=\"hello=world\"\n",
+        );
+        assert_eq!(config.get("CONFIG_ENABLED").map(String::as_str), Some("y"));
+        assert_eq!(config.get("CONFIG_DISABLED").map(String::as_str), Some("n"));
+        assert_eq!(
+            config.get("CONFIG_TEXT").map(String::as_str),
+            Some("\"hello=world\"")
+        );
+        assert_eq!(parse_kconfig_integer("42").unwrap(), 42);
+        assert_eq!(parse_kconfig_integer("077").unwrap(), 0o77);
+        assert_eq!(parse_kconfig_integer("0x2a").unwrap(), 42);
+        assert_eq!(parse_kconfig_integer("-1").unwrap(), u64::MAX);
+        assert!(parse_kconfig_integer("12oops").is_err());
     }
 }

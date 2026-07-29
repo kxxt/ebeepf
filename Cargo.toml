@@ -12,6 +12,7 @@ keywords = ["bpf", "ebpf", "linux", "tracing"]
 
 [dependencies]
 bitflags = "2.0"
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 goblin = { version = "0.9.3", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 libc = "0.2"
 thiserror = "2.0"
