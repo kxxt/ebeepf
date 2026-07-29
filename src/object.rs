@@ -4233,7 +4233,7 @@ fn apply_core_value(
     )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CoreValue {
     value: u64,
     local_size: Option<usize>,
@@ -4294,18 +4294,40 @@ fn evaluate_field_relocation(
     let accessors = parse_accessors(&relocation.access)?;
     let local_field = resolve_local_field(local, local_root, &accessors)?;
     let candidates = target_type_candidates(local, target, local_root)?;
-    let target_field = candidates.into_iter().find_map(|target_root| {
-        resolve_target_field(local, target, local_root, target_root, &accessors).ok()
-    });
+    let target_fields = candidates
+        .into_iter()
+        .filter_map(|target_root| {
+            resolve_target_field(local, target, local_root, target_root, &accessors).ok()
+        })
+        .collect::<Vec<_>>();
     if relocation.kind == 2 {
-        return Ok(CoreValue::plain(u64::from(target_field.is_some())));
+        return Ok(CoreValue::plain(u64::from(!target_fields.is_empty())));
     }
-    let Some(target_field) = target_field else {
+    let Some((target_field, remaining)) = target_fields.split_first() else {
         return Ok(CoreValue::poison());
     };
     let local_layout = field_layout(local, local_field)?;
+    let result = field_core_value(local_layout, target, *target_field, relocation.kind)?;
+    for candidate in remaining {
+        let candidate_result = field_core_value(local_layout, target, *candidate, relocation.kind)?;
+        if candidate.bit_offset != target_field.bit_offset || candidate_result != result {
+            return Err(Error::InvalidObject(format!(
+                "ambiguous CO-RE field relocation for local type {}",
+                local_root.0
+            )));
+        }
+    }
+    Ok(result)
+}
+
+fn field_core_value(
+    local_layout: FieldLayout,
+    target: &Btf,
+    target_field: FieldDescriptor,
+    kind: u32,
+) -> Result<CoreValue> {
     let target_layout = field_layout(target, target_field)?;
-    let value = match relocation.kind {
+    let value = match kind {
         0 => target_layout.byte_offset,
         1 => target_layout.byte_size as u64,
         3 => u64::from(type_is_signed(target, target_field.ty)?),
@@ -4315,8 +4337,8 @@ fn evaluate_field_relocation(
     };
     Ok(CoreValue {
         value,
-        local_size: (relocation.kind == 0).then_some(local_layout.byte_size),
-        target_size: (relocation.kind == 0).then_some(target_layout.byte_size),
+        local_size: (kind == 0).then_some(local_layout.byte_size),
+        target_size: (kind == 0).then_some(target_layout.byte_size),
         poison: false,
     })
 }
@@ -4327,19 +4349,45 @@ fn evaluate_type_relocation(
     local_root: TypeId,
     kind: u32,
 ) -> Result<CoreValue> {
-    let candidate = target_type_candidates(local, target, local_root)?
-        .into_iter()
-        .next();
+    let candidates = target_type_candidates(local, target, local_root)?;
     let value = match kind {
-        7 => candidate.map_or(0, |id| u64::from(id.0)),
-        8 | 12 => u64::from(candidate.is_some()),
-        9 => candidate
-            .map(|id| target.size_of(id).map(|size| size as u64))
-            .transpose()?
-            .unwrap_or(0),
+        7 => consistent_core_values(
+            local_root,
+            "target type ID",
+            candidates.iter().map(|id| u64::from(id.0)),
+        )?
+        .unwrap_or(0),
+        8 | 12 => u64::from(!candidates.is_empty()),
+        9 => consistent_core_values(
+            local_root,
+            "target type size",
+            candidates
+                .iter()
+                .map(|id| target.size_of(*id).map(|size| size as u64))
+                .collect::<Result<Vec<_>>>()?,
+        )?
+        .unwrap_or(0),
         _ => unreachable!(),
     };
     Ok(CoreValue::plain(value))
+}
+
+fn consistent_core_values(
+    local_root: TypeId,
+    what: &str,
+    values: impl IntoIterator<Item = u64>,
+) -> Result<Option<u64>> {
+    let mut values = values.into_iter();
+    let Some(first) = values.next() else {
+        return Ok(None);
+    };
+    if values.any(|value| value != first) {
+        return Err(Error::InvalidObject(format!(
+            "ambiguous CO-RE {what} for local type {}",
+            local_root.0
+        )));
+    }
+    Ok(Some(first))
 }
 
 fn evaluate_enum_relocation(
@@ -4355,14 +4403,17 @@ fn evaluate_enum_relocation(
         ))
     })?;
     let local_name = enum_value(local, local_root, index)?.0;
-    let target_value = target_type_candidates(local, target, local_root)?
+    let target_values = target_type_candidates(local, target, local_root)?
         .into_iter()
-        .find_map(|id| enum_value_by_name(target, id, local_name));
+        .filter_map(|id| enum_value_by_name(target, id, local_name))
+        .map(|value| value as u64)
+        .collect::<Vec<_>>();
     match relocation.kind {
-        10 => Ok(CoreValue::plain(u64::from(target_value.is_some()))),
-        11 => {
-            Ok(target_value.map_or_else(CoreValue::poison, |value| CoreValue::plain(value as u64)))
-        }
+        10 => Ok(CoreValue::plain(u64::from(!target_values.is_empty()))),
+        11 => Ok(
+            consistent_core_values(local_root, "enum value", target_values)?
+                .map_or_else(CoreValue::poison, CoreValue::plain),
+        ),
         _ => unreachable!(),
     }
 }
@@ -5035,6 +5086,53 @@ mod tests {
         bytes.extend(value.to_le_bytes());
     }
 
+    fn flavored_struct_btf(flavor_size: u32, flavor_member_offset: u32) -> Btf {
+        let mut strings = vec![0];
+        let mut add_string = |value: &str| {
+            let offset = strings.len() as u32;
+            strings.extend(value.as_bytes());
+            strings.push(0);
+            offset
+        };
+        let u32_name = add_string("u32");
+        let root_name = add_string("root");
+        let value_name = add_string("value");
+        let flavored_root_name = add_string("root___flavor");
+
+        let mut types = Vec::new();
+        // 1: u32
+        push_u32(&mut types, u32_name);
+        push_u32(&mut types, 1 << 24);
+        push_u32(&mut types, 4);
+        push_u32(&mut types, 32);
+        // 2: struct root { u32 value; }
+        push_u32(&mut types, root_name);
+        push_u32(&mut types, (4 << 24) | 1);
+        push_u32(&mut types, 8);
+        push_u32(&mut types, value_name);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, 0);
+        // 3: a potentially incompatible flavor of struct root.
+        push_u32(&mut types, flavored_root_name);
+        push_u32(&mut types, (4 << 24) | 1);
+        push_u32(&mut types, flavor_size);
+        push_u32(&mut types, value_name);
+        push_u32(&mut types, 1);
+        push_u32(&mut types, flavor_member_offset);
+
+        let mut bytes = Vec::new();
+        bytes.extend(0xeb9f_u16.to_le_bytes());
+        bytes.extend([1, 0]);
+        push_u32(&mut bytes, 24);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+        bytes.extend(types);
+        bytes.extend(strings);
+        Btf::parse(&bytes).unwrap()
+    }
+
     fn btf_object_fixture() -> Vec<u8> {
         let mut strings = vec![0];
         let mut add_string = |value: &str| {
@@ -5390,6 +5488,63 @@ mod tests {
                 .unwrap()
                 .value,
             1
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_flavored_core_candidates() {
+        let btf = flavored_struct_btf(16, 32);
+        let relocation = |kind, access: &str| CoreRelocation {
+            program: "entry".into(),
+            instruction_index: 0,
+            type_id: TypeId(2),
+            access: access.into(),
+            kind,
+        };
+
+        let field_error = evaluate_core_relocation(&btf, &btf, &relocation(0, "0:0"))
+            .unwrap_err()
+            .to_string();
+        assert!(field_error.contains("ambiguous CO-RE field relocation"));
+        assert_eq!(
+            evaluate_core_relocation(&btf, &btf, &relocation(2, "0:0"))
+                .unwrap()
+                .value,
+            1
+        );
+
+        let size_error = evaluate_core_relocation(&btf, &btf, &relocation(9, "0"))
+            .unwrap_err()
+            .to_string();
+        assert!(size_error.contains("ambiguous CO-RE target type size"));
+
+        let id_error = evaluate_core_relocation(&btf, &btf, &relocation(7, "0"))
+            .unwrap_err()
+            .to_string();
+        assert!(id_error.contains("ambiguous CO-RE target type ID"));
+    }
+
+    #[test]
+    fn accepts_consistent_flavored_core_candidates() {
+        let btf = flavored_struct_btf(8, 0);
+        let relocation = |kind, access: &str| CoreRelocation {
+            program: "entry".into(),
+            instruction_index: 0,
+            type_id: TypeId(2),
+            access: access.into(),
+            kind,
+        };
+        assert_eq!(
+            evaluate_core_relocation(&btf, &btf, &relocation(0, "0:0"))
+                .unwrap()
+                .value,
+            0
+        );
+        assert_eq!(
+            evaluate_core_relocation(&btf, &btf, &relocation(9, "0"))
+                .unwrap()
+                .value,
+            8
         );
     }
 
