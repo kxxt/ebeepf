@@ -921,6 +921,7 @@ impl Btf {
     }
 
     pub(crate) fn sanitize_extern_linkage_for_kernel(&mut self) -> Result<()> {
+        self.sanitize_ksym_data_section()?;
         for (index, ty) in self
             .types
             .iter_mut()
@@ -972,6 +973,231 @@ impl Btf {
                 _ => {}
             }
         }
+        Ok(())
+    }
+
+    fn sanitize_ksym_data_section(&mut self) -> Result<()> {
+        let Some(data_section_index) = self
+            .types
+            .iter()
+            .enumerate()
+            .skip(self.raw_type_id_base)
+            .find_map(|(index, ty)| {
+                matches!(ty, BtfType::DataSection { name, .. } if name == ".ksyms").then_some(index)
+            })
+        else {
+            return Ok(());
+        };
+        let variables = match &self.types[data_section_index] {
+            BtfType::DataSection { variables, .. } => variables.clone(),
+            _ => unreachable!(),
+        };
+        if variables.is_empty() {
+            return Ok(());
+        }
+        let integer_type = self
+            .types()
+            .find_map(|(id, ty)| matches!(ty, BtfType::Integer { size: 4, .. }).then_some(id))
+            .ok_or_else(|| Error::Btf(".ksyms requires a 32-bit integer BTF type".into()))?;
+
+        let mut external_functions = Vec::new();
+        let mut dummy_name = None;
+        for variable in &variables {
+            match self.type_by_id(variable.ty) {
+                Some(BtfType::Function {
+                    name, prototype, ..
+                }) => {
+                    let name_offset = self.raw_u32(self.type_record_offset(variable.ty)?)?;
+                    dummy_name.get_or_insert_with(|| (name.clone(), name_offset));
+                    external_functions.push((*prototype, name_offset));
+                }
+                Some(BtfType::Variable { .. }) => {}
+                Some(ty) => {
+                    return Err(Error::Btf(format!(
+                        ".ksyms entry type {} is {:?}, expected a function or variable",
+                        variable.ty.0,
+                        ty.kind()
+                    )));
+                }
+                None => {
+                    return Err(Error::Btf(format!(
+                        ".ksyms references missing type {}",
+                        variable.ty.0
+                    )));
+                }
+            }
+        }
+
+        for (prototype, fallback_name_offset) in external_functions {
+            let parameters = match self.type_by_id(prototype) {
+                Some(BtfType::FunctionPrototype { parameters, .. }) => parameters.clone(),
+                _ => {
+                    return Err(Error::Btf(format!(
+                        "external function prototype type {} is missing",
+                        prototype.0
+                    )));
+                }
+            };
+            let record_offset = self.type_record_offset(prototype)?;
+            for (index, parameter) in parameters.iter().enumerate() {
+                if parameter.ty == TypeId::VOID || !parameter.name.is_empty() {
+                    continue;
+                }
+                let name_offset = record_offset
+                    .checked_add(12)
+                    .and_then(|offset| offset.checked_add(index * 8))
+                    .ok_or_else(|| Error::Btf("function parameter offset overflow".into()))?;
+                self.write_raw_u32(name_offset, fallback_name_offset)?;
+            }
+        }
+
+        let dummy_type = dummy_name
+            .map(|(name, name_offset)| {
+                self.append_allocated_variable_type(name, name_offset, integer_type)
+            })
+            .transpose()?;
+        let data_section_offset = self
+            .type_section_offset
+            .checked_add(self.type_offsets[data_section_index])
+            .ok_or_else(|| Error::Btf("data-section record offset overflow".into()))?;
+        let section_size = u32::try_from(variables.len())
+            .ok()
+            .and_then(|count| count.checked_mul(4))
+            .ok_or_else(|| Error::Btf(".ksyms data-section size overflow".into()))?;
+        self.write_raw_u32(data_section_offset + 8, section_size)?;
+
+        let mut rewritten = Vec::with_capacity(variables.len());
+        for (index, variable) in variables.iter().enumerate() {
+            let entry_offset = data_section_offset
+                .checked_add(12)
+                .and_then(|offset| offset.checked_add(index * 12))
+                .ok_or_else(|| Error::Btf(".ksyms entry offset overflow".into()))?;
+            let type_id = match self.type_by_id(variable.ty) {
+                Some(BtfType::Function { .. }) => {
+                    dummy_type.expect("a function entry creates a dummy variable")
+                }
+                Some(BtfType::Variable { .. }) => {
+                    let record_offset = self.type_record_offset(variable.ty)?;
+                    self.write_raw_u32(record_offset + 8, integer_type.0)?;
+                    self.write_raw_u32(record_offset + 12, 1)?;
+                    if let Some(BtfType::Variable { ty, linkage, .. }) =
+                        self.types.get_mut(variable.ty.0 as usize - 1)
+                    {
+                        *ty = integer_type;
+                        *linkage = 1;
+                    }
+                    variable.ty
+                }
+                _ => unreachable!("entry kinds were checked above"),
+            };
+            let offset = u32::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_mul(4))
+                .ok_or_else(|| Error::Btf(".ksyms variable offset overflow".into()))?;
+            self.write_raw_u32(entry_offset, type_id.0)?;
+            self.write_raw_u32(entry_offset + 4, offset)?;
+            self.write_raw_u32(entry_offset + 8, 4)?;
+            rewritten.push(BtfVariable {
+                ty: type_id,
+                offset,
+                size: 4,
+            });
+        }
+        if let BtfType::DataSection {
+            size, variables, ..
+        } = &mut self.types[data_section_index]
+        {
+            *size = section_size;
+            *variables = rewritten;
+        }
+        Ok(())
+    }
+
+    fn append_allocated_variable_type(
+        &mut self,
+        name: String,
+        name_offset: u32,
+        ty: TypeId,
+    ) -> Result<TypeId> {
+        let type_id = TypeId(
+            u32::try_from(self.types.len())
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| Error::Btf("BTF type count exceeds u32::MAX".into()))?,
+        );
+        let type_length = self.raw_u32(12)?;
+        let string_offset = self.raw_u32(16)?;
+        let type_end = self
+            .type_section_offset
+            .checked_add(type_length as usize)
+            .ok_or_else(|| Error::Btf("BTF type-section end overflow".into()))?;
+        if type_end > self.raw.len() {
+            return Err(Error::Btf("BTF type section lies outside raw data".into()));
+        }
+        let mut record = Vec::with_capacity(16);
+        for value in [name_offset, 14_u32 << 24, ty.0, 1] {
+            record.extend(match self.endian {
+                Endian::Little => value.to_le_bytes(),
+                Endian::Big => value.to_be_bytes(),
+            });
+        }
+        self.raw.splice(type_end..type_end, record);
+        self.write_raw_u32(
+            12,
+            type_length
+                .checked_add(16)
+                .ok_or_else(|| Error::Btf("BTF type-section length overflow".into()))?,
+        )?;
+        self.write_raw_u32(
+            16,
+            string_offset
+                .checked_add(16)
+                .ok_or_else(|| Error::Btf("BTF string-section offset overflow".into()))?,
+        )?;
+        self.type_offsets.push(type_length as usize);
+        self.types.push(BtfType::Variable {
+            name,
+            ty,
+            linkage: 1,
+        });
+        Ok(type_id)
+    }
+
+    fn type_record_offset(&self, id: TypeId) -> Result<usize> {
+        let index =
+            id.0.checked_sub(1)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| Error::Btf(format!("invalid type ID {}", id.0)))?;
+        self.type_section_offset
+            .checked_add(
+                *self
+                    .type_offsets
+                    .get(index)
+                    .ok_or_else(|| Error::Btf(format!("type ID {} is missing", id.0)))?,
+            )
+            .ok_or_else(|| Error::Btf("type record offset overflow".into()))
+    }
+
+    fn raw_u32(&self, offset: usize) -> Result<u32> {
+        let bytes = self
+            .raw
+            .get(offset..offset.saturating_add(4))
+            .ok_or_else(|| Error::Btf("u32 field lies outside raw BTF".into()))?;
+        Ok(match self.endian {
+            Endian::Little => u32::from_le_bytes(bytes.try_into().unwrap()),
+            Endian::Big => u32::from_be_bytes(bytes.try_into().unwrap()),
+        })
+    }
+
+    fn write_raw_u32(&mut self, offset: usize, value: u32) -> Result<()> {
+        let target = self
+            .raw
+            .get_mut(offset..offset.saturating_add(4))
+            .ok_or_else(|| Error::Btf("u32 field lies outside raw BTF".into()))?;
+        target.copy_from_slice(&match self.endian {
+            Endian::Little => value.to_le_bytes(),
+            Endian::Big => value.to_be_bytes(),
+        });
         Ok(())
     }
 }

@@ -670,7 +670,12 @@ impl Object {
             Some(btf) => match sys::load_btf_with_token(btf.as_bytes(), 256 * 1024, token_fd) {
                 Ok(fd) => Some(fd),
                 Err(_)
-                    if !self.kfunc_relocations.is_empty() || !self.ksym_relocations.is_empty() =>
+                    if (!self.kfunc_relocations.is_empty()
+                        || !self.ksym_relocations.is_empty())
+                        && !self
+                            .maps
+                            .values()
+                            .any(|map| map.autocreate && map.map_type.requires_btf_types()) =>
                 {
                     None
                 }
@@ -1921,7 +1926,7 @@ fn extern_symbol_is_weak(elf: &Elf<'_>, name: &str) -> Result<bool> {
     )))
 }
 
-fn read_kernel_config() -> Result<Option<HashMap<String, String>>> {
+pub(crate) fn read_kernel_config() -> Result<Option<HashMap<String, String>>> {
     let release =
         fs::read_to_string("/proc/sys/kernel/osrelease").map_err(|source| Error::File {
             operation: "read kernel release",
@@ -3713,13 +3718,12 @@ fn load_maps(
                     && (spec.btf_key_type != TypeId::VOID || spec.btf_value_type != TypeId::VOID);
                 let fd = match create(with_btf) {
                     Ok(fd) => fd,
-                    Err(_) if with_btf => {
-                        create(false).map_err(|(source, log)| Error::MapCreate {
+                    Err(_) if with_btf && !spec.map_type.requires_btf_types() => create(false)
+                        .map_err(|(source, log)| Error::MapCreate {
                             map: name.clone(),
                             source,
                             log,
-                        })?
-                    }
+                        })?,
                     Err((source, log)) => {
                         return Err(Error::MapCreate {
                             map: name.clone(),
@@ -3777,14 +3781,14 @@ fn ensure_map_compatible(spec: &MapSpec, map: &Map) -> Result<()> {
     Ok(())
 }
 
-fn running_kernel_version() -> u32 {
+pub(crate) fn running_kernel_version() -> u32 {
     fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .and_then(|release| parse_kernel_version(&release))
         .unwrap_or_default()
 }
 
-fn parse_kernel_version(release: &str) -> Option<u32> {
+pub(crate) fn parse_kernel_version(release: &str) -> Option<u32> {
     let mut components = release.trim().split('.');
     let major = components.next()?.parse::<u32>().ok()?;
     let minor = components.next()?.parse::<u32>().ok()?;

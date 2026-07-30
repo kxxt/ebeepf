@@ -11,6 +11,7 @@
 
 mod btf;
 mod error;
+mod features;
 mod instruction;
 mod iter;
 mod link;
@@ -32,6 +33,7 @@ mod xdp;
 
 pub use crate::btf::{Btf, BtfEndianness, BtfInfo, BtfKind, BtfMember, BtfObject, BtfType, TypeId};
 pub use crate::error::{Error, Result};
+pub use crate::features::{possible_cpu_count, KernelFeatures};
 pub use crate::instruction::Instruction;
 pub use crate::iter::BpfIterator;
 pub use crate::link::{

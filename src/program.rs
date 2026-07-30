@@ -2089,6 +2089,7 @@ impl AsFd for ProgramStatistics {
 pub struct Program {
     pub(crate) fd: Arc<OwnedFd>,
     spec: ProgramSpec,
+    verifier_log: Arc<str>,
     usdt_manager: Option<Arc<UsdtManager>>,
     token: Option<BpfToken>,
 }
@@ -2099,6 +2100,7 @@ impl fmt::Debug for Program {
             .debug_struct("Program")
             .field("fd", &self.fd.as_raw_fd())
             .field("spec", &self.spec)
+            .field("verifier_log", &self.verifier_log)
             .field("has_usdt_manager", &self.usdt_manager.is_some())
             .field("has_token", &self.token.is_some())
             .finish()
@@ -2176,14 +2178,15 @@ impl Program {
             signature: spec.signature.as_deref(),
             keyring_id: spec.keyring_id,
         };
-        let fd = sys::program_load(&options).map_err(|(source, log)| Error::Verifier {
+        let output = sys::program_load(&options).map_err(|(source, log)| Error::Verifier {
             program: spec.name.clone(),
             source,
             log,
         })?;
         Ok(Self {
-            fd: Arc::new(fd),
+            fd: Arc::new(output.fd),
             spec,
+            verifier_log: output.log.into(),
             usdt_manager: None,
             token: token.cloned(),
         })
@@ -2250,6 +2253,7 @@ impl Program {
         Ok(Self {
             fd: Arc::new(fd),
             spec,
+            verifier_log: Arc::from(""),
             usdt_manager: None,
             token: None,
         })
@@ -2267,6 +2271,14 @@ impl Program {
     /// Program name.
     pub fn name(&self) -> &str {
         self.spec.name()
+    }
+
+    /// Verifier output captured while this program was loaded.
+    ///
+    /// The string is empty unless the corresponding [`ProgramSpec`] requested
+    /// a nonzero [`VerifierLog`] level and capacity.
+    pub fn verifier_output(&self) -> &str {
+        &self.verifier_log
     }
 
     /// Borrows the kernel file descriptor.

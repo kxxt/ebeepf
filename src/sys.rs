@@ -1131,7 +1131,14 @@ pub(crate) fn load_btf_with_token(
     command_fd(BPF_BTF_LOAD, &attr).map_err(|error| (error, log_string(&log)))
 }
 
-pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Error, String)> {
+pub(crate) struct ProgramLoadOutput {
+    pub fd: OwnedFd,
+    pub log: String,
+}
+
+pub(crate) fn program_load(
+    options: &ProgramLoad<'_>,
+) -> Result<ProgramLoadOutput, (io::Error, String)> {
     if options.attach_program_fd.is_some() && options.attach_btf_object_fd.is_some() {
         return Err((
             io::Error::new(
@@ -1190,7 +1197,11 @@ pub(crate) fn program_load(options: &ProgramLoad<'_>) -> Result<OwnedFd, (io::Er
         ..Default::default()
     };
     set_object_name(&mut attr.prog_name, options.name);
-    command_fd(BPF_PROG_LOAD, &attr).map_err(|error| (error, log_string(&log)))
+    let fd = command_fd(BPF_PROG_LOAD, &attr).map_err(|error| (error, log_string(&log)))?;
+    Ok(ProgramLoadOutput {
+        fd,
+        log: log_string(&log),
+    })
 }
 
 pub(crate) fn probe_program_type(program_type: u32) -> io::Result<bool> {
@@ -1318,6 +1329,7 @@ fn probe_program_load(
         signature: None,
         keyring_id: 0,
     })
+    .map(|output| output.fd)
 }
 
 fn running_kernel_version() -> u32 {

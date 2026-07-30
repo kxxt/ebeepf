@@ -1033,6 +1033,21 @@ fn loads_program_and_exercises_map_crud() {
 }
 
 #[test]
+#[ignore = "requires root or CAP_BPF, clang with the BPF target, and task-local storage maps"]
+fn loads_task_storage_map_with_object_btf() {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/task-storage.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("task-storage.bpf.o");
+    compile_bpf(&source, &object_path);
+
+    let loaded = Object::open(object_path).unwrap().load().unwrap();
+    let info = loaded.map("task_values").unwrap().info().unwrap();
+    assert_eq!(info.map_type, MapType::TaskStorage);
+    assert_ne!(info.btf_id, 0);
+    assert_ne!(info.btf_value_type, TypeId::VOID);
+}
+
+#[test]
 #[ignore = "requires root or CAP_BPF, BPF uprobe-multi, and an eBPF-enabled kernel"]
 fn attaches_usdt_and_receives_cookie() {
     const COOKIE: i32 = 1337;

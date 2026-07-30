@@ -1277,6 +1277,7 @@ fn render_data_struct(
         definitions,
         "/// Owned, layout-independent value decoded from BTF type `{}`.\n\
          #[derive(Clone, Debug, PartialEq)]\n\
+         #[allow(clippy::derive_partial_eq_without_eq)]\n\
          pub struct {name} {{",
         doc_text(suggested)
     )

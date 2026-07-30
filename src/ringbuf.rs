@@ -257,6 +257,11 @@ struct Mapping {
     len: NonZeroUsize,
 }
 
+// SAFETY: this value uniquely owns a process-wide mapping with no thread
+// affinity. Ring-buffer consumption requires `&mut RingBuffer`, so moving the
+// mapping cannot introduce concurrent userspace consumers.
+unsafe impl Send for Mapping {}
+
 impl Mapping {
     fn shared(
         fd: libc::c_int,
@@ -374,10 +379,13 @@ mod tests {
 
     #[test]
     fn record_sizes_include_header_and_alignment() {
+        fn assert_send<T: Send>() {}
+
         assert_eq!(record_size(0), 8);
         assert_eq!(record_size(1), 16);
         assert_eq!(record_size(8), 16);
         assert_eq!(record_size(9), 24);
+        assert_send::<RingBuffer>();
     }
 
     #[test]

@@ -279,6 +279,13 @@ impl MapType {
                 | Self::Arena
         )
     }
+
+    pub(crate) const fn requires_btf_types(self) -> bool {
+        matches!(
+            self,
+            Self::SocketStorage | Self::InodeStorage | Self::TaskStorage | Self::CgroupLocalStorage
+        )
+    }
 }
 
 /// Pinning policy encoded in a BTF map definition.
@@ -1697,6 +1704,11 @@ struct MapMapping {
     map: Map,
 }
 
+// SAFETY: the mapping is owned for its complete lifetime, has no thread
+// affinity, and is only exposed through volatile copies. Mutable access still
+// requires `&mut self` after the value is moved to another thread.
+unsafe impl Send for MapMapping {}
+
 impl fmt::Debug for MapMapping {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1979,9 +1991,15 @@ mod tests {
 
     #[test]
     fn map_types_round_trip_even_when_unknown() {
+        fn assert_send<T: Send>() {}
+
         for raw in 0..=40 {
             assert_eq!(MapType::from_raw(raw).as_raw(), raw);
         }
+        assert!(MapType::TaskStorage.requires_btf_types());
+        assert!(!MapType::Hash.requires_btf_types());
+        assert_send::<MapMemory>();
+        assert_send::<MapMemoryMut>();
     }
 
     #[test]
