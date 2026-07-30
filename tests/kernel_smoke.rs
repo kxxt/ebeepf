@@ -706,7 +706,7 @@ fn creates_resources_with_a_delegated_bpf_token() {
     parent_socket
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
-    fcntl(child_socket.as_raw_fd(), FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
+    fcntl(&child_socket, FcntlArg::F_SETFD(FdFlag::empty())).unwrap();
     let child_directory = tempfile::tempdir().unwrap();
     fs::set_permissions(child_directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
     let child_executable = child_directory.path().join("kernel-smoke");
@@ -888,7 +888,7 @@ fn receive_fd(socket: &UnixDatagram) -> nix::Result<OwnedFd> {
         Some(&mut control),
         MsgFlags::empty(),
     )?;
-    for control in message.cmsgs() {
+    for control in message.cmsgs()? {
         if let ControlMessageOwned::ScmRights(descriptors) = control {
             if let Some(fd) = descriptors.into_iter().next() {
                 // SAFETY: SCM_RIGHTS creates a new descriptor owned by the
