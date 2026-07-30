@@ -268,8 +268,21 @@ impl Drop for TemporaryInterface {
 }
 
 fn compile_bpf(source: &Path, output: &Path) {
+    let target = bpf_target();
+    let source_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
+    let include_directory = source_directory
+        .join("include")
+        .join(target.vmlinux_directory);
     let status = Command::new("clang")
-        .args(["-target", "bpfel", "-g", "-O2", "-c"])
+        .arg("-target")
+        .arg(target.llvm_target)
+        .args(["-g", "-O2"])
+        .arg(format!("-D__TARGET_ARCH_{}", target.libbpf_arch))
+        .arg("-I")
+        .arg(&include_directory)
+        .arg("-I")
+        .arg(source_directory)
+        .arg("-c")
         .arg(source)
         .arg("-o")
         .arg(output)
@@ -280,6 +293,37 @@ fn compile_bpf(source: &Path, output: &Path) {
         "failed to compile BPF fixture `{}`",
         source.display()
     );
+}
+
+struct BpfTarget {
+    llvm_target: &'static str,
+    libbpf_arch: &'static str,
+    vmlinux_directory: &'static str,
+}
+
+fn bpf_target() -> BpfTarget {
+    let architecture =
+        env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| env::consts::ARCH.into());
+    let llvm_target = if cfg!(target_endian = "big") {
+        "bpfeb"
+    } else {
+        "bpfel"
+    };
+    let (libbpf_arch, vmlinux_directory) = match architecture.as_str() {
+        "x86" | "x86_64" => ("x86", "x86"),
+        "arm" => ("arm", "arm"),
+        "aarch64" => ("arm64", "aarch64"),
+        "loongarch64" => ("loongarch", "loongarch64"),
+        "powerpc" | "powerpc64" => ("powerpc", "powerpc"),
+        "riscv64" => ("riscv", "riscv64"),
+        "s390x" => ("s390", "s390x"),
+        value => panic!("target architecture `{value}` has no __TARGET_ARCH mapping"),
+    };
+    BpfTarget {
+        llvm_target,
+        libbpf_arch,
+        vmlinux_directory,
+    }
 }
 
 fn minimal_btf() -> Vec<u8> {
@@ -380,8 +424,12 @@ fn creates_and_populates_llvm_instruction_arrays() {
 #[test]
 #[ignore = "requires root or CAP_BPF and a kernel with BPF program streams"]
 fn reads_program_output_streams() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/stream.bpf.o");
-    let loaded = Object::open(fixture).unwrap().load().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/stream.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("stream.bpf.o");
+    compile_bpf(&source, &object_path);
+
+    let loaded = Object::open(&object_path).unwrap().load().unwrap();
     let program = loaded.program("trigger_streams").unwrap();
     program.test_run(TestRunOptions::new(&[])).unwrap();
 
@@ -395,13 +443,15 @@ fn reads_program_output_streams() {
 #[test]
 #[ignore = "requires root or CAP_BPF and an eBPF-enabled kernel"]
 fn links_and_loads_multiple_elf_objects() {
-    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin");
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
+    let build = tempfile::tempdir().unwrap();
+    let usdt = build.path().join("usdt.bpf.o");
+    let ringbuf = build.path().join("ringbuf.bpf.o");
+    compile_bpf(&sources.join("usdt.bpf.c"), &usdt);
+    compile_bpf(&sources.join("ringbuf.bpf.c"), &ringbuf);
+
     let mut linker = ObjectLinker::new();
-    linker
-        .add_file(fixtures.join("usdt.bpf.o"))
-        .unwrap()
-        .add_file(fixtures.join("ringbuf.bpf.o"))
-        .unwrap();
+    linker.add_file(usdt).unwrap().add_file(ringbuf).unwrap();
     let linked = linker.link().unwrap();
     let loaded = linked.open().unwrap().load().unwrap();
     assert!(loaded.program("handle__usdt").is_ok());
@@ -460,19 +510,15 @@ fn resolves_cross_object_maps() {
 #[test]
 #[ignore = "requires root or CAP_BPF, clang with CO-RE support, and the zram module with BTF"]
 fn links_core_relocations_across_objects() {
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/module-core.bpf.c");
+    let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf");
     let build = tempfile::tempdir().unwrap();
     let core = build.path().join("module-core.bpf.o");
-    compile_bpf(&source, &core);
+    let ringbuf = build.path().join("ringbuf.bpf.o");
+    compile_bpf(&sources.join("module-core.bpf.c"), &core);
+    compile_bpf(&sources.join("ringbuf.bpf.c"), &ringbuf);
 
     let mut linker = ObjectLinker::new();
-    linker
-        .add_file(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/ringbuf.bpf.o"),
-        )
-        .unwrap()
-        .add_file(core)
-        .unwrap();
+    linker.add_file(ringbuf).unwrap().add_file(core).unwrap();
     let loaded = linker.link().unwrap().open().unwrap().load().unwrap();
     let output = loaded
         .program("module_type_exists")
@@ -1052,9 +1098,13 @@ fn loads_task_storage_map_with_object_btf() {
 fn attaches_usdt_and_receives_cookie() {
     const COOKIE: i32 = 1337;
 
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/usdt.bpf.o");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/bpf/usdt.bpf.c");
+    let build = tempfile::tempdir().unwrap();
+    let object_path = build.path().join("usdt.bpf.o");
+    compile_bpf(&source, &object_path);
+
     let executable = env::current_exe().unwrap();
-    let loaded = Object::open(&fixture).unwrap().load().unwrap();
+    let loaded = Object::open(&object_path).unwrap().load().unwrap();
     let mut ring = RingBuffer::new(loaded.map("ringbuf").unwrap()).unwrap();
     let program = loaded.program("handle__usdt_with_cookie").unwrap();
     let program_info = program.info().unwrap();

@@ -901,30 +901,32 @@ mod tests {
 
     #[test]
     fn discovers_repository_usdt_fixture_when_available() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/usdt.bpf.o");
-        if !path.exists() {
-            return;
-        }
+        let fixture = crate::test_bpf::compile_fixture("usdt");
         // The BPF object itself has no SystemTap notes; this verifies the
         // structured error path against a real ELF.
-        assert!(discover_usdt_probes(path).is_err());
+        assert!(discover_usdt_probes(fixture.path()).is_err());
     }
 
     #[test]
     fn encodes_repository_usdt_layout_from_btf_when_available() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/usdt.bpf.o");
-        if !path.exists() {
-            return;
-        }
-        let object = crate::Object::open(path).unwrap();
+        let fixture = crate::test_bpf::compile_fixture("usdt");
+        let object = crate::Object::open(fixture.path()).unwrap();
         let btf = object.btf().unwrap();
         let value_size = object.map(SPEC_MAP).unwrap().value_size();
         let layout = UsdtLayout::from_btf(btf, value_size).unwrap();
         let encoded = layout.encode(btf, "-8@%rax", 1337).unwrap();
 
-        assert_eq!(encoded.len(), 304);
-        assert_eq!(&encoded[288..296], &1337_u64.to_ne_bytes());
-        assert_eq!(&encoded[296..298], &1_u16.to_ne_bytes());
+        assert_eq!(encoded.len(), value_size as usize);
+        let cookie_offset = (layout.cookie.bit_offset / 8) as usize;
+        assert_eq!(
+            &encoded[cookie_offset..cookie_offset + layout.cookie.size],
+            &1337_u64.to_ne_bytes()
+        );
+        let argument_count_offset = (layout.argument_count.bit_offset / 8) as usize;
+        assert_eq!(
+            &encoded[argument_count_offset..argument_count_offset + layout.argument_count.size],
+            &1_u16.to_ne_bytes()
+        );
         assert!(layout.encode(btf, "-8@()", 0).is_err());
     }
 }

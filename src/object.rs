@@ -110,6 +110,9 @@ struct KconfigDefinition {
     overrides: HashMap<String, String>,
 }
 
+type KconfigRelocations = HashMap<String, (String, u32)>;
+type KconfigMap = (KconfigRelocations, Option<KconfigDefinition>);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StructOpsCallback {
     member_index: usize,
@@ -1703,7 +1706,7 @@ fn add_kconfig_map(
     elf: &Elf<'_>,
     btf: Option<&mut Btf>,
     maps: &mut BTreeMap<String, MapSpec>,
-) -> Result<(HashMap<String, (String, u32)>, Option<KconfigDefinition>)> {
+) -> Result<KconfigMap> {
     let Some(btf) = btf else {
         return Ok((HashMap::new(), None));
     };
@@ -5976,11 +5979,8 @@ mod tests {
 
     #[test]
     fn relocates_repository_usdt_btf_information_when_available() {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/usdt.bpf.o");
-        if !path.exists() {
-            return;
-        }
-        let object = Object::open(path).unwrap();
+        let fixture = crate::test_bpf::compile_fixture("usdt");
+        let object = Object::open(fixture.path()).unwrap();
         let (_, BtfType::Function { linkage, .. }) = object
             .btf()
             .unwrap()
@@ -5991,38 +5991,47 @@ mod tests {
         };
         assert_eq!(*linkage, 0);
         assert_eq!(
-            object.program("handle__usdt").unwrap().func_info,
-            [0_u32.to_le_bytes(), 59_u32.to_le_bytes()].concat()
+            function_info_records(&object, "handle__usdt"),
+            [(0, "handle__usdt".to_owned())]
         );
         assert_eq!(
-            object
-                .program("handle__usdt_with_cookie")
-                .unwrap()
-                .func_info,
+            function_info_records(&object, "handle__usdt_with_cookie"),
             [
-                0_u32.to_le_bytes(),
-                61_u32.to_le_bytes(),
-                27_u32.to_le_bytes(),
-                56_u32.to_le_bytes()
+                (0, "handle__usdt_with_cookie".to_owned()),
+                (27, "bpf_usdt_cookie".to_owned())
             ]
-            .concat()
         );
     }
 
     #[test]
     fn resolves_rel_data_section_addends_from_ldimm64() {
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin/stream.bpf.o");
-        if !path.exists() {
-            return;
-        }
-        let object = Object::open(path).unwrap();
+        let fixture = crate::test_bpf::compile_fixture("stream");
+        let object = Object::open(fixture.path()).unwrap();
         let offsets = object
             .map_relocations
             .iter()
             .filter_map(|relocation| relocation.value_offset)
             .collect::<Vec<_>>();
         assert_eq!(offsets, [0, 7]);
+    }
+
+    fn function_info_records(object: &Object, program: &str) -> Vec<(u32, String)> {
+        let btf = object.btf().unwrap();
+        let info = object.program(program).unwrap().function_info();
+        assert_eq!(info.record_size, 8);
+        info.bytes
+            .chunks_exact(8)
+            .map(|record| {
+                let instruction_offset = u32::from_le_bytes(record[..4].try_into().unwrap());
+                let type_id = TypeId(u32::from_le_bytes(record[4..8].try_into().unwrap()));
+                let name = btf
+                    .type_by_id(type_id)
+                    .and_then(BtfType::name)
+                    .unwrap()
+                    .to_owned();
+                (instruction_offset, name)
+            })
+            .collect()
     }
 
     #[test]

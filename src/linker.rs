@@ -31,6 +31,8 @@ const R_BPF_64_NODYLD32: u32 = 4;
 const BTF_HEADER_LEN: u32 = 24;
 const BTF_EXT_HEADER_LEN: u32 = 32;
 
+type LinkedBtfSections = (Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// A pure Rust builder for combining relocatable eBPF ELF objects.
 ///
 /// Sections with the same name are concatenated with their required
@@ -1122,7 +1124,7 @@ fn merge_btf(
     placements: &[Vec<Option<SectionPlacement>>],
     output_sections: &HashMap<String, OutputSection>,
     endian: Endian,
-) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+) -> Result<LinkedBtfSections> {
     let btf_inputs = inputs
         .iter()
         .enumerate()
@@ -1903,14 +1905,14 @@ mod tests {
 
     #[test]
     fn links_repository_objects_with_btf_and_ext_info() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libbpf-rs/tests/bin");
-        let usdt = root.join("usdt.bpf.o");
-        let ringbuf = root.join("ringbuf.bpf.o");
-        if !usdt.exists() || !ringbuf.exists() {
-            return;
-        }
+        let usdt = crate::test_bpf::compile_fixture("usdt");
+        let ringbuf = crate::test_bpf::compile_fixture("ringbuf");
         let mut linker = ObjectLinker::new();
-        linker.add_file(usdt).unwrap().add_file(ringbuf).unwrap();
+        linker
+            .add_file(usdt.path())
+            .unwrap()
+            .add_file(ringbuf.path())
+            .unwrap();
         let linked = linker.link().unwrap();
         let object = linked.open().unwrap();
         assert!(object.btf().is_some());

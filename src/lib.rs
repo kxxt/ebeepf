@@ -26,6 +26,8 @@ mod ringbuf;
 pub mod skel;
 mod sys;
 mod tc;
+#[cfg(test)]
+mod test_bpf;
 mod token;
 mod usdt;
 mod user_ringbuf;
