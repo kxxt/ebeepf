@@ -527,12 +527,20 @@ impl Object {
             return Ok(self);
         };
         definition.overrides = parse_kconfig_overrides(contents.as_ref())?;
+        if definition
+            .entries
+            .iter()
+            .any(|entry| entry.name.starts_with("CONFIG_"))
+        {
+            definition.system = read_kernel_config()?;
+        }
         let initial = build_kconfig_value(
             &definition,
             self.btf
                 .as_ref()
                 .ok_or_else(|| Error::InvalidObject(".kconfig requires BTF".into()))?,
             false,
+            true,
         )?;
         self.maps
             .get_mut(&definition.map_name)
@@ -734,15 +742,23 @@ impl Object {
     }
 
     fn refresh_kconfig(&mut self, require_all: bool) -> Result<()> {
-        let Some(definition) = self.kconfig.as_ref() else {
+        let Some(definition) = self.kconfig.as_mut() else {
             return Ok(());
         };
+        if definition
+            .entries
+            .iter()
+            .any(|entry| entry.name.starts_with("CONFIG_"))
+        {
+            definition.system = read_kernel_config()?;
+        }
         let initial = build_kconfig_value(
             definition,
             self.btf
                 .as_ref()
                 .ok_or_else(|| Error::InvalidObject(".kconfig requires BTF".into()))?,
             require_all,
+            true,
         )?;
         self.maps
             .get_mut(&definition.map_name)
@@ -1748,21 +1764,14 @@ fn add_kconfig_map(
     for entry in &entries {
         symbols.insert(entry.name.clone(), (name.clone(), entry.offset));
     }
-    let needs_kernel_config = entries
-        .iter()
-        .any(|entry| entry.name.starts_with("CONFIG_"));
-    let system = needs_kernel_config
-        .then(read_kernel_config)
-        .transpose()?
-        .flatten();
     let definition = KconfigDefinition {
         map_name: name.clone(),
         size,
         entries,
-        system,
+        system: None,
         overrides: HashMap::new(),
     };
-    let initial_value = build_kconfig_value(&definition, btf, false)?;
+    let initial_value = build_kconfig_value(&definition, btf, false, false)?;
 
     let mut spec = MapSpec::new(&name, MapType::Array, 4, size, 1);
     spec.flags = MapFlags::MMAPABLE | MapFlags::PROGRAM_READ_ONLY;
@@ -1781,15 +1790,24 @@ fn build_kconfig_value(
     definition: &KconfigDefinition,
     btf: &Btf,
     require_all: bool,
+    resolve_virtuals: bool,
 ) -> Result<Vec<u8>> {
     let mut initial_value = vec![0; definition.size as usize];
     for entry in &definition.entries {
-        if let Some(value) = match entry.name.as_str() {
-            "LINUX_KERNEL_VERSION" => Some(u64::from(running_kernel_version())),
-            "LINUX_HAS_BPF_COOKIE" => Some(u64::from(sys::supports_bpf_cookie())),
-            "LINUX_HAS_SYSCALL_WRAPPER" => Some(u64::from(kernel_has_syscall_wrapper()?)),
+        let virtual_value = match entry.name.as_str() {
+            "LINUX_KERNEL_VERSION" if resolve_virtuals => Some(u64::from(running_kernel_version())),
+            "LINUX_HAS_BPF_COOKIE" if resolve_virtuals => {
+                Some(u64::from(sys::supports_bpf_cookie()))
+            }
+            "LINUX_HAS_SYSCALL_WRAPPER" if resolve_virtuals => {
+                Some(u64::from(kernel_has_syscall_wrapper()?))
+            }
+            "LINUX_KERNEL_VERSION" | "LINUX_HAS_BPF_COOKIE" | "LINUX_HAS_SYSCALL_WRAPPER" => {
+                continue;
+            }
             _ => None,
-        } {
+        };
+        if let Some(value) = virtual_value {
             write_kconfig_numeric(
                 &mut initial_value,
                 entry.offset,
