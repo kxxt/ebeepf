@@ -698,6 +698,81 @@ impl SkeletonBuilder {
         self.generate(output)
     }
 
+    /// Instruments the configured source with bpfcov and selects the resulting
+    /// object for skeleton generation.
+    ///
+    /// The instrumented and coverage-only objects are written below
+    /// `coverage_directory`. If [`Self::object`] selected another path, the
+    /// instrumented object is copied there and the returned
+    /// [`InstrumentedBuild`](crate::coverage::InstrumentedBuild) names that
+    /// selected path.
+    #[cfg(feature = "coverage")]
+    pub fn build_coverage(
+        &mut self,
+        coverage_directory: impl AsRef<Path>,
+    ) -> Result<crate::coverage::InstrumentedBuild> {
+        let source = self
+            .source
+            .clone()
+            .ok_or_else(|| Error::Build("no eBPF C source was configured".into()))?;
+        let coverage_directory = coverage_directory.as_ref();
+        let architecture = format!("-D__TARGET_ARCH_{}", target_arch()?);
+
+        let mut pipeline = crate::coverage::Pipeline::new()
+            .source(&source)
+            .output_dir(coverage_directory)
+            .clang_args(self.clang_args.iter().cloned())
+            .clang_arg(architecture)
+            .clang_arg("-fno-stack-protector");
+        if self.clang != Path::new("clang") {
+            pipeline = pipeline.clang(self.clang.clone().into_os_string());
+        }
+        if let Some(path) = env::var_os("BPFCOV_LIB") {
+            pipeline = pipeline.lib_bpfcov(Path::new(&path));
+        }
+        let mut build = pipeline.run().map_err(|error| {
+            Error::Build(format!(
+                "bpfcov failed to instrument `{}`: {error}",
+                source.display()
+            ))
+        })?;
+
+        if let Some(object) = self.object.clone() {
+            if object != build.instrumented_obj {
+                if let Some(parent) = object.parent() {
+                    fs::create_dir_all(parent).map_err(|source| Error::File {
+                        operation: "create instrumented eBPF object output directory",
+                        path: parent.into(),
+                        source,
+                    })?;
+                }
+                fs::copy(&build.instrumented_obj, &object).map_err(|source| Error::File {
+                    operation: "copy instrumented eBPF object",
+                    path: object.clone(),
+                    source,
+                })?;
+                build.instrumented_obj = object;
+            }
+        } else {
+            self.object = Some(build.instrumented_obj.clone());
+        }
+
+        Ok(build)
+    }
+
+    /// Instruments the configured source with bpfcov and generates a Rust
+    /// skeleton for the instrumented object.
+    #[cfg(feature = "coverage")]
+    pub fn build_with_coverage_and_generate(
+        &mut self,
+        output: impl AsRef<Path>,
+        coverage_directory: impl AsRef<Path>,
+    ) -> Result<crate::coverage::InstrumentedBuild> {
+        let build = self.build_coverage(coverage_directory)?;
+        self.generate(output)?;
+        Ok(build)
+    }
+
     /// Returns the selected or inferred object path after [`Self::build`].
     pub fn object_path(&self) -> Option<&Path> {
         self.object.as_deref()

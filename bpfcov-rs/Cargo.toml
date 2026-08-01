@@ -1,0 +1,19 @@
+[package]
+name = "bpfcov"
+version = "0.3.0-alpha.1"
+edition = "2021"
+rust-version = "1.82"
+description = "Generate source-based code coverage for eBPF programs"
+license = "BSD-2-Clause"
+repository = "https://github.com/kxxt/ebeepf"
+homepage = "https://github.com/kxxt/ebeepf/tree/master/bpfcov-rs"
+readme = "README.md"
+keywords = ["bpf", "ebpf", "coverage", "llvm"]
+
+[features]
+default = ["libbpf", "vendored"]
+libbpf = ["dep:libbpf-rs"]
+vendored = []
+
+[dependencies]
+libbpf-rs = { version = "0.26", optional = true }

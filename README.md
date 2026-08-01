@@ -36,6 +36,53 @@ SkeletonBuilder::new()
 # Ok::<(), ebeepf::Error>(())
 ```
 
+## Source-based coverage
+
+The optional `coverage` feature integrates the workspace's `bpfcov` crate. It
+builds the bpfcov LLVM pass, adds coverage-aware skeleton generation, collects
+the profiling maps through `ebeepf`, and re-exports bpfcov's report helpers.
+Enable the feature for both the build script and application:
+
+```toml
+[dependencies]
+ebeepf = { version = "0.1", features = ["coverage"] }
+
+[build-dependencies]
+ebeepf = { version = "0.1", features = ["coverage"] }
+```
+
+An instrumented skeleton can then be generated without configuring a separate
+bpfcov dependency:
+
+```rust,no_run
+use ebeepf::SkeletonBuilder;
+
+let build = SkeletonBuilder::new()
+    .source("src/bpf/tracer.bpf.c")
+    .build_with_coverage_and_generate("src/bpf/tracer.skel.rs", "target/bpfcov")?;
+println!("coverage object: {}", build.coverage_obj.display());
+# Ok::<(), ebeepf::Error>(())
+```
+
+After loading and exercising the instrumented object, write its LLVM profile
+or use the re-exported report module:
+
+```rust,ignore
+use ebeepf::coverage::{report, write_profraw_file};
+
+write_profraw_file(skeleton.object(), "tracer.profraw")?;
+report::merge_profdata(
+    &[std::path::Path::new("tracer.profraw")],
+    std::path::Path::new("tracer.profdata"),
+    None,
+)?;
+```
+
+The feature needs a C++ compiler and an LLVM installation with `llvm-config`,
+`clang`, `opt`, and `llc`. `BPFCOV_LIB` can override the bundled pass, while
+the standard `CLANG`, `OPT`, `LLC`, `LLVM_CONFIG`, and `CXX` variables select
+the toolchain.
+
 The generated API has explicit builder, open, and loaded stages. Open
 skeletons expose mutable map/program definitions and safe BTF-derived global
 data getters and setters. Loaded skeletons retain automatically created links

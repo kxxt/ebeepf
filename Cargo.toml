@@ -1,3 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["bpfcov-rs"]
+
 [package]
 name = "ebeepf"
 version = "0.1.0"
@@ -10,8 +14,13 @@ description = "A pure Rust, safe and idiomatic eBPF loader and runtime"
 readme = "README.md"
 keywords = ["bpf", "ebpf", "linux", "tracing"]
 
+[features]
+default = []
+coverage = ["dep:bpfcov", "bpfcov/vendored"]
+
 [dependencies]
 bitflags = "2.0"
+bpfcov = { path = "bpfcov-rs", version = "0.3.0-alpha.1", default-features = false, optional = true }
 flate2 = { version = "1.0", default-features = false, features = ["rust_backend"] }
 goblin = { version = "0.10.7", default-features = false, features = ["std", "elf32", "elf64", "endian_fd"] }
 libc = "0.2"
@@ -23,5 +32,4 @@ thiserror = "2.0"
 nix = { version = "0.31", default-features = false, features = ["fs", "socket", "uio"] }
 probe = "0.5.2"
 tempfile = "3.3"
-
 

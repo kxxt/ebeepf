@@ -10,6 +10,8 @@
 #![cfg_attr(not(target_os = "linux"), allow(unused))]
 
 mod btf;
+#[cfg(feature = "coverage")]
+pub mod coverage;
 mod error;
 mod features;
 mod instruction;
