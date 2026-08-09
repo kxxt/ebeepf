@@ -15,7 +15,10 @@ use goblin::elf::sym::{STB_GLOBAL, STB_WEAK, STT_FUNC, STT_OBJECT, STV_HIDDEN};
 use goblin::elf::{Elf, SectionHeader, Sym};
 
 use crate::btf::{BtfMember, BtfType, Endian};
-use crate::map::{arena_mmap_size, page_size, possible_cpu_count, MapFlags, Pinning};
+use crate::map::{
+    adjust_ring_buffer_max_entries, arena_mmap_size, page_size, possible_cpu_count, MapFlags,
+    Pinning,
+};
 use crate::program::{
     exclusive_map_hash, kind_supports_auto_attach, program_flags_from_section, ProgramKind,
     VerifierLog,
@@ -33,12 +36,14 @@ const R_BPF_64_32: u32 = 10;
 const R_BPF_64_ABS32: u32 = 3;
 const R_BPF_64_NODYLD32: u32 = 4;
 const BPF_LD_IMM_DW: u8 = 0x18;
+const BPF_CALL: u8 = 0x85;
 const BPF_PSEUDO_MAP_FD: u8 = 1;
 const BPF_PSEUDO_MAP_VALUE: u8 = 2;
 const BPF_PSEUDO_BTF_ID: u8 = 3;
 const BPF_PSEUDO_CALL: u8 = 1;
 const BPF_PSEUDO_KFUNC_CALL: u8 = 2;
 const BPF_PSEUDO_FUNC: u8 = 4;
+const POISON_LDIMM64_MAP_BASE: i32 = 2_001_000_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MapRelocation {
@@ -645,6 +650,9 @@ impl Object {
                     Error::InvalidObject("possible CPU count does not fit u32".into())
                 })?;
             }
+            if matches!(map.map_type, MapType::RingBuffer | MapType::UserRingBuffer) {
+                map.max_entries = adjust_ring_buffer_max_entries(map.max_entries)?;
+            }
         }
         prepare_arena_data_layout(&mut self.maps, token_fd)?;
         for map in self.maps.values() {
@@ -1202,6 +1210,16 @@ fn parse_maps(
                 spec.section_index = Some(map_section_index);
                 spec.section_offset = u64::from(variable.offset);
                 if let Some(values_type) = values.get("values") {
+                    if spec.value_size != 0 && spec.value_size != size_of::<u32>() as u32 {
+                        return Err(Error::InvalidObject(format!(
+                            "map `{name}` values member conflicts with value size {}",
+                            spec.value_size
+                        )));
+                    }
+                    // Map-in-map and program-array values are kernel file
+                    // descriptors, even though the BTF `__array(values, ...)`
+                    // encoding itself has no ordinary value type.
+                    spec.value_size = size_of::<u32>() as u32;
                     let id = btf.resolve_type(*values_type)?;
                     let BtfType::Array { element_type, .. } =
                         btf.type_by_id(id).ok_or_else(|| {
@@ -3077,19 +3095,42 @@ fn relocate_maps(
     relocations: &[MapRelocation],
     maps: &BTreeMap<String, Map>,
 ) -> Result<()> {
-    for relocation in relocations {
+    for (relocation_index, relocation) in relocations.iter().enumerate() {
         let program = programs.get_mut(&relocation.program).ok_or_else(|| {
             Error::InvalidObject(format!(
                 "relocation references missing program `{}`",
                 relocation.program
             ))
         })?;
-        let map = maps.get(&relocation.map).ok_or_else(|| {
-            Error::InvalidObject(format!(
-                "relocation references missing map `{}`",
-                relocation.map
-            ))
-        })?;
+        if !program.autoload {
+            continue;
+        }
+        let Some(map) = maps.get(&relocation.map) else {
+            let poison = POISON_LDIMM64_MAP_BASE
+                .checked_add(i32::try_from(relocation_index).map_err(|_| {
+                    Error::InvalidObject("map relocation index does not fit i32".into())
+                })?)
+                .ok_or_else(|| Error::InvalidObject("map relocation poison overflows".into()))?;
+            let second_instruction = relocation
+                .instruction_index
+                .checked_add(1)
+                .ok_or_else(|| Error::InvalidObject("map relocation index overflows".into()))?;
+            for instruction_index in [relocation.instruction_index, second_instruction] {
+                let instruction =
+                    program
+                        .instructions
+                        .get_mut(instruction_index)
+                        .ok_or_else(|| {
+                            Error::InvalidObject("map relocation is outside program".into())
+                        })?;
+                // Match libbpf's poison relocation: reachable references to a
+                // deliberately uncreated map fail verification with an
+                // identifiable invalid helper, while dead branches are
+                // discarded by the verifier.
+                *instruction = Instruction::new(BPF_CALL, 0, 0, 0, poison);
+            }
+            continue;
+        };
         let fd = map.fd.as_raw_fd();
         let instruction = program
             .instructions
@@ -5015,30 +5056,25 @@ fn resolve_target_field(
                 let local_member = local_members
                     .get(accessor)
                     .ok_or_else(|| Error::Btf("local CO-RE member index is out of range".into()))?;
-                let target_member = target_members
-                    .iter()
-                    .find(|member| {
-                        !local_member.name.is_empty()
-                            && essential_name(&member.name) == essential_name(&local_member.name)
+                let target_member = if local_member.name.is_empty() {
+                    target_members.get(accessor).map(|member| FieldDescriptor {
+                        ty: member.ty,
+                        bit_offset: u64::from(member.bit_offset),
+                        bitfield_size: member.bitfield_size.filter(|size| *size != 0),
                     })
-                    .or_else(|| {
-                        local_member
-                            .name
-                            .is_empty()
-                            .then(|| target_members.get(accessor))
-                            .flatten()
-                    })
-                    .ok_or_else(|| {
-                        Error::Btf(format!("target type has no member `{}`", local_member.name))
-                    })?;
+                } else {
+                    find_target_member_by_name(target, target_members, &local_member.name)?
+                }
+                .ok_or_else(|| {
+                    Error::Btf(format!("target type has no member `{}`", local_member.name))
+                })?;
                 local_descriptor.ty = local_member.ty;
                 local_descriptor.bit_offset += u64::from(local_member.bit_offset);
                 local_descriptor.bitfield_size =
                     local_member.bitfield_size.filter(|size| *size != 0);
                 target_descriptor.ty = target_member.ty;
-                target_descriptor.bit_offset += u64::from(target_member.bit_offset);
-                target_descriptor.bitfield_size =
-                    target_member.bitfield_size.filter(|size| *size != 0);
+                target_descriptor.bit_offset += target_member.bit_offset;
+                target_descriptor.bitfield_size = target_member.bitfield_size;
             }
             (
                 BtfType::Array {
@@ -5073,6 +5109,39 @@ fn resolve_target_field(
         }
     }
     Ok(target_descriptor)
+}
+
+fn find_target_member_by_name(
+    btf: &Btf,
+    members: &[BtfMember],
+    name: &str,
+) -> Result<Option<FieldDescriptor>> {
+    if let Some(member) = members
+        .iter()
+        .find(|member| essential_name(&member.name) == essential_name(name))
+    {
+        return Ok(Some(FieldDescriptor {
+            ty: member.ty,
+            bit_offset: u64::from(member.bit_offset),
+            bitfield_size: member.bitfield_size.filter(|size| *size != 0),
+        }));
+    }
+
+    // C promotes members of anonymous structs and unions into their parent.
+    // CO-RE field matching follows the same rule, so a local direct member
+    // can match a target member nested through one or more anonymous records.
+    for member in members.iter().filter(|member| member.name.is_empty()) {
+        let member_type = btf.resolve_type(member.ty)?;
+        let nested_members = match btf.type_by_id(member_type) {
+            Some(BtfType::Struct { members, .. } | BtfType::Union { members, .. }) => members,
+            _ => continue,
+        };
+        if let Some(mut nested) = find_target_member_by_name(btf, nested_members, name)? {
+            nested.bit_offset += u64::from(member.bit_offset);
+            return Ok(Some(nested));
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5657,6 +5726,62 @@ mod tests {
         Btf::parse(&bytes).unwrap()
     }
 
+    fn anonymous_member_core_btf(target: bool) -> Btf {
+        let mut strings = vec![0];
+        let mut add_string = |value: &str| {
+            let offset = strings.len() as u32;
+            strings.extend(value.as_bytes());
+            strings.push(0);
+            offset
+        };
+        let u64_name = add_string("u64");
+        let sock_name = add_string(if target { "sock" } else { "sock___flavor" });
+        let timer_name = add_string("tcp_retransmit_timer");
+
+        let mut types = Vec::new();
+        // 1: u64
+        push_u32(&mut types, u64_name);
+        push_u32(&mut types, 1 << 24);
+        push_u32(&mut types, 8);
+        push_u32(&mut types, 64);
+        if target {
+            // 2: anonymous union { u64 tcp_retransmit_timer; }
+            push_u32(&mut types, 0);
+            push_u32(&mut types, (5 << 24) | 1);
+            push_u32(&mut types, 8);
+            push_u32(&mut types, timer_name);
+            push_u32(&mut types, 1);
+            push_u32(&mut types, 0);
+            // 3: struct sock { padding; anonymous union; }
+            push_u32(&mut types, sock_name);
+            push_u32(&mut types, (4 << 24) | 1);
+            push_u32(&mut types, 16);
+            push_u32(&mut types, 0);
+            push_u32(&mut types, 2);
+            push_u32(&mut types, 64);
+        } else {
+            // 2: struct sock___flavor { u64 tcp_retransmit_timer; }
+            push_u32(&mut types, sock_name);
+            push_u32(&mut types, (4 << 24) | 1);
+            push_u32(&mut types, 8);
+            push_u32(&mut types, timer_name);
+            push_u32(&mut types, 1);
+            push_u32(&mut types, 0);
+        }
+
+        let mut bytes = Vec::new();
+        bytes.extend(0xeb9f_u16.to_le_bytes());
+        bytes.extend([1, 0]);
+        push_u32(&mut bytes, 24);
+        push_u32(&mut bytes, 0);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, types.len() as u32);
+        push_u32(&mut bytes, strings.len() as u32);
+        bytes.extend(types);
+        bytes.extend(strings);
+        Btf::parse(&bytes).unwrap()
+    }
+
     fn struct_ops_kernel_btf() -> Btf {
         let mut strings = vec![0];
         let mut add_string = |value: &str| {
@@ -5968,6 +6093,46 @@ mod tests {
     }
 
     #[test]
+    fn map_in_map_values_have_descriptor_value_size() {
+        let fixture = crate::test_bpf::compile_fixture("map-in-map");
+        let object = Object::open(fixture.path()).unwrap();
+        let outer = object.map("outer").unwrap();
+        assert_eq!(outer.map_type(), MapType::ArrayOfMaps);
+        assert_eq!(outer.value_size(), size_of::<u32>() as u32);
+    }
+
+    #[test]
+    fn skips_map_relocations_for_programs_that_will_not_load() {
+        let fixture = crate::test_bpf::compile_fixture("ringbuf");
+        let mut object = Object::open(fixture.path()).unwrap();
+        for program in object.programs.values_mut() {
+            program.autoload = false;
+        }
+        let relocations = object.map_relocations.clone();
+        relocate_maps(&mut object.programs, &relocations, &BTreeMap::new()).unwrap();
+    }
+
+    #[test]
+    fn poisons_missing_map_relocations_in_loaded_programs() {
+        let fixture = crate::test_bpf::compile_fixture("ringbuf");
+        let mut object = Object::open(fixture.path()).unwrap();
+        let relocations = object.map_relocations.clone();
+        relocate_maps(&mut object.programs, &relocations, &BTreeMap::new()).unwrap();
+        for (index, relocation) in relocations.iter().enumerate() {
+            let poison = POISON_LDIMM64_MAP_BASE + index as i32;
+            let program = &object.programs[&relocation.program];
+            assert_eq!(
+                program.instructions[relocation.instruction_index],
+                Instruction::new(BPF_CALL, 0, 0, 0, poison)
+            );
+            assert_eq!(
+                program.instructions[relocation.instruction_index + 1],
+                Instruction::new(BPF_CALL, 0, 0, 0, poison)
+            );
+        }
+    }
+
+    #[test]
     fn parses_kernel_release_for_program_loads() {
         assert_eq!(
             parse_kernel_version("6.19.14-200.fc43\n"),
@@ -6078,6 +6243,31 @@ mod tests {
         );
         assert_eq!(
             evaluate_core_relocation(btf, btf, &relocation(2))
+                .unwrap()
+                .value,
+            1
+        );
+    }
+
+    #[test]
+    fn resolves_core_fields_promoted_from_anonymous_records() {
+        let local = anonymous_member_core_btf(false);
+        let target = anonymous_member_core_btf(true);
+        let relocation = |kind| CoreRelocation {
+            program: "entry".into(),
+            instruction_index: 0,
+            type_id: TypeId(2),
+            access: "0:0".into(),
+            kind,
+        };
+        assert_eq!(
+            evaluate_core_relocation(&local, &target, &relocation(0))
+                .unwrap()
+                .value,
+            8
+        );
+        assert_eq!(
+            evaluate_core_relocation(&local, &target, &relocation(2))
                 .unwrap()
                 .value,
             1

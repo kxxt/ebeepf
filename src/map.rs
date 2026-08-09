@@ -1006,6 +1006,9 @@ impl Map {
             spec.max_entries = u32::try_from(possible_cpu_count()?)
                 .map_err(|_| Error::InvalidObject("possible CPU count does not fit u32".into()))?;
         }
+        if matches!(spec.map_type, MapType::RingBuffer | MapType::UserRingBuffer) {
+            spec.max_entries = adjust_ring_buffer_max_entries(spec.max_entries)?;
+        }
         if let Some(program) = options.exclusive_program {
             if spec
                 .exclusive_program
@@ -1888,6 +1891,27 @@ pub(crate) fn possible_cpu_count() -> Result<usize> {
     parse_cpu_list(text.trim())
 }
 
+/// Rounds a ring-buffer capacity up to a power-of-two number of pages, as
+/// required by the kernel. This also matches the normalization performed by
+/// libbpf for object-defined and user-overridden ring-buffer sizes.
+pub(crate) fn adjust_ring_buffer_max_entries(max_entries: u32) -> Result<u32> {
+    if max_entries == 0 {
+        return Ok(0);
+    }
+    let page_size = u32::try_from(page_size()?)
+        .map_err(|_| Error::InvalidObject("page size does not fit u32".into()))?;
+    let pages = max_entries
+        .div_ceil(page_size)
+        .checked_next_power_of_two()
+        .and_then(|pages| pages.checked_mul(page_size))
+        .ok_or_else(|| {
+            Error::InvalidObject(format!(
+                "ring-buffer capacity {max_entries} cannot be rounded to a power-of-two number of pages"
+            ))
+        })?;
+    Ok(pages)
+}
+
 pub(crate) fn page_size() -> Result<usize> {
     // SAFETY: `sysconf` has no pointer arguments.
     let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
@@ -2009,6 +2033,24 @@ mod tests {
         assert_eq!(parse_cpu_list("0-3,8,10-11").unwrap(), 7);
         assert!(parse_cpu_list("3-1").is_err());
         assert!(parse_cpu_list("0-nope").is_err());
+    }
+
+    #[test]
+    fn ring_buffer_capacity_rounds_up_to_power_of_two_pages() {
+        let page_size = u32::try_from(page_size().unwrap()).unwrap();
+        assert_eq!(adjust_ring_buffer_max_entries(0).unwrap(), 0);
+        assert_eq!(
+            adjust_ring_buffer_max_entries(page_size).unwrap(),
+            page_size
+        );
+        assert_eq!(
+            adjust_ring_buffer_max_entries(page_size + 1).unwrap(),
+            page_size * 2
+        );
+        assert_eq!(
+            adjust_ring_buffer_max_entries(50 * 1024 * 1024).unwrap(),
+            64 * 1024 * 1024
+        );
     }
 
     #[test]
