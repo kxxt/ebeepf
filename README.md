@@ -1,5 +1,8 @@
 # ebeepf
 
+> [!WARNING]
+> This repo contains AI-generated code that has not been thoroughly reviewed.
+
 `ebeepf` is a pure Rust eBPF loader and runtime for Linux. It parses eBPF ELF
 and BTF data itself and talks to the kernel through the `bpf(2)` system call;
 it does not link to libbpf.
